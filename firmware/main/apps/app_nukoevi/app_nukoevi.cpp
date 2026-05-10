@@ -8,10 +8,13 @@
 #include <stackchan/stackchan.h>
 #include <ArduinoJson.hpp>
 #include <cstdint>
+#include <cstring>
+#include <ctime>
 #include <memory>
 #include <mutex>
 #include <smooth_lvgl.hpp>
 #include <string>
+#include <string_view>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -23,6 +26,9 @@ LV_IMAGE_DECLARE(nukoevi_screen_open);
 LV_IMAGE_DECLARE(nukoevi_screen_half_a);
 LV_IMAGE_DECLARE(nukoevi_screen_closed);
 LV_IMAGE_DECLARE(nukoevi_screen_half_b);
+LV_IMAGE_DECLARE(nukoevi_talk_open);
+LV_IMAGE_DECLARE(nukoevi_sleep_drowsy);
+LV_IMAGE_DECLARE(nukoevi_sleep_asleep);
 LV_FONT_DECLARE(font_puhui_14_1);
 
 static std::unique_ptr<Container> _panel;
@@ -52,6 +58,15 @@ static constexpr uint32_t _llm_timeout_ms = 30000;
 static constexpr uint32_t _llm_request_interval_ms = 2500;
 static uint32_t _caption_updated_at = 0;
 static bool _caption_visible = false;
+static bool _talk_requested = false;
+static size_t _talk_request_text_size = 0;
+static bool _talk_active = false;
+static uint8_t _talk_index = 0;
+static uint32_t _talk_timecount = 0;
+static uint32_t _talk_until = 0;
+static bool _sleep_mode = false;
+static uint8_t _sleep_index = 0;
+static uint32_t _sleep_timecount = 0;
 static constexpr uint32_t _caption_auto_hide_ms = 6000;
 static constexpr int _caption_width       = 316;
 static constexpr int _caption_label_width = 300;
@@ -65,6 +80,60 @@ static const lv_image_dsc_t* const _blink_sequence[] = {
     &nukoevi_screen_half_b,
     &nukoevi_screen_open,
 };
+
+static const lv_image_dsc_t* const _talk_sequence[] = {
+    &nukoevi_screen_open,
+    &nukoevi_talk_open,
+    &nukoevi_screen_open,
+    &nukoevi_talk_open,
+};
+
+static const lv_image_dsc_t* const _sleep_sequence[] = {
+    &nukoevi_sleep_drowsy,
+    &nukoevi_sleep_asleep,
+    &nukoevi_sleep_drowsy,
+};
+
+static bool starts_with(std::string_view text, std::string_view prefix)
+{
+    return text.size() >= prefix.size() && text.substr(0, prefix.size()) == prefix;
+}
+
+static bool should_talk_for_text(std::string_view text)
+{
+    if (text.empty()) {
+        return false;
+    }
+
+    return !starts_with(text, "AI ") && !starts_with(text, "Open ") && !starts_with(text, "BLE ") &&
+           !starts_with(text, "Starting ") && text != "考え中";
+}
+
+static bool is_night_time()
+{
+    const time_t now_t = time(nullptr);
+    struct tm local_tm;
+    if (localtime_r(&now_t, &local_tm) == nullptr) {
+        return false;
+    }
+
+    if (local_tm.tm_year < 124) {
+        return false;
+    }
+
+    return local_tm.tm_hour >= 22 || local_tm.tm_hour < 7;
+}
+
+static void start_talk_animation(size_t text_size)
+{
+    const auto now = GetHAL().millis();
+    const uint32_t duration = uitk::clamp<uint32_t>(1400 + static_cast<uint32_t>(text_size) * 40, 1800, 5200);
+
+    _talk_active    = true;
+    _talk_index     = 0;
+    _talk_timecount = 0;
+    _talk_until     = now + duration;
+}
 
 static void start_local_llm_request()
 {
@@ -130,6 +199,7 @@ static void handle_llm_timeout(uint32_t now)
     _active_chat_request_id = 0;
     _llm_status         = "Open iPhone app, then tap";
     _llm_status_changed = true;
+    _talk_requested     = false;
     mclog::tagWarn("NUKOEVI", "LLM request timed out");
 }
 
@@ -234,6 +304,64 @@ static void handle_caption_auto_hide(uint32_t now)
     mclog::tagInfo("NUKOEVI", "caption hidden");
 }
 
+static bool update_talk_animation(uint32_t now)
+{
+    if (!_talk_active) {
+        return false;
+    }
+
+    if (now >= _talk_until) {
+        _talk_active    = false;
+        _talk_index     = 0;
+        _talk_timecount = 0;
+        return false;
+    }
+
+    constexpr uint32_t talk_frame_ms = 120;
+    if (_talk_timecount == 0 || now - _talk_timecount >= talk_frame_ms) {
+        _talk_timecount = now;
+        _talk_index = (_talk_index + 1) % (sizeof(_talk_sequence) / sizeof(_talk_sequence[0]));
+        _avatar->setSrc(_talk_sequence[_talk_index]);
+    }
+
+    return true;
+}
+
+static bool update_sleep_animation(uint32_t now)
+{
+    if (!is_night_time()) {
+        if (_sleep_mode) {
+            _sleep_mode      = false;
+            _sleep_index     = 0;
+            _sleep_timecount = 0;
+            _blink_index     = 0;
+            _blink_timecount = now;
+            _avatar->setSrc(&nukoevi_screen_open);
+        }
+        return false;
+    }
+
+    if (!_sleep_mode) {
+        _sleep_mode      = true;
+        _sleep_index     = 0;
+        _sleep_timecount = now;
+        _avatar->setSrc(_sleep_sequence[_sleep_index]);
+        return true;
+    }
+
+    const uint32_t interval = _sleep_index == 0 ? 4200 : 650;
+    if (now - _sleep_timecount >= interval) {
+        _sleep_timecount = now;
+        _sleep_index++;
+        if (_sleep_index >= sizeof(_sleep_sequence) / sizeof(_sleep_sequence[0])) {
+            _sleep_index = 0;
+        }
+        _avatar->setSrc(_sleep_sequence[_sleep_index]);
+    }
+
+    return true;
+}
+
 static void handle_screen_tap_request()
 {
     const auto point = hal_bridge::get_touch_point();
@@ -285,6 +413,10 @@ void AppNukoevi::onOpen()
     _avatar->align(LV_ALIGN_CENTER, 0, 0);
     _blink_index     = 0;
     _blink_timecount = GetHAL().millis();
+    _talk_active     = false;
+    _talk_requested  = false;
+    _sleep_mode      = false;
+    _sleep_index     = 0;
 
     _caption_panel = lv_obj_create(lv_screen_active());
     lv_obj_set_size(_caption_panel, _caption_width, 44);
@@ -346,6 +478,10 @@ void AppNukoevi::onOpen()
 
         _llm_status         = text;
         _llm_status_changed = true;
+        if (should_talk_for_text(text)) {
+            _talk_requested = true;
+            _talk_request_text_size = strlen(text);
+        }
         _llm_running        = false;
         _llm_started_at     = 0;
         _active_chat_request_id = 0;
@@ -423,6 +559,8 @@ void AppNukoevi::onRunning()
     }
 
     bool should_start_llm = false;
+    bool should_start_talk = false;
+    size_t talk_text_size = 0;
     {
         std::lock_guard<std::mutex> lock(_llm_mutex);
         if (_llm_requested && !_llm_running) {
@@ -435,10 +573,28 @@ void AppNukoevi::onRunning()
             update_caption_text(_llm_status);
             _llm_status_changed = false;
         }
+        if (_talk_requested) {
+            _talk_requested = false;
+            should_start_talk = true;
+            talk_text_size = _talk_request_text_size;
+            _talk_request_text_size = 0;
+        }
     }
 
     if (should_start_llm) {
         begin_local_llm_task();
+    }
+
+    if (should_start_talk) {
+        start_talk_animation(talk_text_size);
+    }
+
+    if (update_talk_animation(now)) {
+        return;
+    }
+
+    if (update_sleep_animation(now)) {
+        return;
     }
 
     if (_blink_index == 0) {
