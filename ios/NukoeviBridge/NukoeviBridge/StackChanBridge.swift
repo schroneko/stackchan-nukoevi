@@ -81,6 +81,18 @@ final class StackChanBridge: NSObject, ObservableObject {
         peripheral.writeValue(data, for: configCharacteristic, type: .withResponse)
         connectionState = "Response sent to StackChan"
     }
+
+    private func prepareResponder(sendStatus: Bool = false) {
+        Task {
+            let status = await responder.prepare()
+            await MainActor.run {
+                self.lastResponse = status
+                if sendStatus {
+                    self.sendResponse(status)
+                }
+            }
+        }
+    }
 }
 
 extension StackChanBridge: @MainActor CBCentralManagerDelegate {
@@ -139,13 +151,7 @@ extension StackChanBridge: @MainActor CBPeripheralDelegate {
         configCharacteristic = characteristic
         peripheral.setNotifyValue(true, for: characteristic)
         connectionState = "Connected to StackChan"
-        Task {
-            let status = await responder.availabilityStatus()
-            await MainActor.run {
-                self.lastResponse = status
-                self.sendResponse(status)
-            }
-        }
+        prepareResponder(sendStatus: true)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
