@@ -1,10 +1,10 @@
 # Nukoevi display status
 
-Date: 2026-05-10
+Date: 2026-05-11
 
 ## Goal
 
-Show `/Users/username/Downloads/nukoevi.png` on the StackChan screen as a Nukoevi character app. The custom AI agent integration is intentionally out of scope for this step.
+Show Nukoevi on the StackChan screen as the main character app, connect it to the local iPhone bridge, and keep generated character assets reproducible.
 
 ## Implemented
 
@@ -17,6 +17,16 @@ Show `/Users/username/Downloads/nukoevi.png` on the StackChan screen as a Nukoev
 - Installed `AppNukoevi` from `firmware/main/main.cpp`.
 - Opened `AppNukoevi` at boot with `GetMooncake().openApp(nukoevi_app_id)`, so the Nukoevi image is shown immediately after flashing and booting.
 - Updated `AppNukoevi` to switch frames periodically so the character blinks.
+- Set the Nukoevi app LCD brightness to 30%.
+- Added a readable bottom caption panel for iPhone bridge responses.
+- Added automatic caption hiding after 6 seconds when the local LLM task is not running.
+- Added tap debounce and request throttling so repeated taps do not continuously queue iPhone bridge requests.
+- Added local iPhone bridge integration using BLE `chatRequest` and `chatResponse` messages.
+- Removed the iOS background Bluetooth mode because it caused Apple Intelligence requests to fail when the standard Camera app was open.
+- Added full-frame lip-sync animation when a valid AI response is received.
+- Added night sleepy mode from 22:00 to 07:00 using generated full-frame sleepy images.
+- Added a generated app icon for the Nukoevi iPhone bridge app.
+- Stopped the Joy-Con task for now. No new Joy-Con integration is part of the current Nukoevi firmware path.
 
 ## Asset Generation
 
@@ -24,6 +34,23 @@ Show `/Users/username/Downloads/nukoevi.png` on the StackChan screen as a Nukoev
 - Preview sheet: `firmware/main/apps/app_nukoevi/source-assets/nukoevi-blink-preview.png`.
 - Reproducible generator: `firmware/main/apps/app_nukoevi/source-assets/generate_nukoevi_blink_assets.py`.
 - Generator command: `uv run --with pillow python firmware/main/apps/app_nukoevi/source-assets/generate_nukoevi_blink_assets.py`.
+- Lip-sync source strip: `firmware/main/apps/app_nukoevi/source-assets/nukoevi-talk-imagegen-strip.png`.
+- Sleep source strip: `firmware/main/apps/app_nukoevi/source-assets/nukoevi-sleep-imagegen-strip.png`.
+- Motion generator: `firmware/main/apps/app_nukoevi/source-assets/generate_nukoevi_motion_assets.py`.
+- Motion generator command: `uv run --with pillow python firmware/main/apps/app_nukoevi/source-assets/generate_nukoevi_motion_assets.py`.
+- Motion C asset: `firmware/main/apps/app_nukoevi/assets/nukoevi_motion.c`.
+- Motion verification command: `uv run --with pillow python firmware/main/apps/app_nukoevi/source-assets/verify_motion_asset.py`.
+- Latest motion verification preview: `firmware/main/apps/app_nukoevi/source-assets/nukoevi-motion-from-c-asset-9d6eda94cdba.png`.
+- iPhone app icon source: `firmware/main/apps/app_nukoevi/source-assets/nukoevi-bridge-icon-source.png`.
+- iPhone app icon generator: `ios/NukoeviBridge/scripts/generate_app_icon_assets.py`.
+- iPhone app icon generator command: `uv run --with pillow python ios/NukoeviBridge/scripts/generate_app_icon_assets.py`.
+
+## Image Generation Rule
+
+- Generate complete screen frames for character animation.
+- Do not generate only a mouth, eyes, or other partial facial part and paste it on top of the base image.
+- Keep generated source strips and per-frame PNG files under `firmware/main/apps/app_nukoevi/source-assets/`.
+- Embed only the minimum required full-frame RGB565 C assets in firmware because the app partition is nearly full.
 
 ## Verified
 
@@ -34,17 +61,27 @@ Show `/Users/username/Downloads/nukoevi.png` on the StackChan screen as a Nukoev
 - Flash command: `idf.py -p /dev/cu.usbmodem2101 flash`.
 - Flash result: success.
 - Monitor result: boot completed and logged `[NUKOEVI] on open`.
-- Latest blink build result: success, app binary size `0x42fd20`, app partition free `0xc02e0`.
-- Latest blink flash result: success, boot completed and logged `[NUKOEVI] on open`.
+- Latest motion asset verification: `matches=True`.
+- Latest firmware build result: success.
+- Latest firmware app binary size: `0x4e29d0`.
+- Latest firmware app partition free space: `0xd630`, about 1%.
+- Latest firmware flash port: `/dev/cu.usbmodem3101`.
+- Latest firmware flash result: success.
+- Latest firmware monitor result: bootloader loaded the app image successfully. A second short monitor pass showed no reset loop output.
+- Latest iPhone app build command: `xcodebuild -project ios/NukoeviBridge/NukoeviBridge.xcodeproj -scheme NukoeviBridge -destination id=00008150-0002645C3A04401C build`.
+- Latest iPhone app build result: success.
+- Latest iPhone app install result: success on device `00008150-0002645C3A04401C`.
+- Latest iPhone app launch result: success for bundle id `test.NukoeviBridge`.
 
 ## Not Included Yet
 
 - Custom AI agent connection.
 - Speech, audio, or conversation handling.
 - Sprite animation from the original `spritesheet.webp`.
-- Display white-clipping correction while filming StackChan with a smartphone. Based on GOROman's X post, lower the LCD brightness so smartphone video capture does not blow out bright areas. Do not treat this as LCC/LUT image processing.
-- Design and apply a polished app icon for the Nukoevi iPhone bridge app.
-- Night sleepy mode from 22:00 to 07:00 with sleepy or sleeping full-frame Nukoevi images and a nodding-off animation. Generate each animation frame as a complete screen image, not as partial eye or mouth overlays.
+- VLM or camera-based perception.
+- Microphone input.
+- Standard Camera app plus Apple Intelligence background inference. The current iOS workaround is to keep the Nukoevi Bridge app active and avoid requiring background inference while the standard Camera app owns the foreground.
+- More firmware animation frames. The firmware app partition is nearly full, so additional full-frame RGB565 assets need either a partition change or a compressed/runtime-decoded asset path.
 
 ## Repository Handling
 
