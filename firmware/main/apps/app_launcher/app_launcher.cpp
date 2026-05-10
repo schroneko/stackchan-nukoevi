@@ -47,7 +47,6 @@ void AppLauncher::onLauncherRunning()
         }
     } else {
         _view->update();
-        screensaver_update();
     }
 
     GetStackChan().update();

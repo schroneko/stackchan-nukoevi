@@ -286,7 +286,9 @@ private:
         const int seconds_to_shutdown = xiaozhi_config_.idleShutdownTimeSeconds > 0
                                             ? static_cast<int>(xiaozhi_config_.idleShutdownTimeSeconds)
                                             : -1;
-        const int seconds_to_sleep    = -1;
+        const int seconds_to_sleep    = seconds_to_shutdown == -1
+                                            ? kPowerSaveSleepDelaySeconds
+                                            : std::min(kPowerSaveSleepDelaySeconds, seconds_to_shutdown);
 
         ESP_LOGI(TAG, "Init power save timer: sleep=%d s, shutdown=%d s, allow_shutdown_when_charging=%d",
                  seconds_to_sleep, seconds_to_shutdown, xiaozhi_config_.allowShutdownWhenCharging);
