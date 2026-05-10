@@ -353,6 +353,16 @@ private:
         pmic_ = new Pmic(i2c_bus_, 0x34);
     }
 
+    void InitializeBacklightBrightness()
+    {
+        Settings settings("display", true);
+        if (!settings.GetBool("nukoevi_brightness_50_applied", false)) {
+            settings.SetInt("brightness", 50);
+            settings.SetBool("nukoevi_brightness_50_applied", true);
+        }
+        GetBacklight()->RestoreBrightness();
+    }
+
     void InitializeAw9523()
     {
         ESP_LOGI(TAG, "Init AW9523");
@@ -502,7 +512,7 @@ public:
         InitializeIli9342Display();
         InitializeCamera();
         InitializeFt6336TouchPad();
-        GetBacklight()->RestoreBrightness();
+        InitializeBacklightBrightness();
     }
 
     virtual AudioCodec* GetAudioCodec() override

@@ -13,7 +13,7 @@ using namespace smooth_ui_toolkit::lvgl_cpp;
 using namespace setup_workers;
 
 static std::string _tag                        = "Setup-Display";
-static std::vector<uint8_t> _brightness_levels = {1, 15, 30, 45, 60, 75, 90, 100};
+static std::vector<uint8_t> _brightness_levels = {1, 15, 30, 45, 50, 60, 75, 90, 100};
 
 BrightnessSetupWorker::BrightnessSetupWorker()
 {
