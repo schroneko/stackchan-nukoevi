@@ -34,8 +34,9 @@ extern "C" void app_main(void)
     GetMooncake().installApp(std::make_unique<AppAppCenter>());
     GetMooncake().installApp(std::make_unique<AppEzdata>());
     GetMooncake().installApp(std::make_unique<AppDance>());
-    GetMooncake().installApp(std::make_unique<AppNukoevi>());
+    const auto nukoevi_app_id = GetMooncake().installApp(std::make_unique<AppNukoevi>());
     GetMooncake().installApp(std::make_unique<AppSetup>());
+    GetMooncake().openApp(nukoevi_app_id);
 
     // Main loop
     while (1) {
