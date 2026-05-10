@@ -353,12 +353,15 @@ private:
         pmic_ = new Pmic(i2c_bus_, 0x34);
     }
 
-    void InitializeBacklightBrightness()
+    void RestoreBacklightBrightness()
     {
         Settings settings("display", true);
-        if (!settings.GetBool("nukoevi_brightness_50_applied", false)) {
-            settings.SetInt("brightness", 50);
-            settings.SetBool("nukoevi_brightness_50_applied", true);
+        int brightness = settings.GetInt("brightness", 75);
+        if (brightness <= 50) {
+            settings.SetInt("brightness", 75);
+            settings.EraseKey("nukoevi_brightness_50_applied");
+            GetBacklight()->SetBrightness(75, false);
+            return;
         }
         GetBacklight()->RestoreBrightness();
     }
@@ -512,7 +515,7 @@ public:
         InitializeIli9342Display();
         InitializeCamera();
         InitializeFt6336TouchPad();
-        InitializeBacklightBrightness();
+        RestoreBacklightBrightness();
     }
 
     virtual AudioCodec* GetAudioCodec() override
