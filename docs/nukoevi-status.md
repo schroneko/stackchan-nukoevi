@@ -42,6 +42,9 @@ Show `/Users/username/Downloads/nukoevi.png` on the StackChan screen as a Nukoev
 - Custom AI agent connection.
 - Speech, audio, or conversation handling.
 - Sprite animation from the original `spritesheet.webp`.
+- Display white-clipping correction while filming StackChan with a smartphone. Based on GOROman's X post, lower the LCD brightness so smartphone video capture does not blow out bright areas. Do not treat this as LCC/LUT image processing.
+- Design and apply a polished app icon for the Nukoevi iPhone bridge app.
+- Night sleepy mode from 22:00 to 07:00 with sleepy or sleeping full-frame Nukoevi images and a nodding-off animation. Generate each animation frame as a complete screen image, not as partial eye or mouth overlays.
 
 ## Repository Handling
 
