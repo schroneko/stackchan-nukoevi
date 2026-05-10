@@ -165,16 +165,17 @@ static bool should_talk_for_text(std::string_view text)
 static bool is_night_time()
 {
     const time_t now_t = time(nullptr);
-    struct tm local_tm;
-    if (localtime_r(&now_t, &local_tm) == nullptr) {
+    const time_t jst_t = now_t + 9 * 60 * 60;
+    struct tm jst_tm;
+    if (gmtime_r(&jst_t, &jst_tm) == nullptr) {
         return false;
     }
 
-    if (local_tm.tm_year < 124) {
+    if (jst_tm.tm_year < 124) {
         return false;
     }
 
-    return local_tm.tm_hour >= 22 || local_tm.tm_hour < 7;
+    return jst_tm.tm_hour >= 22 || jst_tm.tm_hour < 7;
 }
 
 static void start_talk_animation(size_t text_size)

@@ -24,7 +24,7 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Added local iPhone bridge integration using BLE `chatRequest` and `chatResponse` messages.
 - Removed the iOS background Bluetooth mode because it caused Apple Intelligence requests to fail when the standard Camera app was open.
 - Added full-frame 6-frame lip-sync animation when a valid AI response is received.
-- Added night sleepy mode from 22:00 to 07:00 using generated 6-frame full-screen sleepy images.
+- Added night sleepy mode from 22:00 to 07:00 JST using generated 6-frame full-screen sleepy images.
 - Added StackChan onboard camera capture for local LLM requests. The firmware sends the captured JPEG to the iPhone bridge over BLE chunks before the prompt.
 - Added iPhone-side StackChan camera handling. The bridge reconstructs the JPEG, shows the latest camera image, extracts image context with VisionKit `ImageAnalyzer`, and passes that context into FoundationModels.
 - Added a generated app icon for the Nukoevi iPhone bridge app.
@@ -73,6 +73,7 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Latest firmware flash port: `/dev/cu.usbmodem3101`.
 - Latest firmware flash result: success.
 - Latest firmware monitor result: boot completed, camera initialized, BLE advertising started, Nukoevi opened, and no `nukoevi-*` asset lookup failures appeared after the asset rebuild fix.
+- Night mode uses a JST calculation inside the Nukoevi app so it does not depend on the device RTC timezone setting being configured from Setup.
 - Latest iPhone app build command: `xcodebuild -project ios/NukoeviBridge/NukoeviBridge.xcodeproj -scheme NukoeviBridge -destination id=00008150-0002645C3A04401C build`.
 - Latest iPhone app build result: success.
 - Latest iPhone app install result: success on device `CDCFCD1E-488F-57C8-90C6-694C51110809`.
