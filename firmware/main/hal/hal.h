@@ -210,6 +210,7 @@ public:
 
     void startBleServer();
     bool isBleConnected();
+    bool notifyBleConfig(std::string_view json);
     void startAppConfigServer();
     bool isAppConfiged();
     void resetAppConfiged();
@@ -263,6 +264,7 @@ public:
     void startNetwork(std::function<void(std::string_view)> onLog);
     WifiStatus getWifiStatus();
     void startSntp();
+    bool requestLocalLlmChat(std::string_view prompt, std::string& response, std::function<void(std::string_view)> onLog);
 
     /* -------------------------------- App center ------------------------------- */
     app_center::AppInfoList_t fetchAppList();

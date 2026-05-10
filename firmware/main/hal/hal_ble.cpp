@@ -80,6 +80,15 @@ bool Hal::isBleConnected()
     return stackchan_ble_is_connected();
 }
 
+bool Hal::notifyBleConfig(std::string_view json)
+{
+    if (json.empty()) {
+        return false;
+    }
+
+    return stackchan_ble_notify_config(json.data(), json.size()) == 0;
+}
+
 /* -------------------------------------------------------------------------- */
 /*                              App config server                             */
 /* -------------------------------------------------------------------------- */

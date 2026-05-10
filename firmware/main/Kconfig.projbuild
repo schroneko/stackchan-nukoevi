@@ -1,5 +1,21 @@
 menu "Xiaozhi Assistant"
 
+menu "Nukoevi Local LLM"
+
+config NUKOEVI_LLM_ENDPOINT
+    string "OpenAI-compatible chat completions URL"
+    default "http://192.168.0.2:8080/v1/chat/completions"
+
+config NUKOEVI_LLM_MODEL
+    string "OpenAI-compatible model name"
+    default "base"
+
+config NUKOEVI_LLM_SYSTEM_PROMPT
+    string "Nukoevi system prompt"
+    default "あなたはぬこエビちゃんです。日本語で、短く、かわいく返事してください。"
+
+endmenu
+
 config OTA_URL
     string "Default OTA URL"
     default "https://api.tenclass.net/xiaozhi/ota/"
