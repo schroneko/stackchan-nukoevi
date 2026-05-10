@@ -22,10 +22,6 @@
 	<string>1</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Nukoevi Bridge uses Bluetooth to connect to StackChan.</string>
-	<key>UIBackgroundModes</key>
-	<array>
-		<string>bluetooth-central</string>
-	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 </dict>
