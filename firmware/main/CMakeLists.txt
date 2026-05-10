@@ -395,6 +395,9 @@ endforeach()
 endif()
 
 set(DEFAULT_ASSETS_EXTRA_FILES "${CMAKE_CURRENT_SOURCE_DIR}/assets/assets_bin")
+file(GLOB DEFAULT_ASSETS_EXTRA_FILE_DEPS CONFIGURE_DEPENDS
+    "${DEFAULT_ASSETS_EXTRA_FILES}/*"
+)
 
 # Function to build default assets based on configuration
 function(build_default_assets_bin)
@@ -432,6 +435,7 @@ function(build_default_assets_bin)
         DEPENDS
             ${SDKCONFIG}
             ${XIAOZHI_MAIN_DIR}/../scripts/build_default_assets.py
+            ${DEFAULT_ASSETS_EXTRA_FILE_DEPS}
         COMMENT "Building default assets.bin based on configuration"
         VERBATIM
     )

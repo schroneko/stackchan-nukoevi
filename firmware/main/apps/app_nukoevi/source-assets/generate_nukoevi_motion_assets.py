@@ -1,31 +1,44 @@
 from pathlib import Path
+import struct
 
 from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
+FIRMWARE_MAIN = ROOT.parents[1]
 SOURCE_DIR = ROOT / "source-assets"
-ASSET_DIR = ROOT / "assets"
-OUTPUT = ASSET_DIR / "nukoevi_motion.c"
+ASSET_BIN_DIR = FIRMWARE_MAIN / "assets" / "assets_bin"
 FRAME_WIDTH = 320
 FRAME_HEIGHT = 240
 FRAME_ASPECT = FRAME_WIDTH / FRAME_HEIGHT
+LV_IMAGE_HEADER_MAGIC = 0x19
+LV_COLOR_FORMAT_RGB565 = 0x12
 
 SEQUENCES = [
     (
         "talk",
         SOURCE_DIR / "nukoevi-talk-imagegen-strip.png",
+        [
+            "nukoevi-talk-closed.bin",
+            "nukoevi-talk-tiny.bin",
+            "nukoevi-talk-medium.bin",
+            "nukoevi-talk-wide.bin",
+            "nukoevi-talk-small.bin",
+            "nukoevi-talk-smile.bin",
+        ],
     ),
     (
         "sleep",
         SOURCE_DIR / "nukoevi-sleep-imagegen-strip.png",
+        [
+            "nukoevi-sleep-drowsy.bin",
+            "nukoevi-sleep-nearly-closed.bin",
+            "nukoevi-sleep-nod.bin",
+            "nukoevi-sleep-asleep.bin",
+            "nukoevi-sleep-wobble.bin",
+            "nukoevi-sleep-return.bin",
+        ],
     ),
-]
-
-EMBEDDED_FRAMES = [
-    ("talk", 2, "nukoevi_talk_open", "NUKOEVI_TALK_OPEN"),
-    ("sleep", 0, "nukoevi_sleep_drowsy", "NUKOEVI_SLEEP_DROWSY"),
-    ("sleep", 3, "nukoevi_sleep_asleep", "NUKOEVI_SLEEP_ASLEEP"),
 ]
 
 
@@ -68,10 +81,11 @@ def fit_frame(frame):
 def split_strip(source):
     image = Image.open(source).convert("RGB")
     strip = image.crop(content_bbox(image))
-    panel_width = strip.width / 4
+    panel_count = 6
+    panel_width = strip.width / panel_count
     frames = []
 
-    for index in range(4):
+    for index in range(panel_count):
         left = round(panel_width * index)
         right = round(panel_width * (index + 1))
         frames.append(fit_frame(strip.crop((left, 0, right, strip.height))))
@@ -90,36 +104,15 @@ def rgb565_bytes(image):
     return data
 
 
-def c_array(name, attr, frame):
+def write_bin_asset(name, frame):
     data = rgb565_bytes(frame)
-    lines = [
-        f"#ifndef LV_ATTRIBUTE_IMAGE_{attr}",
-        f"#define LV_ATTRIBUTE_IMAGE_{attr}",
-        "#endif",
-        "",
-        f"const LV_ATTRIBUTE_MEM_ALIGN LV_ATTRIBUTE_LARGE_CONST LV_ATTRIBUTE_IMAGE_{attr} uint8_t {name}_map[] = {{",
-    ]
-
-    for offset in range(0, len(data), 16):
-        row = ", ".join(f"0x{byte:02x}" for byte in data[offset : offset + 16])
-        lines.append(f"    {row},")
-
-    lines.extend(
-        [
-            "};",
-            "",
-            f"const lv_image_dsc_t {name} = {{",
-            "    .header.magic = LV_IMAGE_HEADER_MAGIC,",
-            "    .header.cf    = LV_COLOR_FORMAT_RGB565,",
-            f"    .header.w     = {FRAME_WIDTH},",
-            f"    .header.h     = {FRAME_HEIGHT},",
-            f"    .data_size    = sizeof({name}_map),",
-            f"    .data         = {name}_map,",
-            "};",
-            "",
-        ]
+    header = struct.pack(
+        "<III",
+        LV_IMAGE_HEADER_MAGIC | (LV_COLOR_FORMAT_RGB565 << 8),
+        FRAME_WIDTH | (FRAME_HEIGHT << 16),
+        FRAME_WIDTH * 2,
     )
-    return "\n".join(lines)
+    (ASSET_BIN_DIR / name).write_bytes(header + data)
 
 
 def write_preview(sequence_name, frames):
@@ -131,38 +124,13 @@ def write_preview(sequence_name, frames):
 
 
 def main():
-    ASSET_DIR.mkdir(parents=True, exist_ok=True)
-    source = [
-        "#ifdef __has_include",
-        '#if __has_include("lvgl.h")',
-        "#ifndef LV_LVGL_H_INCLUDE_SIMPLE",
-        "#define LV_LVGL_H_INCLUDE_SIMPLE",
-        "#endif",
-        "#endif",
-        "#endif",
-        "",
-        "#if defined(LV_LVGL_H_INCLUDE_SIMPLE)",
-        '#include "lvgl.h"',
-        "#else",
-        '#include "lvgl/lvgl.h"',
-        "#endif",
-        "",
-        "#ifndef LV_ATTRIBUTE_MEM_ALIGN",
-        "#define LV_ATTRIBUTE_MEM_ALIGN",
-        "#endif",
-        "",
-    ]
+    ASSET_BIN_DIR.mkdir(parents=True, exist_ok=True)
 
-    generated_frames = {}
-    for sequence_name, strip_source in SEQUENCES:
+    for sequence_name, strip_source, asset_names in SEQUENCES:
         frames = split_strip(strip_source)
         write_preview(sequence_name, frames)
-        generated_frames[sequence_name] = frames
-
-    for sequence_name, frame_index, name, attr in EMBEDDED_FRAMES:
-        source.append(c_array(name, attr, generated_frames[sequence_name][frame_index]))
-
-    OUTPUT.write_text("\n".join(source), encoding="utf-8")
+        for asset_name, frame in zip(asset_names, frames):
+            write_bin_asset(asset_name, frame)
 
 
 if __name__ == "__main__":

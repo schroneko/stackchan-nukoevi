@@ -19,6 +19,14 @@ struct ContentView: View {
                 .background(.thinMaterial)
                 .clipShape(RoundedRectangle(cornerRadius: 16))
 
+            if let image = bridge.lastCameraImage {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxHeight: 180)
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+            }
+
             Text(bridge.lastResponse.isEmpty ? "Apple Intelligence response will appear here" : bridge.lastResponse)
                 .font(.body)
                 .multilineTextAlignment(.center)

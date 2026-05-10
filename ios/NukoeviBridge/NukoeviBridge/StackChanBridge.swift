@@ -1,11 +1,13 @@
 @preconcurrency import CoreBluetooth
 import Foundation
+import UIKit
 
 @MainActor
 final class StackChanBridge: NSObject, ObservableObject {
     @Published var connectionState = "Starting Bluetooth"
     @Published var lastPrompt = ""
     @Published var lastResponse = ""
+    @Published var lastCameraImage: UIImage?
     @Published var isScanning = false
 
     private let serviceUUID = CBUUID(string: "E2E5E5E0-1234-5678-1234-56789ABCDEF0")
@@ -14,6 +16,25 @@ final class StackChanBridge: NSObject, ObservableObject {
     private var peripheral: CBPeripheral?
     private var configCharacteristic: CBCharacteristic?
     private let responder = AppleIntelligenceResponder()
+    private var cameraTransfers: [Int: CameraTransfer] = [:]
+    private var cameraImages: [Int: Data] = [:]
+    private var latestCameraImageData: Data?
+
+    private struct CameraTransfer {
+        var chunks: [Data?]
+
+        var isComplete: Bool {
+            chunks.allSatisfy { $0 != nil }
+        }
+
+        var data: Data {
+            chunks.reduce(into: Data()) { result, chunk in
+                if let chunk {
+                    result.append(chunk)
+                }
+            }
+        }
+    }
 
     override init() {
         super.init()
@@ -35,19 +56,81 @@ final class StackChanBridge: NSObject, ObservableObject {
         guard
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let command = object["cmd"] as? String,
-            command == "chatPrompt",
-            let payload = object["data"] as? [String: Any],
-            let prompt = payload["text"] as? String
+            let payload = object["data"] as? [String: Any]
         else {
             return
         }
 
+        switch command {
+        case "cameraStart":
+            handleCameraStart(payload)
+        case "cameraChunk":
+            handleCameraChunk(payload)
+        case "chatPrompt":
+            handleChatPrompt(payload)
+        default:
+            break
+        }
+    }
+
+    private func handleCameraStart(_ payload: [String: Any]) {
+        guard
+            let id = payload["id"] as? Int,
+            let chunks = payload["chunks"] as? Int,
+            chunks > 0
+        else {
+            return
+        }
+
+        cameraTransfers[id] = CameraTransfer(chunks: Array(repeating: nil, count: chunks))
+        connectionState = "Receiving StackChan camera"
+    }
+
+    private func handleCameraChunk(_ payload: [String: Any]) {
+        guard
+            let id = payload["id"] as? Int,
+            let index = payload["index"] as? Int,
+            let encoded = payload["data"] as? String,
+            let chunk = Data(base64Encoded: encoded),
+            var transfer = cameraTransfers[id],
+            transfer.chunks.indices.contains(index)
+        else {
+            return
+        }
+
+        transfer.chunks[index] = chunk
+        if transfer.isComplete {
+            let imageData = transfer.data
+            cameraTransfers[id] = nil
+            cameraImages[id] = imageData
+            latestCameraImageData = imageData
+            lastCameraImage = UIImage(data: imageData)
+            connectionState = "StackChan camera received"
+        } else {
+            cameraTransfers[id] = transfer
+            let received = transfer.chunks.filter { $0 != nil }.count
+            connectionState = "Receiving camera \(received)/\(transfer.chunks.count)"
+        }
+    }
+
+    private func handleChatPrompt(_ payload: [String: Any]) {
+        guard let prompt = payload["text"] as? String else {
+            return
+        }
+
         let requestID = payload["id"] as? Int
+        let imageData: Data?
+        if let requestID, let requestImage = cameraImages.removeValue(forKey: requestID) {
+            imageData = requestImage
+        } else {
+            imageData = latestCameraImageData
+        }
+
         lastPrompt = prompt
         connectionState = "Thinking with Apple Intelligence"
 
         Task {
-            let response = await responder.response(for: prompt)
+            let response = await responder.response(for: prompt, imageData: imageData)
             await MainActor.run {
                 self.lastResponse = response
                 self.sendResponse(response, requestID: requestID)

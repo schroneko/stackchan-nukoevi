@@ -1,5 +1,6 @@
 #include "app_nukoevi.h"
 #include <apps/common/common.h>
+#include <assets/assets.h>
 #include <hal/board/hal_bridge.h>
 #include <hal/hal.h>
 #include <lvgl.h>
@@ -7,16 +8,20 @@
 #include <mooncake_log.h>
 #include <stackchan/stackchan.h>
 #include <ArduinoJson.hpp>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <smooth_lvgl.hpp>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <mbedtls/base64.h>
 
 using namespace mooncake;
 using namespace smooth_ui_toolkit::lvgl_cpp;
@@ -26,9 +31,6 @@ LV_IMAGE_DECLARE(nukoevi_screen_open);
 LV_IMAGE_DECLARE(nukoevi_screen_half_a);
 LV_IMAGE_DECLARE(nukoevi_screen_closed);
 LV_IMAGE_DECLARE(nukoevi_screen_half_b);
-LV_IMAGE_DECLARE(nukoevi_talk_open);
-LV_IMAGE_DECLARE(nukoevi_sleep_drowsy);
-LV_IMAGE_DECLARE(nukoevi_sleep_asleep);
 LV_FONT_DECLARE(font_puhui_14_1);
 
 static std::unique_ptr<Container> _panel;
@@ -54,7 +56,7 @@ static uint32_t _chat_request_id = 0;
 static uint32_t _active_chat_request_id = 0;
 static uint32_t _llm_started_at = 0;
 static uint32_t _last_llm_request_at = 0;
-static constexpr uint32_t _llm_timeout_ms = 30000;
+static constexpr uint32_t _llm_timeout_ms = 60000;
 static constexpr uint32_t _llm_request_interval_ms = 2500;
 static uint32_t _caption_updated_at = 0;
 static bool _caption_visible = false;
@@ -72,6 +74,19 @@ static constexpr int _caption_width       = 316;
 static constexpr int _caption_label_width = 300;
 static constexpr uint8_t _nukoevi_backlight_brightness = 30;
 static bool _last_touch_pressed = false;
+static bool _motion_assets_loaded = false;
+static lv_image_dsc_t _talk_closed;
+static lv_image_dsc_t _talk_tiny;
+static lv_image_dsc_t _talk_medium;
+static lv_image_dsc_t _talk_wide;
+static lv_image_dsc_t _talk_small;
+static lv_image_dsc_t _talk_smile;
+static lv_image_dsc_t _sleep_drowsy;
+static lv_image_dsc_t _sleep_nearly_closed;
+static lv_image_dsc_t _sleep_nod;
+static lv_image_dsc_t _sleep_asleep;
+static lv_image_dsc_t _sleep_wobble;
+static lv_image_dsc_t _sleep_return;
 
 static const lv_image_dsc_t* const _blink_sequence[] = {
     &nukoevi_screen_open,
@@ -82,17 +97,55 @@ static const lv_image_dsc_t* const _blink_sequence[] = {
 };
 
 static const lv_image_dsc_t* const _talk_sequence[] = {
-    &nukoevi_screen_open,
-    &nukoevi_talk_open,
-    &nukoevi_screen_open,
-    &nukoevi_talk_open,
+    &_talk_closed,
+    &_talk_tiny,
+    &_talk_medium,
+    &_talk_wide,
+    &_talk_small,
+    &_talk_smile,
 };
 
 static const lv_image_dsc_t* const _sleep_sequence[] = {
-    &nukoevi_sleep_drowsy,
-    &nukoevi_sleep_asleep,
-    &nukoevi_sleep_drowsy,
+    &_sleep_drowsy,
+    &_sleep_nearly_closed,
+    &_sleep_nod,
+    &_sleep_asleep,
+    &_sleep_wobble,
+    &_sleep_return,
 };
+
+static const uint32_t _sleep_intervals[] = {
+    3600,
+    700,
+    850,
+    2400,
+    850,
+    900,
+};
+
+static void load_motion_assets()
+{
+    if (_motion_assets_loaded) {
+        return;
+    }
+
+    _talk_closed = assets::get_image("nukoevi-talk-closed.bin");
+    _talk_tiny = assets::get_image("nukoevi-talk-tiny.bin");
+    _talk_medium = assets::get_image("nukoevi-talk-medium.bin");
+    _talk_wide = assets::get_image("nukoevi-talk-wide.bin");
+    _talk_small = assets::get_image("nukoevi-talk-small.bin");
+    _talk_smile = assets::get_image("nukoevi-talk-smile.bin");
+    _sleep_drowsy = assets::get_image("nukoevi-sleep-drowsy.bin");
+    _sleep_nearly_closed = assets::get_image("nukoevi-sleep-nearly-closed.bin");
+    _sleep_nod = assets::get_image("nukoevi-sleep-nod.bin");
+    _sleep_asleep = assets::get_image("nukoevi-sleep-asleep.bin");
+    _sleep_wobble = assets::get_image("nukoevi-sleep-wobble.bin");
+    _sleep_return = assets::get_image("nukoevi-sleep-return.bin");
+    _motion_assets_loaded = _talk_closed.data && _talk_tiny.data && _talk_medium.data && _talk_wide.data &&
+                            _talk_small.data && _talk_smile.data && _sleep_drowsy.data &&
+                            _sleep_nearly_closed.data && _sleep_nod.data && _sleep_asleep.data &&
+                            _sleep_wobble.data && _sleep_return.data;
+}
 
 static bool starts_with(std::string_view text, std::string_view prefix)
 {
@@ -150,39 +203,170 @@ static void start_local_llm_request()
     _llm_requested = true;
 }
 
-static void begin_local_llm_task()
+static void update_llm_status(std::string_view status)
 {
     std::lock_guard<std::mutex> lock(_llm_mutex);
-    if (!_llm_running) {
-        _llm_running        = true;
-        _llm_requested      = false;
-        _llm_status         = "考え中";
-        _llm_status_changed = true;
-        _llm_started_at     = GetHAL().millis();
-        _active_chat_request_id = ++_chat_request_id;
+    _llm_status         = status;
+    _llm_status_changed = true;
+}
 
-        ArduinoJson::JsonDocument doc;
-        doc["cmd"]         = "chatPrompt";
-        doc["data"]["id"]  = _active_chat_request_id;
-        doc["data"]["text"] = "ぬこエビちゃんとして、短く挨拶して。";
+static void finish_llm_request(uint32_t request_id, std::string_view status)
+{
+    std::lock_guard<std::mutex> lock(_llm_mutex);
+    if (request_id != 0 && _active_chat_request_id != 0 && request_id != _active_chat_request_id) {
+        return;
+    }
 
-        std::string json;
-        ArduinoJson::serializeJson(doc, json);
+    _llm_running            = false;
+    _llm_requested          = false;
+    _llm_started_at         = 0;
+    _active_chat_request_id = 0;
+    _llm_status             = status;
+    _llm_status_changed     = true;
+}
 
-        if (!GetHAL().isBleConnected()) {
-            _llm_running        = false;
-            _llm_status         = "Open iPhone app";
-            _llm_status_changed = true;
-            _llm_started_at     = 0;
+static bool notify_json(const ArduinoJson::JsonDocument& doc)
+{
+    std::string json;
+    ArduinoJson::serializeJson(doc, json);
+    return GetHAL().notifyBleConfig(json);
+}
+
+static std::string base64_encode(const uint8_t* data, size_t size)
+{
+    size_t encoded_size = 0;
+    mbedtls_base64_encode(nullptr, 0, &encoded_size, data, size);
+    std::string encoded(encoded_size, '\0');
+    if (mbedtls_base64_encode(reinterpret_cast<unsigned char*>(encoded.data()), encoded.size(), &encoded_size, data,
+                              size) != 0) {
+        return {};
+    }
+
+    encoded.resize(encoded_size);
+    return encoded;
+}
+
+static bool send_camera_capture(uint32_t request_id)
+{
+    auto camera = hal_bridge::board_get_camera();
+    if (!camera) {
+        return false;
+    }
+
+    if (!camera->StreamCaptures()) {
+        return false;
+    }
+
+    const uint8_t* frame_data = camera->GetFrameData();
+    const size_t frame_size = camera->GetFrameSize();
+    const int width = camera->GetFrameWidth();
+    const int height = camera->GetFrameHeight();
+    const int format = camera->GetFrameFormat();
+    uint8_t* jpeg_data = nullptr;
+    size_t jpeg_size = 0;
+
+    const bool encoded = image_to_jpeg(const_cast<uint8_t*>(frame_data), frame_size, width, height,
+                                       static_cast<v4l2_pix_fmt_t>(format), 18, &jpeg_data, &jpeg_size);
+    if (!encoded || !jpeg_data || jpeg_size == 0) {
+        if (jpeg_data) {
+            free(jpeg_data);
+        }
+        return false;
+    }
+
+    constexpr size_t chunk_size = 960;
+    const size_t total_chunks = (jpeg_size + chunk_size - 1) / chunk_size;
+
+    ArduinoJson::JsonDocument start_doc;
+    start_doc["cmd"] = "cameraStart";
+    start_doc["data"]["id"] = request_id;
+    start_doc["data"]["size"] = jpeg_size;
+    start_doc["data"]["chunks"] = total_chunks;
+    start_doc["data"]["mime"] = "image/jpeg";
+    if (!notify_json(start_doc)) {
+        free(jpeg_data);
+        return false;
+    }
+    GetHAL().delay(20);
+
+    for (size_t index = 0; index < total_chunks; index++) {
+        const size_t offset = index * chunk_size;
+        const size_t part_size = std::min(chunk_size, jpeg_size - offset);
+        const std::string encoded_chunk = base64_encode(jpeg_data + offset, part_size);
+        if (encoded_chunk.empty()) {
+            free(jpeg_data);
+            return false;
+        }
+
+        ArduinoJson::JsonDocument chunk_doc;
+        chunk_doc["cmd"] = "cameraChunk";
+        chunk_doc["data"]["id"] = request_id;
+        chunk_doc["data"]["index"] = index;
+        chunk_doc["data"]["total"] = total_chunks;
+        chunk_doc["data"]["data"] = encoded_chunk;
+        if (!notify_json(chunk_doc)) {
+            free(jpeg_data);
+            return false;
+        }
+        GetHAL().delay(15);
+    }
+
+    free(jpeg_data);
+    return true;
+}
+
+static bool send_chat_prompt(uint32_t request_id, bool has_image)
+{
+    ArduinoJson::JsonDocument doc;
+    doc["cmd"] = "chatPrompt";
+    doc["data"]["id"] = request_id;
+    doc["data"]["hasImage"] = has_image;
+    doc["data"]["text"] = has_image ? "ｽﾀｯｸﾁｬﾝのカメラ画像を見て、ぬこエビちゃんとして短く答えて。見えているものを一言で教えて。"
+                                    : "ぬこエビちゃんとして、短く挨拶して。";
+    return notify_json(doc);
+}
+
+static void local_llm_task(void* arg)
+{
+    const uint32_t request_id = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(arg));
+
+    update_llm_status("カメラ撮影中");
+    const bool has_image = send_camera_capture(request_id);
+    update_llm_status("考え中");
+
+    if (!send_chat_prompt(request_id, has_image)) {
+        finish_llm_request(request_id, "BLE send failed");
+    }
+
+    vTaskDelete(nullptr);
+}
+
+static void begin_local_llm_task()
+{
+    uint32_t request_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(_llm_mutex);
+        if (_llm_running) {
             return;
         }
 
-        if (!GetHAL().notifyBleConfig(json)) {
-            _llm_running        = false;
-            _llm_status         = "BLE send failed";
-            _llm_status_changed = true;
-            _llm_started_at     = 0;
-        }
+        _llm_running            = true;
+        _llm_requested          = false;
+        _llm_status             = "カメラ撮影中";
+        _llm_status_changed     = true;
+        _llm_started_at         = GetHAL().millis();
+        _active_chat_request_id = ++_chat_request_id;
+        request_id              = _active_chat_request_id;
+    }
+
+    if (!GetHAL().isBleConnected()) {
+        finish_llm_request(request_id, "Open iPhone app");
+        return;
+    }
+
+    const auto arg = reinterpret_cast<void*>(static_cast<uintptr_t>(request_id));
+    if (xTaskCreate(local_llm_task, "nukoevi_llm", 12288, arg, 3, nullptr) != pdPASS) {
+        finish_llm_request(request_id, "Task start failed");
     }
 }
 
@@ -349,7 +533,7 @@ static bool update_sleep_animation(uint32_t now)
         return true;
     }
 
-    const uint32_t interval = _sleep_index == 0 ? 4200 : 650;
+    const uint32_t interval = _sleep_intervals[_sleep_index];
     if (now - _sleep_timecount >= interval) {
         _sleep_timecount = now;
         _sleep_index++;
@@ -396,6 +580,7 @@ void AppNukoevi::onOpen()
     mclog::tagInfo(getAppInfo().name, "on open");
     GetHAL().setBackLightBrightness(_nukoevi_backlight_brightness, true);
     GetHAL().startBleServer();
+    load_motion_assets();
 
     LvglLockGuard lock;
 

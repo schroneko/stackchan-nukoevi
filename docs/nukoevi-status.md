@@ -23,8 +23,10 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Added tap debounce and request throttling so repeated taps do not continuously queue iPhone bridge requests.
 - Added local iPhone bridge integration using BLE `chatRequest` and `chatResponse` messages.
 - Removed the iOS background Bluetooth mode because it caused Apple Intelligence requests to fail when the standard Camera app was open.
-- Added full-frame lip-sync animation when a valid AI response is received.
-- Added night sleepy mode from 22:00 to 07:00 using generated full-frame sleepy images.
+- Added full-frame 6-frame lip-sync animation when a valid AI response is received.
+- Added night sleepy mode from 22:00 to 07:00 using generated 6-frame full-screen sleepy images.
+- Added StackChan onboard camera capture for local LLM requests. The firmware sends the captured JPEG to the iPhone bridge over BLE chunks before the prompt.
+- Added iPhone-side StackChan camera handling. The bridge reconstructs the JPEG, shows the latest camera image, extracts image context with VisionKit `ImageAnalyzer`, and passes that context into FoundationModels.
 - Added a generated app icon for the Nukoevi iPhone bridge app.
 - Stopped the Joy-Con task for now. No new Joy-Con integration is part of the current Nukoevi firmware path.
 
@@ -38,9 +40,10 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Sleep source strip: `firmware/main/apps/app_nukoevi/source-assets/nukoevi-sleep-imagegen-strip.png`.
 - Motion generator: `firmware/main/apps/app_nukoevi/source-assets/generate_nukoevi_motion_assets.py`.
 - Motion generator command: `uv run --with pillow python firmware/main/apps/app_nukoevi/source-assets/generate_nukoevi_motion_assets.py`.
-- Motion C asset: `firmware/main/apps/app_nukoevi/assets/nukoevi_motion.c`.
+- Motion runtime assets: `firmware/main/assets/assets_bin/nukoevi-talk-*.bin` and `firmware/main/assets/assets_bin/nukoevi-sleep-*.bin`.
+- Removed the generated C motion asset because it filled the app partition. Motion frames are now packed into the assets partition.
 - Motion verification command: `uv run --with pillow python firmware/main/apps/app_nukoevi/source-assets/verify_motion_asset.py`.
-- Latest motion verification preview: `firmware/main/apps/app_nukoevi/source-assets/nukoevi-motion-from-c-asset-9d6eda94cdba.png`.
+- Latest motion verification preview: `firmware/main/apps/app_nukoevi/source-assets/nukoevi-motion-from-c-asset-c100d21226db.png`.
 - iPhone app icon source: `firmware/main/apps/app_nukoevi/source-assets/nukoevi-bridge-icon-source.png`.
 - iPhone app icon generator: `ios/NukoeviBridge/scripts/generate_app_icon_assets.py`.
 - iPhone app icon generator command: `uv run --with pillow python ios/NukoeviBridge/scripts/generate_app_icon_assets.py`.
@@ -50,27 +53,29 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Generate complete screen frames for character animation.
 - Do not generate only a mouth, eyes, or other partial facial part and paste it on top of the base image.
 - Keep generated source strips and per-frame PNG files under `firmware/main/apps/app_nukoevi/source-assets/`.
-- Embed only the minimum required full-frame RGB565 C assets in firmware because the app partition is nearly full.
+- Pack generated full-frame RGB565 `.bin` assets through `firmware/main/assets/assets_bin/` so the app partition is not consumed by large generated C arrays.
+- `firmware/main/CMakeLists.txt` tracks `assets_bin` contents as dependencies, so changing generated assets rebuilds `generated_assets.bin`.
 
 ## Verified
 
 - ESP-IDF: v5.5.4 under `/Users/username/ghq/github.com/espressif/esp-idf`.
 - Build command: `idf.py build`.
 - Build result: success.
-- Flash port: `/dev/cu.usbmodem2101`.
-- Flash command: `idf.py -p /dev/cu.usbmodem2101 flash`.
+- Flash port: `/dev/cu.usbmodem3101`.
+- Flash command: `idf.py -p /dev/cu.usbmodem3101 flash`.
 - Flash result: success.
 - Monitor result: boot completed and logged `[NUKOEVI] on open`.
 - Latest motion asset verification: `matches=True`.
 - Latest firmware build result: success.
-- Latest firmware app binary size: `0x4e29d0`.
-- Latest firmware app partition free space: `0xd630`, about 1%.
+- Latest firmware app binary size: `0x472e20`.
+- Latest firmware app partition free space: `0x7d1e0`, about 10%.
+- Latest generated assets size: `4142349` bytes, about 4045 KB in the 4096 KB assets partition.
 - Latest firmware flash port: `/dev/cu.usbmodem3101`.
 - Latest firmware flash result: success.
-- Latest firmware monitor result: bootloader loaded the app image successfully. A second short monitor pass showed no reset loop output.
+- Latest firmware monitor result: boot completed, camera initialized, BLE advertising started, Nukoevi opened, and no `nukoevi-*` asset lookup failures appeared after the asset rebuild fix.
 - Latest iPhone app build command: `xcodebuild -project ios/NukoeviBridge/NukoeviBridge.xcodeproj -scheme NukoeviBridge -destination id=00008150-0002645C3A04401C build`.
 - Latest iPhone app build result: success.
-- Latest iPhone app install result: success on device `00008150-0002645C3A04401C`.
+- Latest iPhone app install result: success on device `CDCFCD1E-488F-57C8-90C6-694C51110809`.
 - Latest iPhone app launch result: success for bundle id `test.NukoeviBridge`.
 
 ## Not Included Yet
@@ -78,10 +83,10 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Custom AI agent connection.
 - Speech, audio, or conversation handling.
 - Sprite animation from the original `spritesheet.webp`.
-- VLM or camera-based perception.
 - Microphone input.
 - Standard Camera app plus Apple Intelligence background inference. The current iOS workaround is to keep the Nukoevi Bridge app active and avoid requiring background inference while the standard Camera app owns the foreground.
-- More firmware animation frames. The firmware app partition is nearly full, so additional full-frame RGB565 assets need either a partition change or a compressed/runtime-decoded asset path.
+- Direct raw-image prompting into FoundationModels. The inspected iPhoneOS 26.4 SDK exposes text prompts for `LanguageModelSession`, so the current path uses VisionKit `ImageAnalyzer` transcript/context as the image input to FoundationModels.
+- More firmware animation frames. The assets partition is now close to full, so additional full-frame RGB565 assets need either compressed/runtime-decoded assets or a partition change.
 
 ## Repository Handling
 

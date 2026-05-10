@@ -1,4 +1,6 @@
 import Foundation
+import UIKit
+import VisionKit
 
 #if canImport(FoundationModels)
 import FoundationModels
@@ -27,7 +29,49 @@ actor AppleIntelligenceResponder {
         return "AI unavailable: FoundationModels"
     }
 
-    func response(for prompt: String) async -> String {
+    func response(for prompt: String, imageData: Data? = nil) async -> String {
+        let cameraContext = await context(from: imageData)
+        let modelPrompt: String
+        if let cameraContext {
+            modelPrompt = """
+            \(prompt)
+
+            StackChan camera analysis:
+            \(cameraContext)
+            """
+        } else {
+            modelPrompt = prompt
+        }
+
+        return await responseText(for: modelPrompt)
+    }
+
+    private func context(from imageData: Data?) async -> String? {
+        guard let imageData, let image = UIImage(data: imageData) else {
+            return nil
+        }
+
+        guard ImageAnalyzer.isSupported else {
+            return "StackChan camera image was received, but ImageAnalyzer is not supported on this device."
+        }
+
+        do {
+            let analyzer = ImageAnalyzer()
+            var configuration = ImageAnalyzer.Configuration([.text, .machineReadableCode, .visualLookUp])
+            configuration.locales = ["ja-JP", "en-US"]
+            let analysis = try await analyzer.analyze(image, configuration: configuration)
+            let transcript = analysis.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+            if transcript.isEmpty {
+                return "StackChan camera image was received, but no text or visual lookup transcript was extracted."
+            }
+            return transcript
+        } catch {
+            let nsError = error as NSError
+            return "StackChan camera image was received, but image analysis failed: \(nsError.localizedDescription)"
+        }
+    }
+
+    private func responseText(for prompt: String) async -> String {
 #if canImport(FoundationModels)
         if #available(iOS 26.0, *) {
             let model = SystemLanguageModel.default

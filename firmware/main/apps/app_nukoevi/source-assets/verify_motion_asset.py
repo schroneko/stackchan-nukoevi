@@ -1,21 +1,30 @@
 import hashlib
-import re
 from pathlib import Path
 
 from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
+FIRMWARE_MAIN = ROOT.parents[1]
 SOURCE_DIR = ROOT / "source-assets"
-ASSET = ROOT / "assets" / "nukoevi_motion.c"
+ASSET_BIN_DIR = FIRMWARE_MAIN / "assets" / "assets_bin"
 RECONSTRUCTED_LATEST = SOURCE_DIR / "nukoevi-motion-from-c-asset-latest.txt"
 FRAME_WIDTH = 320
 FRAME_HEIGHT = 240
 
 FRAMES = [
-    ("talk", "nukoevi_talk_open", 2),
-    ("sleep", "nukoevi_sleep_drowsy", 0),
-    ("sleep", "nukoevi_sleep_asleep", 3),
+    ("talk", "nukoevi-talk-closed.bin", 0),
+    ("talk", "nukoevi-talk-tiny.bin", 1),
+    ("talk", "nukoevi-talk-medium.bin", 2),
+    ("talk", "nukoevi-talk-wide.bin", 3),
+    ("talk", "nukoevi-talk-small.bin", 4),
+    ("talk", "nukoevi-talk-smile.bin", 5),
+    ("sleep", "nukoevi-sleep-drowsy.bin", 0),
+    ("sleep", "nukoevi-sleep-nearly-closed.bin", 1),
+    ("sleep", "nukoevi-sleep-nod.bin", 2),
+    ("sleep", "nukoevi-sleep-asleep.bin", 3),
+    ("sleep", "nukoevi-sleep-wobble.bin", 4),
+    ("sleep", "nukoevi-sleep-return.bin", 5),
 ]
 
 
@@ -44,29 +53,20 @@ def decode_rgb565(data):
     return image
 
 
-def asset_bytes(asset_text, symbol):
-    match = re.search(rf"uint8_t {symbol}_map\[\] = \{{\n(.*?)\n\}};", asset_text, re.S)
-    if not match:
-        raise RuntimeError(f"{symbol}_map was not found")
-    values = re.findall(r"0x([0-9a-fA-F]{2})", match.group(1))
-    return bytes(int(value, 16) for value in values)
-
-
 def main():
-    text = ASSET.read_text(encoding="utf-8")
     reconstructed = []
     matches = []
 
-    for sequence, symbol, frame_index in FRAMES:
-        data = asset_bytes(text, symbol)
+    for sequence, asset_name, frame_index in FRAMES:
+        data = (ASSET_BIN_DIR / asset_name).read_bytes()[12:]
         frame = Image.open(SOURCE_DIR / f"nukoevi-{sequence}-frame-{frame_index}.png").convert("RGB")
         matches.append(data == rgb565_bytes(frame))
         reconstructed.append(decode_rgb565(data))
 
-    preview = Image.new("RGB", (FRAME_WIDTH * len(reconstructed), FRAME_HEIGHT))
+    preview = Image.new("RGB", (FRAME_WIDTH * 6, FRAME_HEIGHT * 2))
     for index, frame in enumerate(reconstructed):
-        x = index * FRAME_WIDTH
-        y = 0
+        x = (index % 6) * FRAME_WIDTH
+        y = (index // 6) * FRAME_HEIGHT
         preview.paste(frame, (x, y))
 
     digest = hashlib.sha256(preview.tobytes()).hexdigest()[:12]
