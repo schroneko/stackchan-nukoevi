@@ -6,32 +6,64 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIR = ROOT / "source-assets"
 ASSET_DIR = ROOT / "assets"
-SOURCE = SOURCE_DIR / "nukoevi-blink-imagegen.png"
+SOURCE = SOURCE_DIR / "nukoevi-blink-imagegen-contact.png"
 OUTPUT = ASSET_DIR / "nukoevi_screen.c"
 PREVIEW = SOURCE_DIR / "nukoevi-blink-preview.png"
 
 FRAME_WIDTH = 320
 FRAME_HEIGHT = 240
-SOURCE_FRAME_WIDTHS = [443, 444, 443, 444]
-SOURCE_FRAME_X = [0, 443, 887, 1330]
-SOURCE_FRAME_Y = 300
-SOURCE_FRAME_HEIGHT = 333
+FRAME_ASPECT = FRAME_WIDTH / FRAME_HEIGHT
 
 FRAMES = [
-    ("nukoevi_screen_open", "NUKOEVI_SCREEN_OPEN", 0),
-    ("nukoevi_screen_half_a", "NUKOEVI_SCREEN_HALF_A", 1),
-    ("nukoevi_screen_closed", "NUKOEVI_SCREEN_CLOSED", 2),
-    ("nukoevi_screen_half_b", "NUKOEVI_SCREEN_HALF_B", 3),
+    ("nukoevi_screen_open", "NUKOEVI_SCREEN_OPEN"),
+    ("nukoevi_screen_half_a", "NUKOEVI_SCREEN_HALF_A"),
+    ("nukoevi_screen_closed", "NUKOEVI_SCREEN_CLOSED"),
+    ("nukoevi_screen_half_b", "NUKOEVI_SCREEN_HALF_B"),
 ]
+
+
+def content_box(image):
+    rgb = image.convert("RGB")
+    pixels = rgb.load()
+    min_x = rgb.width
+    min_y = rgb.height
+    max_x = 0
+    max_y = 0
+
+    for y in range(rgb.height):
+        for x in range(rgb.width):
+            r, g, b = pixels[x, y]
+            if min(r, g, b) < 248:
+                min_x = min(min_x, x)
+                min_y = min(min_y, y)
+                max_x = max(max_x, x + 1)
+                max_y = max(max_y, y + 1)
+
+    return (min_x, min_y, max_x, max_y)
 
 
 def frame_images():
     source = Image.open(SOURCE).convert("RGB")
+    left, top, right, bottom = content_box(source)
+    strip = source.crop((left, top, right, bottom))
+    frame_width = strip.width / len(FRAMES)
     frames = []
-    for x, width in zip(SOURCE_FRAME_X, SOURCE_FRAME_WIDTHS):
-        frame = source.crop((x, SOURCE_FRAME_Y, x + width, SOURCE_FRAME_Y + SOURCE_FRAME_HEIGHT))
+
+    for index in range(len(FRAMES)):
+        frame_left = round(frame_width * index)
+        frame_right = round(frame_width * (index + 1))
+        frame = strip.crop((frame_left, 0, frame_right, strip.height))
+        frame_aspect = frame.width / frame.height
+        if frame_aspect < FRAME_ASPECT:
+            cropped_height = round(frame.width / FRAME_ASPECT)
+            frame = frame.crop((0, 0, frame.width, cropped_height))
+        elif frame_aspect > FRAME_ASPECT:
+            cropped_width = round(frame.height * FRAME_ASPECT)
+            crop_left = round((frame.width - cropped_width) / 2)
+            frame = frame.crop((crop_left, 0, crop_left + cropped_width, frame.height))
         frame = frame.resize((FRAME_WIDTH, FRAME_HEIGHT), Image.Resampling.LANCZOS)
         frames.append(frame)
+
     return frames
 
 
@@ -60,8 +92,8 @@ def write_c_file(frames):
         "#ifndef LV_ATTRIBUTE_MEM_ALIGN\n#define LV_ATTRIBUTE_MEM_ALIGN\n#endif\n",
     ]
 
-    for name, attr, index in FRAMES:
-        data = rgb565_bytes(frames[index])
+    for (name, attr), frame in zip(FRAMES, frames):
+        data = rgb565_bytes(frame)
         pieces.append(f"#ifndef LV_ATTRIBUTE_IMAGE_{attr}\n#define LV_ATTRIBUTE_IMAGE_{attr}\n#endif\n")
         pieces.append(
             f"const LV_ATTRIBUTE_MEM_ALIGN LV_ATTRIBUTE_LARGE_CONST LV_ATTRIBUTE_IMAGE_{attr} uint8_t {name}_map[] = {{\n"
@@ -86,9 +118,8 @@ def write_preview(frames):
     preview = Image.new("RGB", (FRAME_WIDTH * len(frames), FRAME_HEIGHT))
     for index, frame in enumerate(frames):
         preview.paste(frame, (index * FRAME_WIDTH, 0))
-    preview.save(PREVIEW)
-    for index, frame in enumerate(frames):
         frame.save(SOURCE_DIR / f"nukoevi-blink-frame-{index}.png")
+    preview.save(PREVIEW)
 
 
 def main():
