@@ -357,7 +357,7 @@ private:
     {
         Settings settings("display", true);
         int brightness = settings.GetInt("brightness", 75);
-        if (brightness <= 50) {
+        if (brightness <= 0) {
             settings.SetInt("brightness", 75);
             settings.EraseKey("nukoevi_brightness_50_applied");
             GetBacklight()->SetBrightness(75, false);
