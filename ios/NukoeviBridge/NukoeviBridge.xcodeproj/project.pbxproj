@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		2B92124646D90A08EC28CF56 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E31F13593FD02EB6CBFEBE76 /* ContentView.swift */; };
+		2D520A2121ADA818DF99ED15 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 47D573F878A753C89D954776 /* Assets.xcassets */; };
 		56F4C06308D49E6974665020 /* AppleIntelligenceResponder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D711BAD222761C4414FC689 /* AppleIntelligenceResponder.swift */; };
 		A39C3AA07105AFA936C94A25 /* NukoeviBridgeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 86488E3E46B05DEA675BE05E /* NukoeviBridgeApp.swift */; };
 		CC42C18D6FD156C958DAB587 /* StackChanBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8AD37A6F790B696497ADE2C /* StackChanBridge.swift */; };
@@ -17,6 +18,7 @@
 		1D711BAD222761C4414FC689 /* AppleIntelligenceResponder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppleIntelligenceResponder.swift; sourceTree = "<group>"; };
 		3AED9A5213E70A4B09A75B76 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		3E153F44541A98716D1DF4EE /* NukoeviBridge.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = NukoeviBridge.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		47D573F878A753C89D954776 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		86488E3E46B05DEA675BE05E /* NukoeviBridgeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NukoeviBridgeApp.swift; sourceTree = "<group>"; };
 		B8AD37A6F790B696497ADE2C /* StackChanBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StackChanBridge.swift; sourceTree = "<group>"; };
 		E31F13593FD02EB6CBFEBE76 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -27,6 +29,7 @@
 			isa = PBXGroup;
 			children = (
 				1D711BAD222761C4414FC689 /* AppleIntelligenceResponder.swift */,
+				47D573F878A753C89D954776 /* Assets.xcassets */,
 				E31F13593FD02EB6CBFEBE76 /* ContentView.swift */,
 				3AED9A5213E70A4B09A75B76 /* Info.plist */,
 				86488E3E46B05DEA675BE05E /* NukoeviBridgeApp.swift */,
@@ -59,6 +62,7 @@
 			buildConfigurationList = 0A1799BE8AC35E23C9946A51 /* Build configuration list for PBXNativeTarget "NukoeviBridge" */;
 			buildPhases = (
 				285BBE947BD2AEC2007F4DD7 /* Sources */,
+				2212026871113CE02183148B /* Resources */,
 			);
 			buildRules = (
 			);
@@ -105,6 +109,17 @@
 		};
 /* End PBXProject section */
 
+/* Begin PBXResourcesBuildPhase section */
+		2212026871113CE02183148B /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2D520A2121ADA818DF99ED15 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		285BBE947BD2AEC2007F4DD7 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -123,7 +138,7 @@
 		71DB8137DAAAF717F406F54A /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = "";
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -262,7 +277,7 @@
 		B3A9F568645A6B35DD65977A /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = "";
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
