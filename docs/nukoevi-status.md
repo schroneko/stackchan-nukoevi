@@ -25,6 +25,7 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Removed the iOS background Bluetooth mode because it caused Apple Intelligence requests to fail when the standard Camera app was open.
 - Added full-frame 6-frame lip-sync animation when a valid AI response is received.
 - Added night sleepy mode from 22:00 to 07:00 JST using generated 6-frame full-screen sleepy images.
+- Reframed the lip-sync and sleep motion frames to match the normal Nukoevi close-up framing more closely.
 - Added StackChan onboard camera capture for local LLM requests. The firmware sends the captured JPEG to the iPhone bridge over BLE chunks before the prompt.
 - Added iPhone-side StackChan camera handling. The bridge reconstructs the JPEG, shows the latest camera image, extracts image context with VisionKit `ImageAnalyzer`, and passes that context into FoundationModels.
 - Added a generated app icon for the Nukoevi iPhone bridge app.
@@ -43,7 +44,7 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Motion runtime assets: `firmware/main/assets/assets_bin/nukoevi-talk-*.bin` and `firmware/main/assets/assets_bin/nukoevi-sleep-*.bin`.
 - Removed the generated C motion asset because it filled the app partition. Motion frames are now packed into the assets partition.
 - Motion verification command: `uv run --with pillow python firmware/main/apps/app_nukoevi/source-assets/verify_motion_asset.py`.
-- Latest motion verification preview: `firmware/main/apps/app_nukoevi/source-assets/nukoevi-motion-from-c-asset-c100d21226db.png`.
+- Latest motion verification preview: `firmware/main/apps/app_nukoevi/source-assets/nukoevi-motion-from-c-asset-ac6aa204ad53.png`.
 - iPhone app icon source: `firmware/main/apps/app_nukoevi/source-assets/nukoevi-bridge-icon-source.png`.
 - iPhone app icon generator: `ios/NukoeviBridge/scripts/generate_app_icon_assets.py`.
 - iPhone app icon generator command: `uv run --with pillow python ios/NukoeviBridge/scripts/generate_app_icon_assets.py`.

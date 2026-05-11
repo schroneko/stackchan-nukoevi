@@ -71,9 +71,20 @@ def fit_frame(frame):
         left = round((frame.width - crop_width) / 2)
         frame = frame.crop((left, 0, left + crop_width, frame.height))
     elif frame_aspect < FRAME_ASPECT:
-        crop_height = round(frame.width / FRAME_ASPECT)
-        top = round((frame.height - crop_height) / 2)
+        base_crop_height = round(frame.width / FRAME_ASPECT)
+        crop_height = min(frame.height, round(base_crop_height * 1.05))
+        top = round((frame.height - crop_height) * 0.32)
         frame = frame.crop((0, top, frame.width, top + crop_height))
+        background = frame.resize(
+            (FRAME_WIDTH, round(frame.height * FRAME_WIDTH / frame.width)),
+            Image.Resampling.LANCZOS,
+        )
+        crop_top = max(0, round((background.height - FRAME_HEIGHT) / 2))
+        background = background.crop((0, crop_top, FRAME_WIDTH, crop_top + FRAME_HEIGHT))
+        foreground_width = round(frame.width * FRAME_HEIGHT / frame.height)
+        foreground = frame.resize((foreground_width, FRAME_HEIGHT), Image.Resampling.LANCZOS)
+        background.paste(foreground, (round((FRAME_WIDTH - foreground_width) / 2), 0))
+        return background
 
     return frame.resize((FRAME_WIDTH, FRAME_HEIGHT), Image.Resampling.LANCZOS)
 
