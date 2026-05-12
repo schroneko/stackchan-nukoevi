@@ -19,6 +19,9 @@ targets:
         CFBundleVersion: "1"
         UILaunchScreen: {}
         NSBluetoothAlwaysUsageDescription: Nukoevi Bridge uses Bluetooth to connect to StackChan.
+        NSBluetoothPeripheralUsageDescription: Nukoevi Bridge uses Bluetooth to connect to StackChan.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: test.NukoeviBridge

@@ -280,7 +280,7 @@ static bool send_camera_capture(uint32_t request_id)
         return false;
     }
 
-    constexpr size_t chunk_size = 960;
+    constexpr size_t chunk_size = 300;
     const size_t total_chunks = (jpeg_size + chunk_size - 1) / chunk_size;
 
     ArduinoJson::JsonDocument start_doc;
@@ -584,6 +584,7 @@ void AppNukoevi::onCreate()
 void AppNukoevi::onOpen()
 {
     mclog::tagInfo(getAppInfo().name, "on open");
+    GetHAL().startBleServer();
     GetHAL().setBackLightBrightness(_nukoevi_backlight_brightness, true);
     if (_espnow_signal_connection < 0) {
         _espnow_signal_connection = GetHAL().onEspNowData.connect([](const std::vector<uint8_t>& data) {
@@ -670,7 +671,16 @@ void AppNukoevi::onOpen()
     GetHAL().onBleConfigData.connect([](const char* data) {
         ArduinoJson::JsonDocument doc;
         auto error = ArduinoJson::deserializeJson(doc, data);
-        if (error || doc["cmd"] != "chatResponse") {
+        if (error) {
+            return;
+        }
+
+        const char* cmd = doc["cmd"] | "";
+        if (strcmp(cmd, "captureRequest") == 0) {
+            start_local_llm_request();
+            return;
+        }
+        if (strcmp(cmd, "chatResponse") != 0) {
             return;
         }
 

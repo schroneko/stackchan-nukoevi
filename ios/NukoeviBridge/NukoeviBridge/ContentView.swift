@@ -27,6 +27,20 @@ struct ContentView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 16))
             }
 
+            if !bridge.lastSavedCameraImagePath.isEmpty {
+                Text(bridge.lastSavedCameraImagePath)
+                    .font(.footnote.monospaced())
+                    .multilineTextAlignment(.center)
+                    .textSelection(.enabled)
+            }
+
+            if !bridge.logFilePath.isEmpty {
+                Text(bridge.logFilePath)
+                    .font(.caption.monospaced())
+                    .multilineTextAlignment(.center)
+                    .textSelection(.enabled)
+            }
+
             Text(bridge.lastResponse.isEmpty ? "Apple Intelligence response will appear here" : bridge.lastResponse)
                 .font(.body)
                 .multilineTextAlignment(.center)
@@ -39,6 +53,12 @@ struct ContentView: View {
                 bridge.start()
             }
             .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+
+            Button("Capture StackChan Camera") {
+                bridge.requestCapture()
+            }
+            .buttonStyle(.bordered)
             .controlSize(.large)
         }
         .padding(24)
