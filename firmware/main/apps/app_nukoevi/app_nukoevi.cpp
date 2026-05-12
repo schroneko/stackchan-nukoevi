@@ -78,6 +78,7 @@ static constexpr uint32_t _caption_auto_hide_ms = 6000;
 static constexpr int _caption_width       = 316;
 static constexpr int _caption_label_width = 300;
 static constexpr uint8_t _nukoevi_backlight_brightness = 30;
+static constexpr bool _enable_espnow_remote = false;
 static bool _last_touch_pressed = false;
 static bool _motion_assets_loaded = false;
 static lv_image_dsc_t _talk_closed;
@@ -214,6 +215,12 @@ static void update_llm_status(std::string_view status)
     std::lock_guard<std::mutex> lock(_llm_mutex);
     _llm_status         = status;
     _llm_status_changed = true;
+}
+
+static void start_xiaozhi_request()
+{
+    update_llm_status("聞いてます");
+    GetHAL().requestXiaozhiStart();
 }
 
 static void finish_llm_request(uint32_t request_id, std::string_view status)
@@ -387,7 +394,7 @@ static void handle_llm_timeout(uint32_t now)
     _llm_requested      = false;
     _llm_started_at     = 0;
     _active_chat_request_id = 0;
-    _llm_status         = "Open iPhone app, then tap";
+    _llm_status         = "タップして話してね";
     _llm_status_changed = true;
     _talk_requested     = false;
     mclog::tagWarn("NUKOEVI", "LLM request timed out");
@@ -559,7 +566,7 @@ static void handle_screen_tap_request()
 
     if (pressed && !_last_touch_pressed) {
         mclog::tagInfo("NUKOEVI", "raw touch press num={} x={} y={}", point.num, point.x, point.y);
-        start_local_llm_request();
+        start_xiaozhi_request();
     } else if (!pressed && _last_touch_pressed) {
         mclog::tagInfo("NUKOEVI", "raw touch release");
     }
@@ -596,8 +603,8 @@ void AppNukoevi::onOpen()
             _espnow_received_data = data;
         });
     }
-    _espnow_receives = true;
-    if (!_espnow_started) {
+    _espnow_receives = _enable_espnow_remote;
+    if (_enable_espnow_remote && !_espnow_started) {
         GetHAL().startEspNow(1);
         _espnow_started = true;
         mclog::tagInfo(getAppInfo().name, "ESP-NOW remote receiver ready on channel 1, id 1");
@@ -645,14 +652,14 @@ void AppNukoevi::onOpen()
     lv_obj_set_size(_llm_label, _caption_label_width, 34);
     lv_obj_align(_llm_label, LV_ALIGN_TOP_LEFT, 8, 6);
     lv_obj_clear_flag(_llm_label, LV_OBJ_FLAG_SCROLLABLE);
-    update_caption_text("Open iPhone app, then tap");
+    update_caption_text("タップして話してね");
 
     _panel->addFlag(LV_OBJ_FLAG_CLICKABLE);
-    _panel->onClick().connect(start_local_llm_request);
+    _panel->onClick().connect(start_xiaozhi_request);
     _avatar->addFlag(LV_OBJ_FLAG_CLICKABLE);
-    _avatar->onClick().connect(start_local_llm_request);
-    lv_obj_add_event_cb(_caption_panel, [](lv_event_t*) { start_local_llm_request(); }, LV_EVENT_CLICKED, nullptr);
-    lv_obj_add_event_cb(_llm_label, [](lv_event_t*) { start_local_llm_request(); }, LV_EVENT_CLICKED, nullptr);
+    _avatar->onClick().connect(start_xiaozhi_request);
+    lv_obj_add_event_cb(_caption_panel, [](lv_event_t*) { start_xiaozhi_request(); }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(_llm_label, [](lv_event_t*) { start_xiaozhi_request(); }, LV_EVENT_CLICKED, nullptr);
 
     if (_head_pet_signal_connection < 0) {
         _head_pet_signal_connection = GetHAL().onHeadPetGesture.connect([](HeadPetGesture gesture) {
