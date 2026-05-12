@@ -47,6 +47,11 @@ static uint8_t _head_pet_step                 = 0;
 static uint32_t _head_pet_timecount           = 0;
 static int _head_pet_base_yaw                 = 0;
 static int _head_pet_base_pitch               = 0;
+static bool _espnow_receives                  = false;
+static bool _espnow_started                   = false;
+static int _espnow_signal_connection          = -1;
+static std::mutex _espnow_mutex;
+static std::vector<uint8_t> _espnow_received_data;
 static std::mutex _llm_mutex;
 static bool _llm_running        = false;
 static bool _llm_requested      = false;
@@ -580,7 +585,22 @@ void AppNukoevi::onOpen()
 {
     mclog::tagInfo(getAppInfo().name, "on open");
     GetHAL().setBackLightBrightness(_nukoevi_backlight_brightness, true);
-    GetHAL().startBleServer();
+    if (_espnow_signal_connection < 0) {
+        _espnow_signal_connection = GetHAL().onEspNowData.connect([](const std::vector<uint8_t>& data) {
+            if (!_espnow_receives) {
+                return;
+            }
+
+            std::lock_guard<std::mutex> lock(_espnow_mutex);
+            _espnow_received_data = data;
+        });
+    }
+    _espnow_receives = true;
+    if (!_espnow_started) {
+        GetHAL().startEspNow(1);
+        _espnow_started = true;
+        mclog::tagInfo(getAppInfo().name, "ESP-NOW remote receiver ready on channel 1, id 1");
+    }
     load_motion_assets();
 
     LvglLockGuard lock;
@@ -727,11 +747,40 @@ static void handle_head_pet_motion()
     _head_pet_step++;
 }
 
+static void handle_espnow_remote_motion()
+{
+    std::vector<uint8_t> data;
+    {
+        std::lock_guard<std::mutex> lock(_espnow_mutex);
+        data.swap(_espnow_received_data);
+    }
+
+    if (data.size() < 8) {
+        return;
+    }
+
+    constexpr uint8_t receiver_id = 1;
+    const uint8_t target_id = data[0];
+    if (target_id != 0 && target_id != receiver_id) {
+        return;
+    }
+
+    const int16_t yaw_angle = static_cast<int16_t>(data[1] | (data[2] << 8));
+    const int16_t pitch_angle = static_cast<int16_t>(data[3] | (data[4] << 8));
+    const int16_t speed = static_cast<int16_t>(data[5] | (data[6] << 8));
+
+    mclog::tagInfo("NUKOEVI", "espnow remote yaw={} pitch={} speed={}", yaw_angle, pitch_angle, speed);
+    _head_pet_active = false;
+    GetStackChan().motion().moveWithSpeed(yaw_angle, pitch_angle, speed);
+}
+
 void AppNukoevi::onRunning()
 {
     LvglLockGuard lock;
     view::update_home_indicator();
+    handle_espnow_remote_motion();
     handle_head_pet_motion();
+    GetStackChan().update();
     handle_screen_tap_request();
 
     constexpr uint32_t blink_interval_ms = 3200;
@@ -810,6 +859,11 @@ void AppNukoevi::onClose()
 
     view::destroy_home_indicator();
     _head_pet_receives = false;
+    _espnow_receives = false;
+    {
+        std::lock_guard<std::mutex> lock(_espnow_mutex);
+        _espnow_received_data.clear();
+    }
     GetHAL().onBleConfigData.clear();
     if (_caption_panel && lv_obj_is_valid(_caption_panel)) {
         lv_obj_delete(_caption_panel);

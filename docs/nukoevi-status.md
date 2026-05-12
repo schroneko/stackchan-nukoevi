@@ -29,7 +29,7 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Added StackChan onboard camera capture for local LLM requests. The firmware sends the captured JPEG to the iPhone bridge over BLE chunks before the prompt.
 - Added iPhone-side StackChan camera handling. The bridge reconstructs the JPEG, shows the latest camera image, extracts image context with VisionKit `ImageAnalyzer`, and passes that context into FoundationModels.
 - Added a generated app icon for the Nukoevi iPhone bridge app.
-- Stopped the Joy-Con task for now. No new Joy-Con integration is part of the current Nukoevi firmware path.
+- Added ESP-NOW remote receiver handling to the Nukoevi app on channel 1 with receiver id 1, matching the official remote packet format for yaw, pitch, and speed.
 
 ## Asset Generation
 
@@ -89,6 +89,7 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Standard Camera app plus Apple Intelligence background inference. The current iOS workaround is to keep the Nukoevi Bridge app active and avoid requiring background inference while the standard Camera app owns the foreground.
 - Direct raw-image prompting into FoundationModels. The inspected iPhoneOS 26.4 SDK exposes text prompts for `LanguageModelSession`, so the current path uses VisionKit `ImageAnalyzer` transcript/context as the image input to FoundationModels.
 - More firmware animation frames. The assets partition is now close to full, so additional full-frame RGB565 assets need either compressed/runtime-decoded assets or a partition change.
+- Joy-Con or remote control mapping beyond the official ESP-NOW yaw/pitch packet path.
 
 ## Repository Handling
 
