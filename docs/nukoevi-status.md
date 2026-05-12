@@ -57,6 +57,12 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Pack generated full-frame RGB565 `.bin` assets through `firmware/main/assets/assets_bin/` so the app partition is not consumed by large generated C arrays.
 - `firmware/main/CMakeLists.txt` tracks `assets_bin` contents as dependencies, so changing generated assets rebuilds `generated_assets.bin`.
 
+## AI Agent Rule
+
+- Do not connect NiceVoice or any separate Mac-side STT path to the Nukoevi AI Agent flow.
+- Voice input must follow StackChan's standard AI Agent flow: StackChan sends microphone audio through the Xiaozhi WebSocket protocol, and the server side returns standard `stt`, `llm`, and `tts` messages.
+- The intended customization point is the LLM response after standard AI Agent speech recognition, replacing that LLM response with Claude Code Channels output.
+
 ## Verified
 
 - ESP-IDF: v5.5.4 under `/Users/username/ghq/github.com/espressif/esp-idf`.
@@ -82,8 +88,8 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 
 ## Not Included Yet
 
-- Custom AI agent connection.
-- Speech, audio, or conversation handling.
+- Custom AI agent connection fully verified on the physical StackChan.
+- End-to-end speech conversation with Claude Code Channels fully verified on the physical StackChan.
 - Sprite animation from the original `spritesheet.webp`.
 - Microphone input.
 - Standard Camera app plus Apple Intelligence background inference. The current iOS workaround is to keep the Nukoevi Bridge app active and avoid requiring background inference while the standard Camera app owns the foreground.

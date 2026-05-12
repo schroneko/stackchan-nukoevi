@@ -37,6 +37,8 @@ static std::unique_ptr<Container> _panel;
 static std::unique_ptr<Image> _avatar;
 static lv_obj_t* _caption_panel = nullptr;
 static lv_obj_t* _llm_label     = nullptr;
+static lv_obj_t* _listen_indicator = nullptr;
+static lv_obj_t* _listen_indicator_dot = nullptr;
 static uint32_t _blink_timecount = 0;
 static uint8_t _blink_index      = 0;
 static bool _head_pet_receives                = false;
@@ -50,12 +52,16 @@ static int _head_pet_base_pitch               = 0;
 static bool _espnow_receives                  = false;
 static bool _espnow_started                   = false;
 static int _espnow_signal_connection          = -1;
+static int _xiaozhi_text_signal_connection    = -1;
+static int _xiaozhi_status_signal_connection  = -1;
 static std::mutex _espnow_mutex;
 static std::vector<uint8_t> _espnow_received_data;
 static std::mutex _llm_mutex;
 static bool _llm_running        = false;
 static bool _llm_requested      = false;
 static bool _llm_status_changed = false;
+static bool _caption_hide_requested = false;
+static bool _listen_indicator_requested = false;
 static std::string _llm_status;
 static uint32_t _chat_request_id = 0;
 static uint32_t _active_chat_request_id = 0;
@@ -65,6 +71,7 @@ static constexpr uint32_t _llm_timeout_ms = 60000;
 static constexpr uint32_t _llm_request_interval_ms = 2500;
 static uint32_t _caption_updated_at = 0;
 static bool _caption_visible = false;
+static bool _listen_indicator_visible = false;
 static bool _talk_requested = false;
 static size_t _talk_request_text_size = 0;
 static bool _talk_active = false;
@@ -217,10 +224,83 @@ static void update_llm_status(std::string_view status)
     _llm_status_changed = true;
 }
 
+static void set_listen_indicator_requested(bool visible)
+{
+    std::lock_guard<std::mutex> lock(_llm_mutex);
+    _listen_indicator_requested = visible;
+}
+
 static void start_xiaozhi_request()
 {
-    update_llm_status("聞いてます");
-    GetHAL().requestXiaozhiStart();
+    const auto now = GetHAL().millis();
+    if (_last_llm_request_at != 0 && now - _last_llm_request_at < 1500) {
+        return;
+    }
+    _last_llm_request_at = now;
+    if (GetHAL().isXiaozhiListening() || GetHAL().isXiaozhiSpeaking()) {
+        update_llm_status("キャンセル中");
+    } else {
+        update_llm_status("準備中");
+    }
+    GetHAL().requestXiaozhiListening();
+}
+
+static void handle_xiaozhi_status(std::string_view status)
+{
+    if (status == "Listening...") {
+        std::lock_guard<std::mutex> lock(_llm_mutex);
+        _listen_indicator_requested = true;
+        if (_llm_status == "準備中") {
+            _caption_hide_requested = true;
+        }
+        return;
+    }
+
+    if (status == "Connecting..." || status == "Logging in..." || status == "Loading assets..." ||
+        status == "Activation") {
+        set_listen_indicator_requested(false);
+        update_llm_status("準備中");
+        return;
+    }
+
+    if (status == "Speaking...") {
+        set_listen_indicator_requested(false);
+        return;
+    }
+
+    if (status == "Standby") {
+        std::lock_guard<std::mutex> lock(_llm_mutex);
+        _listen_indicator_requested = false;
+        if (!_caption_visible || _llm_status == "準備中" || _llm_status == "キャンセル中") {
+            _llm_status = "タップして話してね";
+            _llm_status_changed = true;
+        }
+    }
+}
+
+static void handle_xiaozhi_text_message(const WsTextMessage_t& message)
+{
+    const std::string& role = message.name;
+    const std::string& text = message.content;
+    if (text.empty()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(_llm_mutex);
+    if (role == "assistant") {
+        _llm_status = text;
+        _llm_status_changed = true;
+        if (should_talk_for_text(text)) {
+            _talk_requested = true;
+            _talk_request_text_size = text.size();
+        }
+        return;
+    }
+
+    if (role == "user") {
+        _llm_status = text;
+        _llm_status_changed = true;
+    }
 }
 
 static void finish_llm_request(uint32_t request_id, std::string_view status)
@@ -490,15 +570,42 @@ static void update_caption_text(const std::string& text)
     mclog::tagInfo("NUKOEVI", "caption updated: {}", caption_text);
 }
 
-static void handle_caption_auto_hide(uint32_t now)
+static void hide_caption_panel()
 {
-    if (!_caption_panel || !_caption_visible || _llm_running || now - _caption_updated_at < _caption_auto_hide_ms) {
+    if (!_caption_panel || !_caption_visible) {
         return;
     }
 
     lv_obj_add_flag(_caption_panel, LV_OBJ_FLAG_HIDDEN);
     _caption_visible = false;
     mclog::tagInfo("NUKOEVI", "caption hidden");
+}
+
+static void update_listen_indicator(bool visible)
+{
+    if (!_listen_indicator) {
+        return;
+    }
+    if (_listen_indicator_visible == visible) {
+        return;
+    }
+
+    if (visible) {
+        lv_obj_clear_flag(_listen_indicator, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(_listen_indicator);
+    } else {
+        lv_obj_add_flag(_listen_indicator, LV_OBJ_FLAG_HIDDEN);
+    }
+    _listen_indicator_visible = visible;
+}
+
+static void handle_caption_auto_hide(uint32_t now)
+{
+    if (!_caption_panel || !_caption_visible || _llm_running || now - _caption_updated_at < _caption_auto_hide_ms) {
+        return;
+    }
+
+    hide_caption_panel();
 }
 
 static bool update_talk_animation(uint32_t now)
@@ -591,7 +698,6 @@ void AppNukoevi::onCreate()
 void AppNukoevi::onOpen()
 {
     mclog::tagInfo(getAppInfo().name, "on open");
-    GetHAL().startBleServer();
     GetHAL().setBackLightBrightness(_nukoevi_backlight_brightness, true);
     if (_espnow_signal_connection < 0) {
         _espnow_signal_connection = GetHAL().onEspNowData.connect([](const std::vector<uint8_t>& data) {
@@ -602,6 +708,12 @@ void AppNukoevi::onOpen()
             std::lock_guard<std::mutex> lock(_espnow_mutex);
             _espnow_received_data = data;
         });
+    }
+    if (_xiaozhi_status_signal_connection < 0) {
+        _xiaozhi_status_signal_connection = GetHAL().onXiaozhiStatus.connect(handle_xiaozhi_status);
+    }
+    if (_xiaozhi_text_signal_connection < 0) {
+        _xiaozhi_text_signal_connection = GetHAL().onXiaozhiTextMessage.connect(handle_xiaozhi_text_message);
     }
     _espnow_receives = _enable_espnow_remote;
     if (_enable_espnow_remote && !_espnow_started) {
@@ -653,6 +765,29 @@ void AppNukoevi::onOpen()
     lv_obj_align(_llm_label, LV_ALIGN_TOP_LEFT, 8, 6);
     lv_obj_clear_flag(_llm_label, LV_OBJ_FLAG_SCROLLABLE);
     update_caption_text("タップして話してね");
+
+    _listen_indicator = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(_listen_indicator, 24, 24);
+    lv_obj_align(_listen_indicator, LV_ALIGN_TOP_RIGHT, -8, 8);
+    lv_obj_set_style_radius(_listen_indicator, 12, LV_PART_MAIN);
+    lv_obj_set_style_border_width(_listen_indicator, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(_listen_indicator, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(_listen_indicator, lv_color_hex(0x2B1710), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(_listen_indicator, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(_listen_indicator, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(_listen_indicator, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(_listen_indicator, LV_OBJ_FLAG_CLICKABLE);
+
+    _listen_indicator_dot = lv_obj_create(_listen_indicator);
+    lv_obj_set_size(_listen_indicator_dot, 8, 8);
+    lv_obj_align(_listen_indicator_dot, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(_listen_indicator_dot, 4, LV_PART_MAIN);
+    lv_obj_set_style_border_width(_listen_indicator_dot, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(_listen_indicator_dot, lv_color_hex(0xF5B06F), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(_listen_indicator_dot, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_clear_flag(_listen_indicator_dot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(_listen_indicator, LV_OBJ_FLAG_HIDDEN);
+    _listen_indicator_visible = false;
 
     _panel->addFlag(LV_OBJ_FLAG_CLICKABLE);
     _panel->onClick().connect(start_xiaozhi_request);
@@ -812,6 +947,8 @@ void AppNukoevi::onRunning()
 
     bool should_start_llm = false;
     bool should_start_talk = false;
+    bool should_hide_caption = false;
+    bool listen_indicator_visible = false;
     size_t talk_text_size = 0;
     {
         std::lock_guard<std::mutex> lock(_llm_mutex);
@@ -831,6 +968,16 @@ void AppNukoevi::onRunning()
             talk_text_size = _talk_request_text_size;
             _talk_request_text_size = 0;
         }
+        if (_caption_hide_requested) {
+            _caption_hide_requested = false;
+            should_hide_caption = true;
+        }
+        listen_indicator_visible = _listen_indicator_requested;
+    }
+
+    update_listen_indicator(listen_indicator_visible);
+    if (should_hide_caption) {
+        hide_caption_panel();
     }
 
     if (should_start_llm) {
@@ -877,6 +1024,14 @@ void AppNukoevi::onClose()
     view::destroy_home_indicator();
     _head_pet_receives = false;
     _espnow_receives = false;
+    if (_xiaozhi_status_signal_connection >= 0) {
+        GetHAL().onXiaozhiStatus.disconnect(_xiaozhi_status_signal_connection);
+        _xiaozhi_status_signal_connection = -1;
+    }
+    if (_xiaozhi_text_signal_connection >= 0) {
+        GetHAL().onXiaozhiTextMessage.disconnect(_xiaozhi_text_signal_connection);
+        _xiaozhi_text_signal_connection = -1;
+    }
     {
         std::lock_guard<std::mutex> lock(_espnow_mutex);
         _espnow_received_data.clear();
@@ -885,10 +1040,18 @@ void AppNukoevi::onClose()
     if (_caption_panel && lv_obj_is_valid(_caption_panel)) {
         lv_obj_delete(_caption_panel);
     }
+    if (_listen_indicator && lv_obj_is_valid(_listen_indicator)) {
+        lv_obj_delete(_listen_indicator);
+    }
     _llm_label     = nullptr;
     _caption_panel = nullptr;
+    _listen_indicator = nullptr;
+    _listen_indicator_dot = nullptr;
     _caption_visible = false;
     _caption_updated_at = 0;
+    _listen_indicator_visible = false;
+    _listen_indicator_requested = false;
+    _caption_hide_requested = false;
     _avatar.reset();
     _panel.reset();
 }

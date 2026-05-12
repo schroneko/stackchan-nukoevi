@@ -1,1 +1,1 @@
-/Users/username/ghq/github.com/schroneko/stackchan-nukoevi/firmware/main/apps/app_nukoevi/source-assets/nukoevi-motion-from-c-asset-ac6aa204ad53.png
+/Users/username/ghq/github.com/schroneko/stackchan-nukoevi/firmware/main/apps/app_nukoevi/source-assets/nukoevi-motion-from-c-asset-60ed243a6e68.png

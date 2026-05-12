@@ -134,6 +134,7 @@ void Hal::updateHeapStatusLog()
 #include <stackchan/stackchan.h>
 #include <apps/common/common.h>
 #include <assets/assets.h>
+#include <application.h>
 
 void Hal::xiaozhi_board_init()
 {
@@ -181,8 +182,8 @@ void Hal::startXiaozhi()
     mclog::tagInfo(_tag, "start xiaozhi");
 
     auto& motion = GetStackChan().motion();
-    motion.setAutoAngleSyncEnabled(true);
-    motion.setAutoTorqueReleaseEnabled(true);
+    motion.setAutoAngleSyncEnabled(false);
+    motion.setAutoTorqueReleaseEnabled(false);
 
     // Setup reminder handler
     tools::on_reminder_triggered().clear();
@@ -200,6 +201,89 @@ void Hal::startXiaozhi()
     xTaskCreatePinnedToCore(_stackchan_update_task, "stackchan", 4096, NULL, 3, NULL, 1);
 
     hal_bridge::start_xiaozhi_app();
+}
+
+static void _xiaozhi_background_task(void*)
+{
+    hal_bridge::start_xiaozhi_app();
+}
+
+static bool _xiaozhi_start_listening_scheduled = false;
+
+static void _xiaozhi_start_listening_task(void*)
+{
+    vTaskDelay(pdMS_TO_TICKS(200));
+    Application::GetInstance().ToggleChatState();
+    _xiaozhi_start_listening_scheduled = false;
+    vTaskDelete(nullptr);
+}
+
+static void _schedule_xiaozhi_start_listening()
+{
+    if (_xiaozhi_start_listening_scheduled) {
+        return;
+    }
+
+    _xiaozhi_start_listening_scheduled = true;
+    xTaskCreatePinnedToCore(_xiaozhi_start_listening_task, "xiaozhi-listen", 4096, nullptr, 5, nullptr, 0);
+}
+
+void Hal::startXiaozhiBackground()
+{
+    if (_xiaozhi_background_started) {
+        return;
+    }
+
+    mclog::tagInfo(_tag, "start xiaozhi background");
+    _xiaozhi_background_started = true;
+    auto result = xTaskCreatePinnedToCore(_xiaozhi_background_task, "xiaozhi-bg", 8192, nullptr, 5,
+                                          &_xiaozhi_background_task_handle, 0);
+    if (result != pdPASS) {
+        mclog::tagError(_tag, "failed to start xiaozhi background task");
+        _xiaozhi_background_started = false;
+        _xiaozhi_listen_requested = false;
+    }
+}
+
+void Hal::requestXiaozhiListening()
+{
+    _xiaozhi_listen_requested = true;
+    startXiaozhiBackground();
+
+    if (!hal_bridge::is_xiaozhi_ready()) {
+        return;
+    }
+
+    _xiaozhi_listen_requested = false;
+    _schedule_xiaozhi_start_listening();
+}
+
+void Hal::notifyXiaozhiReady()
+{
+    if (!_xiaozhi_listen_requested) {
+        return;
+    }
+
+    _xiaozhi_listen_requested = false;
+    _schedule_xiaozhi_start_listening();
+}
+
+bool Hal::isXiaozhiListening()
+{
+    if (!_xiaozhi_background_started) {
+        return false;
+    }
+
+    return Application::GetInstance().GetDeviceState() == kDeviceStateListening;
+}
+
+bool Hal::isXiaozhiSpeaking()
+{
+    if (!_xiaozhi_background_started) {
+        return false;
+    }
+
+    return Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking;
 }
 
 XiaozhiConfig_t Hal::getXiaozhiConfig()

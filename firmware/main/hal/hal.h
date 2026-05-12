@@ -15,6 +15,8 @@
 #include <array>
 #include <lvgl_image.h>
 #include <string_view>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 /**
  * @brief
@@ -198,8 +200,15 @@ public:
         return _xiaozhi_start_requested;
     }
     void startXiaozhi();
+    void startXiaozhiBackground();
+    void requestXiaozhiListening();
+    void notifyXiaozhiReady();
+    bool isXiaozhiListening();
+    bool isXiaozhiSpeaking();
     XiaozhiConfig_t getXiaozhiConfig();
     void setXiaozhiConfig(XiaozhiConfig_t config);
+    uitk::Signal<const WsTextMessage_t&> onXiaozhiTextMessage;
+    uitk::Signal<std::string_view> onXiaozhiStatus;
 
     /* ----------------------------------- BLE ---------------------------------- */
     uitk::Signal<const char*> onBleMotionData;
@@ -288,6 +297,9 @@ public:
 
 private:
     bool _xiaozhi_start_requested = false;
+    bool _xiaozhi_background_started = false;
+    bool _xiaozhi_listen_requested = false;
+    TaskHandle_t _xiaozhi_background_task_handle = nullptr;
 
     void xiaozhi_board_init();
     void lvgl_init();
