@@ -6,6 +6,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
+import { spawnSync } from 'child_process'
 import { randomUUID } from 'crypto'
 import { mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { homedir } from 'os'
@@ -18,6 +19,13 @@ const fakeChatWsUrl = process.env.STACKCHAN_FAKECHAT_WS ?? 'ws://127.0.0.1:8787/
 const upstreamOtaUrl = process.env.STACKCHAN_UPSTREAM_OTA_URL ?? 'https://api.tenclass.net/xiaozhi/ota/'
 const directMcpChannel = process.env.STACKCHAN_DIRECT_MCP_CHANNEL === '1'
 const statePath = process.env.STACKCHAN_RELAY_STATE_PATH ?? `${homedir()}/.local/state/stackchan-xiaozhi-relay/upstream.json`
+const irodoriTtsUrl = process.env.STACKCHAN_IRODORI_TTS_URL ?? 'https://schroneko-irodori-tts-stackchan-api.hf.space/synthesis'
+const irodoriTtsKey = process.env.STACKCHAN_IRODORI_TTS_KEY ?? ''
+const irodoriTtsSpeaker = process.env.STACKCHAN_IRODORI_TTS_SPEAKER ?? '3'
+const irodoriTtsSteps = process.env.STACKCHAN_IRODORI_TTS_STEPS ?? '24'
+const irodoriTtsSeconds = process.env.STACKCHAN_IRODORI_TTS_SECONDS ?? ''
+const irodoriTtsEnabled = process.env.STACKCHAN_IRODORI_TTS_ENABLED !== '0'
+const irodoriTtsFrameDelayMs = Number(process.env.STACKCHAN_IRODORI_TTS_FRAME_DELAY_MS ?? '55')
 
 type StackChanRequest = {
   id: string
@@ -134,6 +142,165 @@ function sendStackChanText(ws: ServerWebSocket<StackChanConnection>, sessionId: 
     sendJson(ws, { session_id: sessionId, type: 'tts', state: 'sentence_start', text: normalized })
     sendJson(ws, { session_id: sessionId, type: 'tts', state: 'stop' })
   }
+}
+
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function concatUint8Arrays(chunks: Uint8Array[]) {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0)
+  const output = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    output.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return output
+}
+
+function hasAsciiPrefix(value: Uint8Array, prefix: string) {
+  if (value.byteLength < prefix.length) return false
+  for (let index = 0; index < prefix.length; index++) {
+    if (value[index] !== prefix.charCodeAt(index)) return false
+  }
+  return true
+}
+
+function oggOpusPackets(ogg: Uint8Array) {
+  const packets: Uint8Array[] = []
+  let offset = 0
+  let current: Uint8Array[] = []
+
+  while (offset + 27 <= ogg.byteLength) {
+    if (String.fromCharCode(...ogg.slice(offset, offset + 4)) !== 'OggS') {
+      throw new Error(`invalid ogg capture pattern at ${offset}`)
+    }
+
+    const segmentCount = ogg[offset + 26]
+    const segmentTableOffset = offset + 27
+    const payloadOffset = segmentTableOffset + segmentCount
+    if (payloadOffset > ogg.byteLength) {
+      throw new Error('truncated ogg segment table')
+    }
+
+    const segmentSizes = ogg.slice(segmentTableOffset, payloadOffset)
+    const payloadSize = segmentSizes.reduce((sum, value) => sum + value, 0)
+    const pageEnd = payloadOffset + payloadSize
+    if (pageEnd > ogg.byteLength) {
+      throw new Error('truncated ogg payload')
+    }
+
+    let cursor = payloadOffset
+    for (const size of segmentSizes) {
+      current.push(ogg.slice(cursor, cursor + size))
+      cursor += size
+      if (size < 255) {
+        const packet = concatUint8Arrays(current)
+        current = []
+        if (!hasAsciiPrefix(packet, 'OpusHead') && !hasAsciiPrefix(packet, 'OpusTags')) {
+          packets.push(packet)
+        }
+      }
+    }
+
+    offset = pageEnd
+  }
+
+  return packets
+}
+
+function encodeMp3ToOpusPackets(mp3: Uint8Array) {
+  const result = spawnSync('ffmpeg', [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-i',
+    'pipe:0',
+    '-ar',
+    '16000',
+    '-ac',
+    '1',
+    '-c:a',
+    'libopus',
+    '-application',
+    'voip',
+    '-b:a',
+    '24k',
+    '-frame_duration',
+    '60',
+    '-f',
+    'opus',
+    'pipe:1',
+  ], {
+    input: Buffer.from(mp3),
+    maxBuffer: 16 * 1024 * 1024,
+  })
+
+  if (result.status !== 0) {
+    throw new Error(`ffmpeg failed: ${result.stderr.toString().trim()}`)
+  }
+
+  return oggOpusPackets(new Uint8Array(result.stdout))
+}
+
+async function synthesizeIrodoriMp3(text: string) {
+  const url = new URL(irodoriTtsUrl)
+  url.searchParams.set('text', text)
+  url.searchParams.set('speaker', irodoriTtsSpeaker)
+  url.searchParams.set('steps', irodoriTtsSteps)
+  if (irodoriTtsSeconds) url.searchParams.set('seconds', irodoriTtsSeconds)
+  if (irodoriTtsKey) url.searchParams.set('key', irodoriTtsKey)
+
+  const response = await fetch(url)
+  const body = await response.text()
+  if (!response.ok) {
+    throw new Error(`Irodori synthesis failed: ${response.status} ${body}`)
+  }
+
+  const json = JSON.parse(body) as { success?: boolean; mp3StreamingUrl?: string; mp3DownloadUrl?: string; error?: string }
+  if (json.success === false) {
+    throw new Error(`Irodori synthesis failed: ${json.error ?? body}`)
+  }
+
+  const audioUrl = json.mp3StreamingUrl ?? json.mp3DownloadUrl
+  if (!audioUrl) {
+    throw new Error(`Irodori response has no mp3 URL: ${body}`)
+  }
+
+  const audioResponse = await fetch(audioUrl)
+  if (!audioResponse.ok) {
+    throw new Error(`Irodori audio download failed: ${audioResponse.status}`)
+  }
+  return new Uint8Array(await audioResponse.arrayBuffer())
+}
+
+async function sendStackChanAssistant(ws: ServerWebSocket<StackChanConnection>, sessionId: string, text: string) {
+  const normalized = normalizeText(text)
+  if (!normalized) return
+
+  sendJson(ws, { session_id: sessionId, type: 'llm', emotion: 'happy' })
+  sendJson(ws, { session_id: sessionId, type: 'tts', state: 'start' })
+  sendJson(ws, { session_id: sessionId, type: 'tts', state: 'sentence_start', text: normalized })
+
+  if (irodoriTtsEnabled) {
+    try {
+      log(`Irodori TTS request: ${normalized}`)
+      const mp3 = await synthesizeIrodoriMp3(normalized)
+      const packets = encodeMp3ToOpusPackets(mp3)
+      log(`Irodori TTS packets: ${packets.length}`)
+      for (const packet of packets) {
+        ws.send(packet)
+        if (irodoriTtsFrameDelayMs > 0) {
+          await sleep(irodoriTtsFrameDelayMs)
+        }
+      }
+    } catch (err) {
+      log(`Irodori TTS skipped: ${err}`)
+    }
+  }
+
+  sendJson(ws, { session_id: sessionId, type: 'tts', state: 'stop' })
 }
 
 function finishStackChanTurn(ws: ServerWebSocket<StackChanConnection>) {
@@ -442,7 +609,7 @@ class UpstreamConnection {
 
   private async replyWithClaude(transcript: string) {
     const reply = await askClaude(transcript, this.local, this.local.data.sessionId, this.local.data.deviceId)
-    sendStackChanText(this.local, this.local.data.sessionId, reply, 'assistant')
+    await sendStackChanAssistant(this.local, this.local.data.sessionId, reply)
     finishStackChanTurn(this.local)
   }
 }
@@ -497,9 +664,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 
   entry.resolve(text)
-  if (entry.socket) {
-    finishStackChanTurn(entry.socket)
-  }
   return { content: [{ type: 'text', text: 'sent' }] }
 })
 
