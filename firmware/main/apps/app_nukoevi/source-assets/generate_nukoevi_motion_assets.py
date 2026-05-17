@@ -1,6 +1,7 @@
 from pathlib import Path
 import struct
 
+import lz4.block
 from PIL import Image
 
 
@@ -13,6 +14,8 @@ FRAME_HEIGHT = 240
 FRAME_ASPECT = FRAME_WIDTH / FRAME_HEIGHT
 LV_IMAGE_HEADER_MAGIC = 0x19
 LV_COLOR_FORMAT_RGB565 = 0x12
+LV_IMAGE_FLAGS_COMPRESSED = 0x08
+LV_IMAGE_COMPRESS_LZ4 = 0x02
 
 SEQUENCES = [
     (
@@ -117,13 +120,24 @@ def rgb565_bytes(image):
 
 def write_bin_asset(name, frame):
     data = rgb565_bytes(frame)
+    compressed = lz4.block.compress(bytes(data), store_size=False)
     header = struct.pack(
-        "<III",
-        LV_IMAGE_HEADER_MAGIC | (LV_COLOR_FORMAT_RGB565 << 8),
-        FRAME_WIDTH | (FRAME_HEIGHT << 16),
+        "<BBHHHHH",
+        LV_IMAGE_HEADER_MAGIC,
+        LV_COLOR_FORMAT_RGB565,
+        LV_IMAGE_FLAGS_COMPRESSED,
+        FRAME_WIDTH,
+        FRAME_HEIGHT,
         FRAME_WIDTH * 2,
+        0,
     )
-    (ASSET_BIN_DIR / name).write_bytes(header + data)
+    compression_header = struct.pack(
+        "<III",
+        LV_IMAGE_COMPRESS_LZ4,
+        len(compressed),
+        len(data),
+    )
+    (ASSET_BIN_DIR / name).write_bytes(header + compression_header + compressed)
 
 
 def write_preview(sequence_name, frames):

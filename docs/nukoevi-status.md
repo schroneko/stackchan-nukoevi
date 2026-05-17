@@ -40,10 +40,10 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Lip-sync source strip: `firmware/main/apps/app_nukoevi/source-assets/nukoevi-talk-imagegen-strip.png`.
 - Sleep source strip: `firmware/main/apps/app_nukoevi/source-assets/nukoevi-sleep-imagegen-strip.png`.
 - Motion generator: `firmware/main/apps/app_nukoevi/source-assets/generate_nukoevi_motion_assets.py`.
-- Motion generator command: `uv run --with pillow python firmware/main/apps/app_nukoevi/source-assets/generate_nukoevi_motion_assets.py`.
+- Motion generator command: `uv run --with pillow --with lz4 python firmware/main/apps/app_nukoevi/source-assets/generate_nukoevi_motion_assets.py`.
 - Motion runtime assets: `firmware/main/assets/assets_bin/nukoevi-talk-*.bin` and `firmware/main/assets/assets_bin/nukoevi-sleep-*.bin`.
 - Removed the generated C motion asset because it filled the app partition. Motion frames are now packed into the assets partition.
-- Motion verification command: `uv run --with pillow python firmware/main/apps/app_nukoevi/source-assets/verify_motion_asset.py`.
+- Motion verification command: `uv run --with pillow --with lz4 python firmware/main/apps/app_nukoevi/source-assets/verify_motion_asset.py`.
 - Latest motion verification preview: `firmware/main/apps/app_nukoevi/source-assets/nukoevi-motion-from-c-asset-ac6aa204ad53.png`.
 - iPhone app icon source: `firmware/main/apps/app_nukoevi/source-assets/nukoevi-bridge-icon-source.png`.
 - iPhone app icon generator: `ios/NukoeviBridge/scripts/generate_app_icon_assets.py`.

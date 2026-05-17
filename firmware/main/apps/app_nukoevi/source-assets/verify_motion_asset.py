@@ -1,6 +1,8 @@
 import hashlib
 from pathlib import Path
+import struct
 
+import lz4.block
 from PIL import Image
 
 
@@ -11,6 +13,8 @@ ASSET_BIN_DIR = FIRMWARE_MAIN / "assets" / "assets_bin"
 RECONSTRUCTED_LATEST = SOURCE_DIR / "nukoevi-motion-from-c-asset-latest.txt"
 FRAME_WIDTH = 320
 FRAME_HEIGHT = 240
+LV_IMAGE_FLAGS_COMPRESSED = 0x08
+LV_IMAGE_COMPRESS_LZ4 = 0x02
 
 FRAMES = [
     ("talk", "nukoevi-talk-closed.bin", 0),
@@ -53,12 +57,25 @@ def decode_rgb565(data):
     return image
 
 
+def read_asset_pixels(asset_name):
+    data = (ASSET_BIN_DIR / asset_name).read_bytes()
+    flags = struct.unpack_from("<H", data, 2)[0]
+    payload = data[12:]
+    if flags & LV_IMAGE_FLAGS_COMPRESSED:
+        method, compressed_size, raw_size = struct.unpack_from("<III", payload, 0)
+        if method != LV_IMAGE_COMPRESS_LZ4:
+            raise ValueError(f"unsupported compression method: {method}")
+        compressed = payload[12:12 + compressed_size]
+        return lz4.block.decompress(compressed, uncompressed_size=raw_size)
+    return payload
+
+
 def main():
     reconstructed = []
     matches = []
 
     for sequence, asset_name, frame_index in FRAMES:
-        data = (ASSET_BIN_DIR / asset_name).read_bytes()[12:]
+        data = read_asset_pixels(asset_name)
         frame = Image.open(SOURCE_DIR / f"nukoevi-{sequence}-frame-{frame_index}.png").convert("RGB")
         matches.append(data == rgb565_bytes(frame))
         reconstructed.append(decode_rgb565(data))
