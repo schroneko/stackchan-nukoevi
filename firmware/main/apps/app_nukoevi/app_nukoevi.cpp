@@ -42,6 +42,8 @@ static lv_obj_t* _mic_button = nullptr;
 static lv_obj_t* _wifi_button = nullptr;
 static lv_obj_t* _wifi_label = nullptr;
 static lv_obj_t* _wifi_off_badge = nullptr;
+static lv_obj_t* _battery_panel = nullptr;
+static lv_obj_t* _battery_label = nullptr;
 static lv_obj_t* _controls_scrim = nullptr;
 static lv_obj_t* _controls_modal = nullptr;
 static lv_obj_t* _brightness_label = nullptr;
@@ -252,6 +254,64 @@ static void update_wifi_button()
     }
 }
 
+static const char* get_battery_symbol(uint8_t level)
+{
+    if (level >= 90) {
+        return LV_SYMBOL_BATTERY_FULL;
+    }
+    if (level >= 65) {
+        return LV_SYMBOL_BATTERY_3;
+    }
+    if (level >= 40) {
+        return LV_SYMBOL_BATTERY_2;
+    }
+    if (level >= 15) {
+        return LV_SYMBOL_BATTERY_1;
+    }
+    return LV_SYMBOL_BATTERY_EMPTY;
+}
+
+static void update_battery_indicator()
+{
+    if (!_battery_panel || !_battery_label) {
+        return;
+    }
+
+    const auto level = GetHAL().getBatteryLevel();
+    const bool charging = GetHAL().isBatteryCharging();
+    char text[32];
+    std::snprintf(text, sizeof(text), "%s%s %u%%", charging ? LV_SYMBOL_CHARGE " " : "", get_battery_symbol(level),
+                  static_cast<unsigned>(level));
+    lv_label_set_text(_battery_label, text);
+
+    const uint32_t bg_color = level <= 15 ? 0x5A2525 : 0x2B1710;
+    const uint32_t text_color = charging ? 0x9CFFB5 : (level <= 15 ? 0xFFB3A7 : 0xFFF4E6);
+    lv_obj_set_style_bg_color(_battery_panel, lv_color_hex(bg_color), LV_PART_MAIN);
+    lv_obj_set_style_text_color(_battery_label, lv_color_hex(text_color), LV_PART_MAIN);
+}
+
+static void create_battery_indicator()
+{
+    _battery_panel = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(_battery_panel, 86, 28);
+    lv_obj_align(_battery_panel, LV_ALIGN_TOP_MID, 0, 8);
+    lv_obj_set_style_radius(_battery_panel, 14, LV_PART_MAIN);
+    lv_obj_set_style_border_width(_battery_panel, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(_battery_panel, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(_battery_panel, lv_color_hex(0x2B1710), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(_battery_panel, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(_battery_panel, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(_battery_panel, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(_battery_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(_battery_panel, LV_OBJ_FLAG_CLICKABLE);
+
+    _battery_label = lv_label_create(_battery_panel);
+    lv_obj_set_style_text_font(_battery_label, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(_battery_label, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
+    lv_obj_center(_battery_label);
+    update_battery_indicator();
+}
+
 static void create_control_button(lv_obj_t** button, lv_obj_t** label, lv_align_t align, int x, int y, const char* text,
                                   lv_event_cb_t callback)
 {
@@ -302,6 +362,8 @@ static void create_top_controls()
     lv_obj_set_style_text_color(_wifi_off_badge, lv_color_hex(0xFFB3A7), LV_PART_MAIN);
     lv_obj_align(_wifi_off_badge, LV_ALIGN_BOTTOM_RIGHT, -2, -1);
     update_wifi_button();
+
+    create_battery_indicator();
 }
 
 static void create_controls_modal()
@@ -1200,6 +1262,7 @@ void AppNukoevi::onRunning()
     handle_head_pet_motion();
     GetStackChan().update();
     update_wifi_button();
+    update_battery_indicator();
 
     constexpr uint32_t blink_interval_ms = 3200;
     constexpr uint32_t blink_frame_ms    = 85;
@@ -1313,6 +1376,9 @@ void AppNukoevi::onClose()
     if (_wifi_button && lv_obj_is_valid(_wifi_button)) {
         lv_obj_delete(_wifi_button);
     }
+    if (_battery_panel && lv_obj_is_valid(_battery_panel)) {
+        lv_obj_delete(_battery_panel);
+    }
     if (_caption_panel && lv_obj_is_valid(_caption_panel)) {
         lv_obj_delete(_caption_panel);
     }
@@ -1323,6 +1389,8 @@ void AppNukoevi::onClose()
     _wifi_button = nullptr;
     _wifi_label = nullptr;
     _wifi_off_badge = nullptr;
+    _battery_panel = nullptr;
+    _battery_label = nullptr;
     _controls_scrim = nullptr;
     _controls_modal = nullptr;
     _brightness_label = nullptr;
