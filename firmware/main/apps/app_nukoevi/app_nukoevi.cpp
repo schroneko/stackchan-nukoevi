@@ -1,5 +1,6 @@
 #include "app_nukoevi.h"
 #include <apps/common/common.h>
+#include <apps/app_setup/app_setup.h>
 #include <assets/assets.h>
 #include <hal/board/hal_bridge.h>
 #include <hal/hal.h>
@@ -9,6 +10,8 @@
 #include <stackchan/stackchan.h>
 #include <ArduinoJson.hpp>
 #include <algorithm>
+#include <array>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -35,6 +38,16 @@ LV_FONT_DECLARE(font_puhui_14_1);
 
 static std::unique_ptr<Container> _panel;
 static std::unique_ptr<Image> _avatar;
+static lv_obj_t* _mic_button = nullptr;
+static lv_obj_t* _wifi_button = nullptr;
+static lv_obj_t* _wifi_label = nullptr;
+static lv_obj_t* _wifi_off_badge = nullptr;
+static lv_obj_t* _controls_scrim = nullptr;
+static lv_obj_t* _controls_modal = nullptr;
+static lv_obj_t* _brightness_label = nullptr;
+static lv_obj_t* _brightness_slider = nullptr;
+static lv_obj_t* _volume_label = nullptr;
+static lv_obj_t* _volume_slider = nullptr;
 static lv_obj_t* _caption_panel = nullptr;
 static lv_obj_t* _llm_label     = nullptr;
 static lv_obj_t* _listen_indicator = nullptr;
@@ -85,8 +98,16 @@ static constexpr uint32_t _caption_auto_hide_ms = 6000;
 static constexpr int _caption_width       = 316;
 static constexpr int _caption_label_width = 300;
 static constexpr uint8_t _nukoevi_backlight_brightness = 30;
+static constexpr std::array<uint8_t, 8> _brightness_levels = {1, 15, 30, 45, 60, 75, 90, 100};
+static constexpr std::array<uint8_t, 21> _volume_levels = {
+    0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100};
 static constexpr bool _enable_espnow_remote = false;
-static bool _last_touch_pressed = false;
+static int32_t _brightness_index = 0;
+static int32_t _volume_index = 0;
+static bool _brightness_changed = false;
+static bool _volume_changed = false;
+static bool _controls_syncing = false;
+static bool _xiaozhi_interaction_requested = false;
 static bool _motion_assets_loaded = false;
 static lv_image_dsc_t _talk_closed;
 static lv_image_dsc_t _talk_tiny;
@@ -135,6 +156,262 @@ static const uint32_t _sleep_intervals[] = {
     850,
     900,
 };
+
+static void start_xiaozhi_request();
+
+static int32_t value_to_index(uint8_t value, const uint8_t* levels, size_t size)
+{
+    for (size_t i = 0; i < size; i++) {
+        if (levels[i] >= value) {
+            return static_cast<int32_t>(i);
+        }
+    }
+
+    return static_cast<int32_t>(size - 1);
+}
+
+static void set_button_style(lv_obj_t* button, uint32_t bg_color, uint32_t text_color)
+{
+    lv_obj_set_size(button, 36, 36);
+    lv_obj_set_style_radius(button, 18, LV_PART_MAIN);
+    lv_obj_set_style_border_width(button, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(button, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(button, lv_color_hex(bg_color), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(button, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(button, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(button, 0, LV_PART_MAIN);
+    lv_obj_set_style_text_color(button, lv_color_hex(text_color), LV_PART_MAIN);
+    lv_obj_set_style_text_font(button, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_clear_flag(button, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
+}
+
+static void update_controls_labels()
+{
+    char text[24];
+    if (_brightness_label) {
+        std::snprintf(text, sizeof(text), "Brightness %u%%", _brightness_levels[_brightness_index]);
+        lv_label_set_text(_brightness_label, text);
+    }
+    if (_volume_label) {
+        std::snprintf(text, sizeof(text), "Volume %u%%", _volume_levels[_volume_index]);
+        lv_label_set_text(_volume_label, text);
+    }
+}
+
+static void save_controls_if_changed()
+{
+    if (_brightness_changed) {
+        GetHAL().setBackLightBrightness(_brightness_levels[_brightness_index], true);
+        _brightness_changed = false;
+    }
+    if (_volume_changed) {
+        GetHAL().setSpeakerVolume(_volume_levels[_volume_index], true);
+        _volume_changed = false;
+    }
+}
+
+static void hide_controls_modal()
+{
+    save_controls_if_changed();
+    if (_controls_scrim) {
+        lv_obj_add_flag(_controls_scrim, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void open_setup_wifi()
+{
+    mclog::tagInfo("NUKOEVI", "open Wi-Fi setup requested");
+    AppSetup::requestOpenWifiSetup();
+    const auto app_num = GetMooncake().getAppNum();
+    for (std::size_t i = 0; i < app_num; i++) {
+        const auto info = GetMooncake().getAppInfo(static_cast<int>(i));
+        if (info.name == "SETUP") {
+            GetMooncake().openApp(static_cast<int>(i));
+            return;
+        }
+    }
+    mclog::tagWarn("NUKOEVI", "SETUP app not found");
+}
+
+static void update_wifi_button()
+{
+    if (!_wifi_button || !_wifi_label || !_wifi_off_badge) {
+        return;
+    }
+
+    const bool connected = GetHAL().getWifiStatus() != WifiStatus::None;
+    lv_label_set_text(_wifi_label, LV_SYMBOL_WIFI);
+    lv_obj_set_style_bg_color(_wifi_button, lv_color_hex(connected ? 0x2B1710 : 0x4A3B3B), LV_PART_MAIN);
+    lv_obj_set_style_text_color(_wifi_label, lv_color_hex(connected ? 0xFFF4E6 : 0xC8B8B8), LV_PART_MAIN);
+
+    if (connected) {
+        lv_obj_add_flag(_wifi_off_badge, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(_wifi_off_badge, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void create_control_button(lv_obj_t** button, lv_obj_t** label, lv_align_t align, int x, int y, const char* text,
+                                  lv_event_cb_t callback)
+{
+    *button = lv_obj_create(lv_screen_active());
+    set_button_style(*button, 0x2B1710, 0xFFF4E6);
+    lv_obj_align(*button, align, x, y);
+    lv_obj_add_event_cb(*button, callback, LV_EVENT_CLICKED, nullptr);
+
+    *label = lv_label_create(*button);
+    lv_label_set_text(*label, text);
+    lv_obj_center(*label);
+}
+
+static void create_mic_icon(lv_obj_t* parent)
+{
+    auto create_part = [&](int width, int height, int radius, lv_align_t align, int x, int y) {
+        auto part = lv_obj_create(parent);
+        lv_obj_set_size(part, width, height);
+        lv_obj_align(part, align, x, y);
+        lv_obj_set_style_radius(part, radius, LV_PART_MAIN);
+        lv_obj_set_style_border_width(part, 0, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(part, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(part, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(part, 0, LV_PART_MAIN);
+        lv_obj_clear_flag(part, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(part, LV_OBJ_FLAG_CLICKABLE);
+    };
+
+    create_part(12, 18, 6, LV_ALIGN_TOP_MID, 0, 6);
+    create_part(3, 7, 1, LV_ALIGN_BOTTOM_MID, 0, -7);
+    create_part(16, 3, 1, LV_ALIGN_BOTTOM_MID, 0, -5);
+}
+
+static void create_top_controls()
+{
+    _mic_button = lv_obj_create(lv_screen_active());
+    set_button_style(_mic_button, 0x2B1710, 0xFFF4E6);
+    lv_obj_align(_mic_button, LV_ALIGN_TOP_RIGHT, -8, 8);
+    lv_obj_add_event_cb(_mic_button, [](lv_event_t*) { start_xiaozhi_request(); }, LV_EVENT_CLICKED, nullptr);
+    create_mic_icon(_mic_button);
+
+    create_control_button(&_wifi_button, &_wifi_label, LV_ALIGN_TOP_LEFT, 8, 8, LV_SYMBOL_WIFI,
+                          [](lv_event_t*) { open_setup_wifi(); });
+
+    _wifi_off_badge = lv_label_create(_wifi_button);
+    lv_label_set_text(_wifi_off_badge, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(_wifi_off_badge, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(_wifi_off_badge, lv_color_hex(0xFFB3A7), LV_PART_MAIN);
+    lv_obj_align(_wifi_off_badge, LV_ALIGN_BOTTOM_RIGHT, -2, -1);
+    update_wifi_button();
+}
+
+static void create_controls_modal()
+{
+    _controls_scrim = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(_controls_scrim, 320, 240);
+    lv_obj_align(_controls_scrim, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(_controls_scrim, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(_controls_scrim, 110, LV_PART_MAIN);
+    lv_obj_set_style_border_width(_controls_scrim, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(_controls_scrim, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(_controls_scrim, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(_controls_scrim, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(_controls_scrim, [](lv_event_t*) { hide_controls_modal(); }, LV_EVENT_CLICKED, nullptr);
+
+    _controls_modal = lv_obj_create(_controls_scrim);
+    lv_obj_set_size(_controls_modal, 300, 170);
+    lv_obj_align(_controls_modal, LV_ALIGN_CENTER, 0, 8);
+    lv_obj_set_style_radius(_controls_modal, 8, LV_PART_MAIN);
+    lv_obj_set_style_border_width(_controls_modal, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(_controls_modal, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(_controls_modal, lv_color_hex(0x2B1710), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(_controls_modal, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(_controls_modal, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(_controls_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(_controls_modal, LV_OBJ_FLAG_CLICKABLE);
+
+    auto close_button = lv_obj_create(_controls_modal);
+    set_button_style(close_button, 0xFFF4E6, 0x2B1710);
+    lv_obj_set_size(close_button, 30, 30);
+    lv_obj_align(close_button, LV_ALIGN_TOP_RIGHT, -8, 8);
+    lv_obj_add_event_cb(close_button, [](lv_event_t*) { hide_controls_modal(); }, LV_EVENT_CLICKED, nullptr);
+    auto close_label = lv_label_create(close_button);
+    lv_label_set_text(close_label, LV_SYMBOL_CLOSE);
+    lv_obj_center(close_label);
+
+    _brightness_label = lv_label_create(_controls_modal);
+    lv_obj_set_style_text_font(_brightness_label, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(_brightness_label, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
+    lv_obj_align(_brightness_label, LV_ALIGN_TOP_LEFT, 18, 18);
+
+    _brightness_slider = lv_slider_create(_controls_modal);
+    lv_obj_set_size(_brightness_slider, 250, 16);
+    lv_obj_align(_brightness_slider, LV_ALIGN_TOP_MID, 0, 50);
+    lv_slider_set_range(_brightness_slider, 0, _brightness_levels.size() - 1);
+    lv_obj_set_style_bg_color(_brightness_slider, lv_color_hex(0xFFF4E6), LV_PART_KNOB);
+    lv_obj_set_style_bg_color(_brightness_slider, lv_color_hex(0xF5B06F), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(_brightness_slider, lv_color_hex(0x6D597A), LV_PART_MAIN);
+    lv_obj_add_event_cb(
+        _brightness_slider,
+        [](lv_event_t* event) {
+            if (_controls_syncing) {
+                return;
+            }
+            _brightness_index = lv_slider_get_value(static_cast<lv_obj_t*>(lv_event_get_target(event)));
+            update_controls_labels();
+            GetHAL().setBackLightBrightness(_brightness_levels[_brightness_index], false);
+            _brightness_changed = true;
+        },
+        LV_EVENT_VALUE_CHANGED, nullptr);
+    lv_obj_add_event_cb(_brightness_slider, [](lv_event_t*) { save_controls_if_changed(); }, LV_EVENT_RELEASED, nullptr);
+
+    _volume_label = lv_label_create(_controls_modal);
+    lv_obj_set_style_text_font(_volume_label, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(_volume_label, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
+    lv_obj_align(_volume_label, LV_ALIGN_TOP_LEFT, 18, 86);
+
+    _volume_slider = lv_slider_create(_controls_modal);
+    lv_obj_set_size(_volume_slider, 250, 16);
+    lv_obj_align(_volume_slider, LV_ALIGN_TOP_MID, 0, 118);
+    lv_slider_set_range(_volume_slider, 0, _volume_levels.size() - 1);
+    lv_obj_set_style_bg_color(_volume_slider, lv_color_hex(0xFFF4E6), LV_PART_KNOB);
+    lv_obj_set_style_bg_color(_volume_slider, lv_color_hex(0xF5B06F), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(_volume_slider, lv_color_hex(0x6D597A), LV_PART_MAIN);
+    lv_obj_add_event_cb(
+        _volume_slider,
+        [](lv_event_t* event) {
+            if (_controls_syncing) {
+                return;
+            }
+            _volume_index = lv_slider_get_value(static_cast<lv_obj_t*>(lv_event_get_target(event)));
+            update_controls_labels();
+            GetHAL().setSpeakerVolume(_volume_levels[_volume_index], false);
+            _volume_changed = true;
+        },
+        LV_EVENT_VALUE_CHANGED, nullptr);
+    lv_obj_add_event_cb(_volume_slider, [](lv_event_t*) { save_controls_if_changed(); }, LV_EVENT_RELEASED, nullptr);
+
+    lv_obj_add_flag(_controls_scrim, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void show_controls_modal()
+{
+    if (!_controls_scrim) {
+        create_controls_modal();
+    }
+
+    _brightness_index = value_to_index(GetHAL().getBackLightBrightness(), _brightness_levels.data(), _brightness_levels.size());
+    _volume_index = value_to_index(GetHAL().getSpeakerVolume(), _volume_levels.data(), _volume_levels.size());
+    _controls_syncing = true;
+    lv_slider_set_value(_brightness_slider, _brightness_index, LV_ANIM_OFF);
+    lv_slider_set_value(_volume_slider, _volume_index, LV_ANIM_OFF);
+    update_controls_labels();
+    _controls_syncing = false;
+    _brightness_changed = false;
+    _volume_changed = false;
+
+    lv_obj_clear_flag(_controls_scrim, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(_controls_scrim);
+}
 
 static void load_motion_assets()
 {
@@ -237,10 +514,11 @@ static void start_xiaozhi_request()
         return;
     }
     _last_llm_request_at = now;
+    _xiaozhi_interaction_requested = true;
     if (GetHAL().isXiaozhiListening() || GetHAL().isXiaozhiSpeaking()) {
         update_llm_status("キャンセル中");
     } else {
-        update_llm_status("準備中");
+        update_llm_status("マイク起動中");
     }
     GetHAL().requestXiaozhiListening();
 }
@@ -250,7 +528,7 @@ static void handle_xiaozhi_status(std::string_view status)
     if (status == "Listening...") {
         std::lock_guard<std::mutex> lock(_llm_mutex);
         _listen_indicator_requested = true;
-        if (_llm_status == "準備中") {
+        if (_llm_status == "マイク起動中") {
             _caption_hide_requested = true;
         }
         return;
@@ -259,7 +537,9 @@ static void handle_xiaozhi_status(std::string_view status)
     if (status == "Connecting..." || status == "Logging in..." || status == "Loading assets..." ||
         status == "Activation") {
         set_listen_indicator_requested(false);
-        update_llm_status("準備中");
+        if (_xiaozhi_interaction_requested) {
+            update_llm_status("マイク起動中");
+        }
         return;
     }
 
@@ -271,10 +551,10 @@ static void handle_xiaozhi_status(std::string_view status)
     if (status == "Standby") {
         std::lock_guard<std::mutex> lock(_llm_mutex);
         _listen_indicator_requested = false;
-        if (!_caption_visible || _llm_status == "準備中" || _llm_status == "キャンセル中") {
-            _llm_status = "タップして話してね";
-            _llm_status_changed = true;
+        if (_llm_status == "マイク起動中" || _llm_status == "キャンセル中") {
+            _caption_hide_requested = true;
         }
+        _xiaozhi_interaction_requested = false;
     }
 }
 
@@ -474,7 +754,7 @@ static void handle_llm_timeout(uint32_t now)
     _llm_requested      = false;
     _llm_started_at     = 0;
     _active_chat_request_id = 0;
-    _llm_status         = "タップして話してね";
+    _llm_status         = "応答がありません";
     _llm_status_changed = true;
     _talk_requested     = false;
     mclog::tagWarn("NUKOEVI", "LLM request timed out");
@@ -666,21 +946,6 @@ static bool update_sleep_animation(uint32_t now)
     return true;
 }
 
-static void handle_screen_tap_request()
-{
-    const auto point = hal_bridge::get_touch_point();
-    const bool pressed = point.num > 0;
-
-    if (pressed && !_last_touch_pressed) {
-        mclog::tagInfo("NUKOEVI", "raw touch press num={} x={} y={}", point.num, point.x, point.y);
-        start_xiaozhi_request();
-    } else if (!pressed && _last_touch_pressed) {
-        mclog::tagInfo("NUKOEVI", "raw touch release");
-    }
-
-    _last_touch_pressed = pressed;
-}
-
 AppNukoevi::AppNukoevi()
 {
     setAppInfo().name = "NUKOEVI";
@@ -715,6 +980,7 @@ void AppNukoevi::onOpen()
     if (_xiaozhi_text_signal_connection < 0) {
         _xiaozhi_text_signal_connection = GetHAL().onXiaozhiTextMessage.connect(handle_xiaozhi_text_message);
     }
+    GetHAL().startXiaozhiBackground();
     _espnow_receives = _enable_espnow_remote;
     if (_enable_espnow_remote && !_espnow_started) {
         GetHAL().startEspNow(1);
@@ -733,10 +999,14 @@ void AppNukoevi::onOpen()
     _panel->setBgColor(lv_color_hex(0xF5B06F));
     _panel->removeFlag(LV_OBJ_FLAG_SCROLLABLE);
     _panel->setPadding(0, 0, 0, 0);
+    _panel->addFlag(LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(_panel->get(), [](lv_event_t*) { show_controls_modal(); }, LV_EVENT_LONG_PRESSED, nullptr);
 
     _avatar = std::make_unique<Image>(_panel->get());
     _avatar->setSrc(&nukoevi_screen_open);
     _avatar->align(LV_ALIGN_CENTER, 0, 0);
+    _avatar->addFlag(LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(_avatar->get(), [](lv_event_t*) { show_controls_modal(); }, LV_EVENT_LONG_PRESSED, nullptr);
     _blink_index     = 0;
     _blink_timecount = GetHAL().millis();
     _talk_active     = false;
@@ -764,11 +1034,12 @@ void AppNukoevi::onOpen()
     lv_obj_set_size(_llm_label, _caption_label_width, 34);
     lv_obj_align(_llm_label, LV_ALIGN_TOP_LEFT, 8, 6);
     lv_obj_clear_flag(_llm_label, LV_OBJ_FLAG_SCROLLABLE);
-    update_caption_text("タップして話してね");
+    lv_obj_add_flag(_caption_panel, LV_OBJ_FLAG_HIDDEN);
+    _caption_visible = false;
 
     _listen_indicator = lv_obj_create(lv_screen_active());
     lv_obj_set_size(_listen_indicator, 24, 24);
-    lv_obj_align(_listen_indicator, LV_ALIGN_TOP_RIGHT, -8, 8);
+    lv_obj_align(_listen_indicator, LV_ALIGN_TOP_RIGHT, -50, 8);
     lv_obj_set_style_radius(_listen_indicator, 12, LV_PART_MAIN);
     lv_obj_set_style_border_width(_listen_indicator, 2, LV_PART_MAIN);
     lv_obj_set_style_border_color(_listen_indicator, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
@@ -789,12 +1060,7 @@ void AppNukoevi::onOpen()
     lv_obj_add_flag(_listen_indicator, LV_OBJ_FLAG_HIDDEN);
     _listen_indicator_visible = false;
 
-    _panel->addFlag(LV_OBJ_FLAG_CLICKABLE);
-    _panel->onClick().connect(start_xiaozhi_request);
-    _avatar->addFlag(LV_OBJ_FLAG_CLICKABLE);
-    _avatar->onClick().connect(start_xiaozhi_request);
-    lv_obj_add_event_cb(_caption_panel, [](lv_event_t*) { start_xiaozhi_request(); }, LV_EVENT_CLICKED, nullptr);
-    lv_obj_add_event_cb(_llm_label, [](lv_event_t*) { start_xiaozhi_request(); }, LV_EVENT_CLICKED, nullptr);
+    create_top_controls();
 
     if (_head_pet_signal_connection < 0) {
         _head_pet_signal_connection = GetHAL().onHeadPetGesture.connect([](HeadPetGesture gesture) {
@@ -933,7 +1199,7 @@ void AppNukoevi::onRunning()
     handle_espnow_remote_motion();
     handle_head_pet_motion();
     GetStackChan().update();
-    handle_screen_tap_request();
+    update_wifi_button();
 
     constexpr uint32_t blink_interval_ms = 3200;
     constexpr uint32_t blink_frame_ms    = 85;
@@ -1037,12 +1303,32 @@ void AppNukoevi::onClose()
         _espnow_received_data.clear();
     }
     GetHAL().onBleConfigData.clear();
+    hide_controls_modal();
+    if (_controls_scrim && lv_obj_is_valid(_controls_scrim)) {
+        lv_obj_delete(_controls_scrim);
+    }
+    if (_mic_button && lv_obj_is_valid(_mic_button)) {
+        lv_obj_delete(_mic_button);
+    }
+    if (_wifi_button && lv_obj_is_valid(_wifi_button)) {
+        lv_obj_delete(_wifi_button);
+    }
     if (_caption_panel && lv_obj_is_valid(_caption_panel)) {
         lv_obj_delete(_caption_panel);
     }
     if (_listen_indicator && lv_obj_is_valid(_listen_indicator)) {
         lv_obj_delete(_listen_indicator);
     }
+    _mic_button = nullptr;
+    _wifi_button = nullptr;
+    _wifi_label = nullptr;
+    _wifi_off_badge = nullptr;
+    _controls_scrim = nullptr;
+    _controls_modal = nullptr;
+    _brightness_label = nullptr;
+    _brightness_slider = nullptr;
+    _volume_label = nullptr;
+    _volume_slider = nullptr;
     _llm_label     = nullptr;
     _caption_panel = nullptr;
     _listen_indicator = nullptr;
@@ -1052,6 +1338,7 @@ void AppNukoevi::onClose()
     _listen_indicator_visible = false;
     _listen_indicator_requested = false;
     _caption_hide_requested = false;
+    _xiaozhi_interaction_requested = false;
     _avatar.reset();
     _panel.reset();
 }

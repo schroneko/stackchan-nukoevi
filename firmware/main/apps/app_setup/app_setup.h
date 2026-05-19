@@ -17,6 +17,7 @@
 class AppSetup : public mooncake::AppAbility {
 public:
     AppSetup();
+    static void requestOpenWifiSetup();
 
     // 重写生命周期回调
     void onCreate() override;

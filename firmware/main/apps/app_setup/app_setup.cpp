@@ -15,6 +15,8 @@ using namespace mooncake;
 using namespace view;
 using namespace setup_workers;
 
+static bool _open_wifi_setup_requested = false;
+
 AppSetup::AppSetup()
 {
     // 配置 App 名
@@ -25,6 +27,11 @@ AppSetup::AppSetup()
     // 配置 App 主题颜色
     static uint32_t theme_color = 0xB3B3B3;
     setAppInfo().userData       = (void*)&theme_color;
+}
+
+void AppSetup::requestOpenWifiSetup()
+{
+    _open_wifi_setup_requested = true;
 }
 
 void AppSetup::onCreate()
@@ -128,9 +135,18 @@ void AppSetup::onOpen()
         },
     };
 
+    const bool open_wifi_setup = _open_wifi_setup_requested;
+    _open_wifi_setup_requested = false;
+
     LvglLockGuard lock;
 
-    _menu_page = std::make_unique<view::SelectMenuPage>(_menu_sections);
+    if (open_wifi_setup) {
+        _destroy_menu    = true;
+        _need_warm_reset = true;
+        _worker          = std::make_unique<WifiSetupWorker>();
+    } else {
+        _menu_page = std::make_unique<view::SelectMenuPage>(_menu_sections);
+    }
 
     view::create_home_indicator([&]() { close(); });
     view::create_status_bar();
