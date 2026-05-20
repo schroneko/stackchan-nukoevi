@@ -31,7 +31,6 @@
 using namespace mooncake;
 using namespace smooth_ui_toolkit::lvgl_cpp;
 
-LV_IMAGE_DECLARE(nukoevi_icon);
 LV_IMAGE_DECLARE(nukoevi_screen_open);
 LV_IMAGE_DECLARE(nukoevi_screen_half_a);
 LV_IMAGE_DECLARE(nukoevi_screen_closed);
@@ -1316,7 +1315,8 @@ static bool update_sleep_animation(uint32_t now)
 AppNukoevi::AppNukoevi()
 {
     setAppInfo().name = "NUKOEVI";
-    setAppInfo().icon = (void*)&nukoevi_icon;
+    static auto icon = assets::get_image("nukoevi_icon.bin");
+    setAppInfo().icon = (void*)&icon;
 
     static uint32_t theme_color = 0xF5B06F;
     setAppInfo().userData       = (void*)&theme_color;
