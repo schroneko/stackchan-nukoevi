@@ -92,7 +92,8 @@ bool Hal::notifyBleConfig(std::string_view json)
 /* -------------------------------------------------------------------------- */
 /*                              App config server                             */
 /* -------------------------------------------------------------------------- */
-#include "utils/wifi_connect/wifi_station.h"
+#include <ssid_manager.h>
+#include <wifi_manager.h>
 #include <string_view>
 #include <queue>
 #include <mutex>
@@ -104,31 +105,6 @@ public:
     {
         GetHAL().onBleConfigData.connect([this](const char* data) { on_config_data(data); });
         _was_connected = stackchan_ble_is_connected();
-
-        // Setup WifiStation callbacks
-        _wifi_station = std::make_unique<StackChanWifiStation>();
-        _wifi_station->OnConnect([this](const std::string& ssid) {
-            mclog::tagInfo(_tag, "wifi Connecting to {}", ssid);
-            _is_wifi_connecting = true;
-            notify_state(0, "wifiConnecting");
-        });
-        _wifi_station->OnConnected([this](const std::string& ssid) {
-            mclog::tagInfo(_tag, "wifi Connected to {}", ssid);
-            _is_wifi_connecting = false;
-            notify_state(1, "wifiConnected");
-            GetHAL().onAppConfigEvent.emit(AppConfigEvent::WifiConnected);
-
-            Settings settings("app_config", true);
-            settings.SetBool("is_configed", true);
-        });
-        _wifi_station->OnConnectFailed([this](const std::string& ssid) {
-            mclog::tagInfo(_tag, "wifi Connect Failed to {}", ssid);
-            _is_wifi_connecting = false;
-            notify_state(2, "wifiConnectFailed");
-            GetHAL().onAppConfigEvent.emit(AppConfigEvent::WifiConnectFailed);
-        });
-
-        _wifi_station->Start();
     }
 
     void update()
@@ -159,15 +135,19 @@ public:
         if (has_data) {
             process_config_data(data.c_str());
         }
+
+        update_wifi_connection_state();
     }
 
 private:
+    static constexpr uint32_t _wifi_connect_timeout_ms = 45000;
     static constexpr std::string_view _tag = "WifiConfigServer";
     std::queue<std::string> _msg_queue;
     std::mutex _mutex;
     bool _was_connected = false;
     std::atomic<bool> _is_wifi_connecting{false};
-    std::unique_ptr<StackChanWifiStation> _wifi_station;
+    uint32_t _wifi_connect_deadline = 0;
+    std::string _pending_ssid;
 
     void on_config_data(const char* json_data)
     {
@@ -197,7 +177,8 @@ private:
 
     void handle_get_wifi_status()
     {
-        if (_wifi_station->IsConnected()) {
+        auto& wifi = WifiManager::GetInstance();
+        if (wifi.IsConnected()) {
             notify_state(1, "wifiConnected");
         } else if (_is_wifi_connecting) {
             notify_state(0, "wifiConnecting");
@@ -214,12 +195,17 @@ private:
             return;
         }
 
-        const char* ssid     = data["ssid"];
-        const char* password = data["password"];
+        const char* ssid     = data["ssid"] | "";
+        const char* password = data["password"] | "";
+
+        if (strlen(ssid) == 0) {
+            mclog::tagWarn(_tag, "empty wifi ssid");
+            notify_state(2, "wifiConnectFailed: Empty SSID");
+            return;
+        }
 
         mclog::tagInfo(_tag, "get wifi config: {} / {}", ssid, password);
 
-        // Notify state: connecting
         notify_state(0, "wifiConnecting");
         GetHAL().onAppConfigEvent.emit(AppConfigEvent::TryWifiConnect);
 
@@ -234,8 +220,49 @@ private:
 
     void connect_wifi(const char* ssid, const char* password)
     {
-        // Save to NVS (compatible with Xiaozhi) and connect
-        _wifi_station->AddAuth(ssid, password);
+        _pending_ssid = ssid;
+        _is_wifi_connecting = true;
+        _wifi_connect_deadline = GetHAL().millis() + _wifi_connect_timeout_ms;
+
+        SsidManager::GetInstance().AddSsid(ssid, password);
+
+        auto& wifi = WifiManager::GetInstance();
+        if (!wifi.IsInitialized()) {
+            wifi.Initialize();
+        }
+        if (wifi.IsConfigMode()) {
+            wifi.StopConfigAp();
+        } else {
+            wifi.StopStation();
+            wifi.StartStation();
+        }
+    }
+
+    void update_wifi_connection_state()
+    {
+        if (!_is_wifi_connecting) {
+            return;
+        }
+
+        auto& wifi = WifiManager::GetInstance();
+        if (wifi.IsConnected()) {
+            auto ssid = wifi.GetSsid();
+            mclog::tagInfo(_tag, "wifi Connected to {}", ssid.empty() ? _pending_ssid : ssid);
+            _is_wifi_connecting = false;
+            notify_state(1, "wifiConnected");
+            GetHAL().onAppConfigEvent.emit(AppConfigEvent::WifiConnected);
+
+            Settings settings("app_config", true);
+            settings.SetBool("is_configed", true);
+            return;
+        }
+
+        if (static_cast<int32_t>(GetHAL().millis() - _wifi_connect_deadline) >= 0) {
+            mclog::tagInfo(_tag, "wifi Connect Failed to {}", _pending_ssid);
+            _is_wifi_connecting = false;
+            notify_state(2, "wifiConnectFailed");
+            GetHAL().onAppConfigEvent.emit(AppConfigEvent::WifiConnectFailed);
+        }
     }
 
     void notify_state(int type, const char* state)
