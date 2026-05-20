@@ -5,6 +5,7 @@ import json
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,6 +43,21 @@ class Bridge:
         self.remote_evictl = remote_evictl
         self.requests = {}
         self.state_dir.mkdir(parents=True, exist_ok=True)
+
+    def health(self):
+        command = evictl_command()
+        return {
+            "ok": True,
+            "target": self.target,
+            "source": self.source,
+            "stateDir": str(self.state_dir),
+            "evictlCommand": command,
+            "evictlAvailable": command_available(command),
+            "localAddresses": local_ipv4_addresses(),
+            "remoteHost": self.remote_host,
+            "queueOnly": self.queue_only,
+            "responseTimeout": self.response_timeout,
+        }
 
     def handle(self, payload):
         cmd = payload.get("cmd")
@@ -228,11 +244,43 @@ def evictl_command():
     return ["evictl"]
 
 
+def command_available(command):
+    if not command:
+        return False
+    executable = command[0]
+    if "/" in executable:
+        return Path(executable).exists()
+    return shutil.which(executable) is not None
+
+
+def local_ipv4_addresses():
+    addresses = []
+    try:
+        for item in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            address = item[4][0]
+            if address not in addresses and not address.startswith("127."):
+                addresses.append(address)
+    except OSError:
+        pass
+    if not addresses:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("8.8.8.8", 80))
+            address = probe.getsockname()[0]
+            if not address.startswith("127."):
+                addresses.append(address)
+        except OSError:
+            pass
+        finally:
+            probe.close()
+    return addresses
+
+
 def make_handler(bridge):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path.rstrip("/") == "/health":
-                self.send_json(200, {"ok": True})
+                self.send_json(200, bridge.health())
                 return
             self.send_json(404, {"ok": False, "text": "not found"})
 
@@ -262,7 +310,7 @@ def make_handler(bridge):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default=os.environ.get("NUKOEVI_EVI_BRIDGE_HOST", "0.0.0.0"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("NUKOEVI_EVI_BRIDGE_PORT", "8787")))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("NUKOEVI_EVI_BRIDGE_PORT", "18787")))
     parser.add_argument("--target", default=os.environ.get("EVICTL_TARGET", "nukoevi"))
     parser.add_argument("--source", default=os.environ.get("EVICTL_SOURCE", "stackchan-camera"))
     parser.add_argument("--state-dir", default=os.environ.get("NUKOEVI_EVI_BRIDGE_STATE", str(Path.home() / ".local" / "share" / "stackchan-nukoevi" / "evictl-bridge")))

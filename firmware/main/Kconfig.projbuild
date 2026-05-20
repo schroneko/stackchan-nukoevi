@@ -16,7 +16,7 @@ config NUKOEVI_LLM_SYSTEM_PROMPT
 
 config NUKOEVI_EVI_BRIDGE_ENDPOINT
     string "Nukoevi evictl bridge URL"
-    default "http://192.168.0.2:8787/"
+    default "http://192.168.0.2:18787/"
 
 config NUKOEVI_EXTERNAL_LED_LEFT_GPIO
     int "Nukoevi left external LED PWM GPIO"
