@@ -99,6 +99,7 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Latest microphone finding: pressing the mic icon was triggering Xiaozhi's automatic OTA upgrade to 1.4.1, which caused the apparent restart. Preserved-display background mode now skips the firmware upgrade, reconnects MQTT, and reaches `listening` without rebooting.
 - Latest evictl bridge verification: `tools/nukoevi-evictl-bridge.py` now defaults to port `18787`, exposes `/health`, and can relay to Mac Studio with `--remote-host mymacstudio --remote-evictl ...`. Remote `evictl send nukoevi` delivered to `evi-claude-code-channels-nukoevi` through `claude-telegram-channel`, and a local image-chunk smoke test returned a Claude Code Channels response.
 - Latest camera button blocker: after the latest reboot, the physical StackChan could not see `MyPhone` again and entered config AP mode, so the remaining physical camera-button verification is blocked on Wi-Fi visibility rather than the evictl bridge path.
+- Latest camera branch audit: `feat/stackchan-camera-bridge` has no commits ahead of the current branch. The remaining diff would mostly restore old heavy assets and deleted bridge code, so there is no additional behavior to carry forward from that branch.
 
 ## Task List
 
@@ -113,8 +114,8 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - [x] Fix the battery display based on the current physical UI behavior.
 - [ ] Connect the camera icon flow to the current `evictl` bridge: capture the current frame, send it to the bridge, receive the response, and show the response on StackChan.
 - [x] Add an operator-friendly way to run or locate the `evictl` bridge target without depending on the old iPhone BLE bridge path.
-- [ ] Audit the local branch `feat/stackchan-camera-bridge` and carry forward only the behavior still needed after the asset optimization work.
-- [ ] Reconcile any useful camera bridge behavior from `feat/stackchan-camera-bridge` with the current lighter firmware path instead of restoring the old heavy assets or deleted `channels/stackchan` server wholesale.
+- [x] Audit the local branch `feat/stackchan-camera-bridge` and carry forward only the behavior still needed after the asset optimization work.
+- [x] Reconcile any useful camera bridge behavior from `feat/stackchan-camera-bridge` with the current lighter firmware path instead of restoring the old heavy assets or deleted `channels/stackchan` server wholesale.
 - [x] Add firmware brightness controls for the two external LEDs without changing StackChan's standard RGB LED rows.
 - [x] Flash the external LED PWM firmware after the StackChan USB serial port is visible.
 - [x] Flash the safer external LED slider build that removes release-time flash/NVS writes.
