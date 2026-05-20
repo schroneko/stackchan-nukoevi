@@ -92,6 +92,7 @@ static uint32_t _llm_started_at = 0;
 static uint32_t _last_llm_request_at = 0;
 static constexpr uint32_t _llm_timeout_ms = 60000;
 static constexpr uint32_t _llm_request_interval_ms = 2500;
+static constexpr int _bridge_http_timeout_ms = 10000;
 static uint32_t _caption_updated_at = 0;
 static bool _caption_visible = false;
 static bool _listen_indicator_visible = false;
@@ -904,9 +905,11 @@ static bool post_evictl_bridge_json(const ArduinoJson::JsonDocument& doc, std::s
         return false;
     }
 
+    http->SetTimeout(_bridge_http_timeout_ms);
     http->SetHeader("Content-Type", "application/json");
     http->SetContent(std::move(json));
     if (!http->Open("POST", CONFIG_NUKOEVI_EVI_BRIDGE_ENDPOINT)) {
+        mclog::tagError("NUKOEVI", "bridge http open failed: error={}", http->GetLastError());
         return false;
     }
 
@@ -914,7 +917,7 @@ static bool post_evictl_bridge_json(const ArduinoJson::JsonDocument& doc, std::s
     std::string body = http->ReadAll();
     http->Close();
     if (status_code < 200 || status_code >= 300) {
-        mclog::tagError("NUKOEVI", "evictl bridge http failed: status={}, body={}", status_code, body);
+        mclog::tagError("NUKOEVI", "bridge http failed: status={}, body={}", status_code, body);
         return false;
     }
 
@@ -954,6 +957,7 @@ static bool send_evictl_camera_capture(uint32_t request_id)
 
     constexpr size_t chunk_size = 300;
     const size_t total_chunks = (jpeg_size + chunk_size - 1) / chunk_size;
+    mclog::tagInfo("NUKOEVI", "camera jpeg captured: {} bytes, {} chunks", jpeg_size, total_chunks);
 
     ArduinoJson::JsonDocument start_doc;
     start_doc["cmd"] = "cameraStart";
@@ -1010,17 +1014,18 @@ static void evictl_camera_task(void* arg)
 
     update_llm_status("カメラ撮影中");
     const bool has_image = send_evictl_camera_capture(request_id);
-    update_llm_status("evictl送信中");
+    mclog::tagInfo("NUKOEVI", "camera capture result: {}", has_image ? "ok" : "failed");
+    update_llm_status("送信中");
 
     std::string response;
     if (!send_evictl_chat_prompt(request_id, has_image, response)) {
-        finish_llm_request(request_id, "evictl send failed");
+        finish_llm_request(request_id, "送信できませんでした");
         vTaskDelete(nullptr);
         return;
     }
 
     if (response.empty()) {
-        response = "evictlへ送信しました";
+        response = "送信しました";
     }
     finish_llm_request(request_id, response);
 
