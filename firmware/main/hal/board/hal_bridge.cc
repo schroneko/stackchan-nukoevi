@@ -111,10 +111,18 @@ void start_xiaozhi_app()
 {
     set_xiaozhi_mode(true);
 
-    // Initialize and run the application
     auto& app = Application::GetInstance();
     app.Initialize();
-    app.Run();  // This function runs the main event loop and never returns
+    app.Run();
+}
+
+void start_xiaozhi_background_app()
+{
+    set_xiaozhi_mode(true);
+
+    auto& app = Application::GetInstance();
+    app.Initialize(true);
+    app.Run();
 }
 
 XiaozhiConfig_t get_xiaozhi_config()

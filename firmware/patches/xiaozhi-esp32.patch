@@ -1,8 +1,74 @@
 diff --git a/main/application.cc b/main/application.cc
-index d69d43d..3b6f07e 100644
+index d69d43d..de71480 100644
 --- a/main/application.cc
 +++ b/main/application.cc
-@@ -610,33 +610,36 @@ void Application::InitializeProtocol() {
+@@ -16,6 +16,7 @@
+ #include <driver/gpio.h>
+ #include <arpa/inet.h>
+ #include <font_awesome.h>
++#include <wifi_manager.h>
+ 
+ #define TAG "Application"
+ 
+@@ -58,15 +59,21 @@ bool Application::SetDeviceState(DeviceState state) {
+     return state_machine_.TransitionTo(state);
+ }
+ 
+-void Application::Initialize() {
++void Application::Initialize(bool preserve_display) {
++    if (initialized_) {
++        return;
++    }
++    initialized_ = true;
++    display_preserved_ = preserve_display;
++
+     auto& board = Board::GetInstance();
+     SetDeviceState(kDeviceStateStarting);
+ 
+-    // Setup the display
+     auto display = board.GetDisplay();
+-    display->SetupUI();
+-    // Print board name/version info
+-    display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());
++    if (!display_preserved_) {
++        display->SetupUI();
++        display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());
++    }
+ 
+     // Setup the audio service
+     auto codec = board.GetAudioCodec();
+@@ -155,11 +162,15 @@ void Application::Initialize() {
+         }
+     });
+ 
+-    // Start network asynchronously
+-    board.StartNetwork();
++    if (WifiManager::GetInstance().IsConnected()) {
++        xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_CONNECTED);
++    } else {
++        board.StartNetwork();
++    }
+ 
+-    // Update the status bar immediately to show the network state
+-    display->UpdateStatusBar(true);
++    if (!display_preserved_) {
++        display->UpdateStatusBar(true);
++    }
+ }
+ 
+ void Application::Run() {
+@@ -432,7 +443,9 @@ void Application::CheckNewVersion() {
+         retry_count = 0;
+         retry_delay = 10; // Reset retry delay
+ 
+-        if (ota_->HasNewVersion()) {
++        if (ota_->HasNewVersion() && display_preserved_) {
++            ESP_LOGW(TAG, "Skipping firmware upgrade in preserved display mode: %s", ota_->GetFirmwareVersion().c_str());
++        } else if (ota_->HasNewVersion()) {
+             if (UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion())) {
+                 return; // This line will never be reached after reboot
+             }
+@@ -610,33 +623,36 @@ void Application::InitializeProtocol() {
  }
  
  void Application::ShowActivationCode(const std::string& code, const std::string& message) {
@@ -66,6 +132,33 @@ index d69d43d..3b6f07e 100644
  }
  
  void Application::Alert(const char* status, const char* message, const char* emotion, const std::string_view& sound) {
+@@ -1116,4 +1130,3 @@ void Application::ResetProtocol() {
+         protocol_.reset();
+     });
+ }
+-
+diff --git a/main/application.h b/main/application.h
+index 7ca7af4..d25734b 100644
+--- a/main/application.h
++++ b/main/application.h
+@@ -54,7 +54,7 @@ public:
+      * This sets up display, audio, network callbacks, etc.
+      * Network connection starts asynchronously.
+      */
+-    void Initialize();
++    void Initialize(bool preserve_display = false);
+ 
+     /**
+      * Run the main event loop
+@@ -137,6 +137,8 @@ private:
+     std::unique_ptr<Ota> ota_;
+ 
+     bool has_server_time_ = false;
++    bool initialized_ = false;
++    bool display_preserved_ = false;
+     bool aborted_ = false;
+     bool assets_version_checked_ = false;
+     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
 diff --git a/main/assets.cc b/main/assets.cc
 index ad61944..6b84daf 100644
 --- a/main/assets.cc
@@ -245,6 +338,51 @@ index 3692e0c..7bfbc5c 100644
      
      // Strategy instance
      std::unique_ptr<AssetStrategy> strategy_;
+diff --git a/main/audio/audio_service.cc b/main/audio/audio_service.cc
+index 350ac58..9744c82 100644
+--- a/main/audio/audio_service.cc
++++ b/main/audio/audio_service.cc
+@@ -547,6 +547,10 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
+ }
+ 
+ void AudioService::EnableWakeWordDetection(bool enable) {
++#if CONFIG_WAKE_WORD_DISABLED
++    (void)enable;
++    return;
++#else
+     if (!wake_word_) {
+         return;
+     }
+@@ -574,6 +578,7 @@ void AudioService::EnableWakeWordDetection(bool enable) {
+         wake_word_->Stop();
+         xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+     }
++#endif
+ }
+ 
+ void AudioService::EnableVoiceProcessing(bool enable) {
+@@ -700,7 +705,9 @@ void AudioService::CheckAndUpdateAudioPowerState() {
+ void AudioService::SetModelsList(srmodel_list_t* models_list) {
+     models_list_ = models_list;
+ 
+-#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
++#if CONFIG_WAKE_WORD_DISABLED
++    wake_word_ = nullptr;
++#elif CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
+     if (esp_srmodel_filter(models_list_, ESP_MN_PREFIX, NULL) != nullptr) {
+         wake_word_ = std::make_unique<CustomWakeWord>();
+     } else if (esp_srmodel_filter(models_list_, ESP_WN_PREFIX, NULL) != nullptr) {
+@@ -726,7 +733,9 @@ void AudioService::SetModelsList(srmodel_list_t* models_list) {
+ }
+ 
+ bool AudioService::IsAfeWakeWord() {
+-#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
++#if CONFIG_WAKE_WORD_DISABLED
++    return false;
++#elif CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
+     return wake_word_ != nullptr && dynamic_cast<AfeWakeWord*>(wake_word_.get()) != nullptr;
+ #else
+     return false;
 diff --git a/main/boards/common/i2c_device.cc b/main/boards/common/i2c_device.cc
 index 835997d..ea50d51 100644
 --- a/main/boards/common/i2c_device.cc
@@ -271,3 +409,32 @@ index 7bc917b..874b137 100644
  };
  
  #endif // I2C_DEVICE_H
+diff --git a/main/boards/common/wifi_board.cc b/main/boards/common/wifi_board.cc
+index 377685b..8333abd 100644
+--- a/main/boards/common/wifi_board.cc
++++ b/main/boards/common/wifi_board.cc
+@@ -50,6 +50,12 @@ std::string WifiBoard::GetBoardType() {
+ }
+ 
+ void WifiBoard::StartNetwork() {
++    if (network_started_) {
++        ESP_LOGI(TAG, "Network already started");
++        return;
++    }
++    network_started_ = true;
++
+     auto& wifi_manager = WifiManager::GetInstance();
+ 
+     // Initialize WiFi manager
+diff --git a/main/boards/common/wifi_board.h b/main/boards/common/wifi_board.h
+index 7ee973c..a6cd3a7 100644
+--- a/main/boards/common/wifi_board.h
++++ b/main/boards/common/wifi_board.h
+@@ -10,6 +10,7 @@ class WifiBoard : public Board {
+ protected:
+     esp_timer_handle_t connect_timer_ = nullptr;
+     bool in_config_mode_ = false;
++    bool network_started_ = false;
+     NetworkEventCallback network_event_callback_ = nullptr;
+ 
+     virtual std::string GetBoardJson() override;

@@ -205,7 +205,7 @@ void Hal::startXiaozhi()
 
 static void _xiaozhi_background_task(void*)
 {
-    hal_bridge::start_xiaozhi_app();
+    hal_bridge::start_xiaozhi_background_app();
 }
 
 static bool _xiaozhi_start_listening_scheduled = false;
@@ -236,7 +236,7 @@ void Hal::startXiaozhiBackground()
 
     mclog::tagInfo(_tag, "start xiaozhi background");
     _xiaozhi_background_started = true;
-    auto result = xTaskCreatePinnedToCore(_xiaozhi_background_task, "xiaozhi-bg", 8192, nullptr, 5,
+    auto result = xTaskCreatePinnedToCore(_xiaozhi_background_task, "xiaozhi-bg", 16384, nullptr, 5,
                                           &_xiaozhi_background_task_handle, 0);
     if (result != pdPASS) {
         mclog::tagError(_tag, "failed to start xiaozhi background task");

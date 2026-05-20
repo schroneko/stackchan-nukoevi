@@ -46,6 +46,7 @@ lv_disp_t* display_get_lvgl_display();
 
 void xiaozhi_board_init();
 void start_xiaozhi_app();
+void start_xiaozhi_background_app();
 bool is_xiaozhi_ready();
 bool is_xiaozhi_idle();
 XiaozhiConfig_t get_xiaozhi_config();
