@@ -19,6 +19,8 @@ set(STACK_CHAN_INCLUDE_DIRS
     "."
 )
 list(APPEND STACK_CHAN_SOURCES main.cpp)
+list(APPEND STACK_CHAN_SOURCES hal/hal_external_led.cpp)
+list(REMOVE_DUPLICATES STACK_CHAN_SOURCES)
 
 # Define source files
 set(SOURCES "audio/audio_codec.cc"

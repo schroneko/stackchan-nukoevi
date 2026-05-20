@@ -2,6 +2,8 @@
 #include <apps/common/common.h>
 #include <apps/app_setup/app_setup.h>
 #include <assets/assets.h>
+#include <board.h>
+#include <font_awesome.h>
 #include <hal/board/hal_bridge.h>
 #include <hal/hal.h>
 #include <lvgl.h>
@@ -35,10 +37,13 @@ LV_IMAGE_DECLARE(nukoevi_screen_half_a);
 LV_IMAGE_DECLARE(nukoevi_screen_closed);
 LV_IMAGE_DECLARE(nukoevi_screen_half_b);
 LV_FONT_DECLARE(font_puhui_14_1);
+LV_FONT_DECLARE(font_awesome_20_4);
 
 static std::unique_ptr<Container> _panel;
 static std::unique_ptr<Image> _avatar;
 static lv_obj_t* _mic_button = nullptr;
+static lv_obj_t* _camera_button = nullptr;
+static lv_obj_t* _camera_label = nullptr;
 static lv_obj_t* _wifi_button = nullptr;
 static lv_obj_t* _wifi_label = nullptr;
 static lv_obj_t* _wifi_off_badge = nullptr;
@@ -50,6 +55,10 @@ static lv_obj_t* _brightness_label = nullptr;
 static lv_obj_t* _brightness_slider = nullptr;
 static lv_obj_t* _volume_label = nullptr;
 static lv_obj_t* _volume_slider = nullptr;
+static lv_obj_t* _left_ext_led_label = nullptr;
+static lv_obj_t* _left_ext_led_slider = nullptr;
+static lv_obj_t* _right_ext_led_label = nullptr;
+static lv_obj_t* _right_ext_led_slider = nullptr;
 static lv_obj_t* _caption_panel = nullptr;
 static lv_obj_t* _llm_label     = nullptr;
 static lv_obj_t* _listen_indicator = nullptr;
@@ -93,6 +102,8 @@ static bool _talk_active = false;
 static uint8_t _talk_index = 0;
 static uint32_t _talk_timecount = 0;
 static uint32_t _talk_until = 0;
+static bool _open_wifi_setup_requested = false;
+static bool _network_started = false;
 static bool _sleep_mode = false;
 static uint8_t _sleep_index = 0;
 static uint32_t _sleep_timecount = 0;
@@ -101,11 +112,14 @@ static constexpr int _caption_width       = 316;
 static constexpr int _caption_label_width = 300;
 static constexpr uint8_t _nukoevi_backlight_brightness = 30;
 static constexpr std::array<uint8_t, 8> _brightness_levels = {1, 15, 30, 45, 60, 75, 90, 100};
+static constexpr std::array<uint8_t, 11> _external_led_levels = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
 static constexpr std::array<uint8_t, 21> _volume_levels = {
     0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100};
 static constexpr bool _enable_espnow_remote = false;
 static int32_t _brightness_index = 0;
 static int32_t _volume_index = 0;
+static int32_t _left_ext_led_index = 0;
+static int32_t _right_ext_led_index = 0;
 static bool _brightness_changed = false;
 static bool _volume_changed = false;
 static bool _controls_syncing = false;
@@ -160,6 +174,7 @@ static const uint32_t _sleep_intervals[] = {
 };
 
 static void start_xiaozhi_request();
+static void begin_evictl_camera_task();
 
 static int32_t value_to_index(uint8_t value, const uint8_t* levels, size_t size)
 {
@@ -192,12 +207,20 @@ static void update_controls_labels()
 {
     char text[24];
     if (_brightness_label) {
-        std::snprintf(text, sizeof(text), "Brightness %u%%", _brightness_levels[_brightness_index]);
+        std::snprintf(text, sizeof(text), "Display %u%%", _brightness_levels[_brightness_index]);
         lv_label_set_text(_brightness_label, text);
     }
     if (_volume_label) {
         std::snprintf(text, sizeof(text), "Volume %u%%", _volume_levels[_volume_index]);
         lv_label_set_text(_volume_label, text);
+    }
+    if (_left_ext_led_label) {
+        std::snprintf(text, sizeof(text), "Left LED %u%%", _external_led_levels[_left_ext_led_index]);
+        lv_label_set_text(_left_ext_led_label, text);
+    }
+    if (_right_ext_led_label) {
+        std::snprintf(text, sizeof(text), "Right LED %u%%", _external_led_levels[_right_ext_led_index]);
+        lv_label_set_text(_right_ext_led_label, text);
     }
 }
 
@@ -224,16 +247,38 @@ static void hide_controls_modal()
 static void open_setup_wifi()
 {
     mclog::tagInfo("NUKOEVI", "open Wi-Fi setup requested");
+    _open_wifi_setup_requested = true;
+}
+
+static void start_network_once()
+{
+    if (_network_started) {
+        return;
+    }
+
+    _network_started = true;
+    mclog::tagInfo("NUKOEVI", "start Wi-Fi network");
+    Board::GetInstance().StartNetwork();
+}
+
+static bool open_setup_wifi_if_requested()
+{
+    if (!_open_wifi_setup_requested) {
+        return false;
+    }
+
+    _open_wifi_setup_requested = false;
     AppSetup::requestOpenWifiSetup();
     const auto app_num = GetMooncake().getAppNum();
     for (std::size_t i = 0; i < app_num; i++) {
         const auto info = GetMooncake().getAppInfo(static_cast<int>(i));
         if (info.name == "SETUP") {
             GetMooncake().openApp(static_cast<int>(i));
-            return;
+            return true;
         }
     }
     mclog::tagWarn("NUKOEVI", "SETUP app not found");
+    return false;
 }
 
 static void update_wifi_button()
@@ -353,6 +398,10 @@ static void create_top_controls()
     lv_obj_add_event_cb(_mic_button, [](lv_event_t*) { start_xiaozhi_request(); }, LV_EVENT_CLICKED, nullptr);
     create_mic_icon(_mic_button);
 
+    create_control_button(&_camera_button, &_camera_label, LV_ALIGN_TOP_RIGHT, -50, 8, FONT_AWESOME_CAMERA,
+                          [](lv_event_t*) { begin_evictl_camera_task(); });
+    lv_obj_set_style_text_font(_camera_label, &font_awesome_20_4, LV_PART_MAIN);
+
     create_control_button(&_wifi_button, &_wifi_label, LV_ALIGN_TOP_LEFT, 8, 8, LV_SYMBOL_WIFI,
                           [](lv_event_t*) { open_setup_wifi(); });
 
@@ -380,8 +429,8 @@ static void create_controls_modal()
     lv_obj_add_event_cb(_controls_scrim, [](lv_event_t*) { hide_controls_modal(); }, LV_EVENT_CLICKED, nullptr);
 
     _controls_modal = lv_obj_create(_controls_scrim);
-    lv_obj_set_size(_controls_modal, 300, 170);
-    lv_obj_align(_controls_modal, LV_ALIGN_CENTER, 0, 8);
+    lv_obj_set_size(_controls_modal, 300, 216);
+    lv_obj_align(_controls_modal, LV_ALIGN_CENTER, 0, 4);
     lv_obj_set_style_radius(_controls_modal, 8, LV_PART_MAIN);
     lv_obj_set_style_border_width(_controls_modal, 2, LV_PART_MAIN);
     lv_obj_set_style_border_color(_controls_modal, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
@@ -403,11 +452,11 @@ static void create_controls_modal()
     _brightness_label = lv_label_create(_controls_modal);
     lv_obj_set_style_text_font(_brightness_label, &lv_font_montserrat_16, LV_PART_MAIN);
     lv_obj_set_style_text_color(_brightness_label, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
-    lv_obj_align(_brightness_label, LV_ALIGN_TOP_LEFT, 18, 18);
+    lv_obj_align(_brightness_label, LV_ALIGN_TOP_LEFT, 18, 12);
 
     _brightness_slider = lv_slider_create(_controls_modal);
-    lv_obj_set_size(_brightness_slider, 250, 16);
-    lv_obj_align(_brightness_slider, LV_ALIGN_TOP_MID, 0, 50);
+    lv_obj_set_size(_brightness_slider, 250, 12);
+    lv_obj_align(_brightness_slider, LV_ALIGN_TOP_MID, 0, 38);
     lv_slider_set_range(_brightness_slider, 0, _brightness_levels.size() - 1);
     lv_obj_set_style_bg_color(_brightness_slider, lv_color_hex(0xFFF4E6), LV_PART_KNOB);
     lv_obj_set_style_bg_color(_brightness_slider, lv_color_hex(0xF5B06F), LV_PART_INDICATOR);
@@ -429,11 +478,11 @@ static void create_controls_modal()
     _volume_label = lv_label_create(_controls_modal);
     lv_obj_set_style_text_font(_volume_label, &lv_font_montserrat_16, LV_PART_MAIN);
     lv_obj_set_style_text_color(_volume_label, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
-    lv_obj_align(_volume_label, LV_ALIGN_TOP_LEFT, 18, 86);
+    lv_obj_align(_volume_label, LV_ALIGN_TOP_LEFT, 18, 60);
 
     _volume_slider = lv_slider_create(_controls_modal);
-    lv_obj_set_size(_volume_slider, 250, 16);
-    lv_obj_align(_volume_slider, LV_ALIGN_TOP_MID, 0, 118);
+    lv_obj_set_size(_volume_slider, 250, 12);
+    lv_obj_align(_volume_slider, LV_ALIGN_TOP_MID, 0, 86);
     lv_slider_set_range(_volume_slider, 0, _volume_levels.size() - 1);
     lv_obj_set_style_bg_color(_volume_slider, lv_color_hex(0xFFF4E6), LV_PART_KNOB);
     lv_obj_set_style_bg_color(_volume_slider, lv_color_hex(0xF5B06F), LV_PART_INDICATOR);
@@ -452,6 +501,56 @@ static void create_controls_modal()
         LV_EVENT_VALUE_CHANGED, nullptr);
     lv_obj_add_event_cb(_volume_slider, [](lv_event_t*) { save_controls_if_changed(); }, LV_EVENT_RELEASED, nullptr);
 
+    _left_ext_led_label = lv_label_create(_controls_modal);
+    lv_obj_set_style_text_font(_left_ext_led_label, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(_left_ext_led_label, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
+    lv_obj_align(_left_ext_led_label, LV_ALIGN_TOP_LEFT, 18, 108);
+
+    _left_ext_led_slider = lv_slider_create(_controls_modal);
+    lv_obj_set_size(_left_ext_led_slider, 250, 12);
+    lv_obj_align(_left_ext_led_slider, LV_ALIGN_TOP_MID, 0, 134);
+    lv_slider_set_range(_left_ext_led_slider, 0, _external_led_levels.size() - 1);
+    lv_obj_set_style_bg_color(_left_ext_led_slider, lv_color_hex(0xFFF4E6), LV_PART_KNOB);
+    lv_obj_set_style_bg_color(_left_ext_led_slider, lv_color_hex(0xF5B06F), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(_left_ext_led_slider, lv_color_hex(0x6D597A), LV_PART_MAIN);
+    lv_obj_add_event_cb(
+        _left_ext_led_slider,
+        [](lv_event_t* event) {
+            if (_controls_syncing) {
+                return;
+            }
+            _left_ext_led_index = lv_slider_get_value(static_cast<lv_obj_t*>(lv_event_get_target(event)));
+            update_controls_labels();
+            GetHAL().setExternalLedBrightness(_external_led_levels[_left_ext_led_index],
+                                              _external_led_levels[_right_ext_led_index], false);
+        },
+        LV_EVENT_VALUE_CHANGED, nullptr);
+
+    _right_ext_led_label = lv_label_create(_controls_modal);
+    lv_obj_set_style_text_font(_right_ext_led_label, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(_right_ext_led_label, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
+    lv_obj_align(_right_ext_led_label, LV_ALIGN_TOP_LEFT, 18, 156);
+
+    _right_ext_led_slider = lv_slider_create(_controls_modal);
+    lv_obj_set_size(_right_ext_led_slider, 250, 12);
+    lv_obj_align(_right_ext_led_slider, LV_ALIGN_TOP_MID, 0, 182);
+    lv_slider_set_range(_right_ext_led_slider, 0, _external_led_levels.size() - 1);
+    lv_obj_set_style_bg_color(_right_ext_led_slider, lv_color_hex(0xFFF4E6), LV_PART_KNOB);
+    lv_obj_set_style_bg_color(_right_ext_led_slider, lv_color_hex(0xF5B06F), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(_right_ext_led_slider, lv_color_hex(0x6D597A), LV_PART_MAIN);
+    lv_obj_add_event_cb(
+        _right_ext_led_slider,
+        [](lv_event_t* event) {
+            if (_controls_syncing) {
+                return;
+            }
+            _right_ext_led_index = lv_slider_get_value(static_cast<lv_obj_t*>(lv_event_get_target(event)));
+            update_controls_labels();
+            GetHAL().setExternalLedBrightness(_external_led_levels[_left_ext_led_index],
+                                              _external_led_levels[_right_ext_led_index], false);
+        },
+        LV_EVENT_VALUE_CHANGED, nullptr);
+
     lv_obj_add_flag(_controls_scrim, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -463,9 +562,15 @@ static void show_controls_modal()
 
     _brightness_index = value_to_index(GetHAL().getBackLightBrightness(), _brightness_levels.data(), _brightness_levels.size());
     _volume_index = value_to_index(GetHAL().getSpeakerVolume(), _volume_levels.data(), _volume_levels.size());
+    _left_ext_led_index = value_to_index(GetHAL().getLeftExternalLedBrightness(), _external_led_levels.data(),
+                                         _external_led_levels.size());
+    _right_ext_led_index = value_to_index(GetHAL().getRightExternalLedBrightness(), _external_led_levels.data(),
+                                          _external_led_levels.size());
     _controls_syncing = true;
     lv_slider_set_value(_brightness_slider, _brightness_index, LV_ANIM_OFF);
     lv_slider_set_value(_volume_slider, _volume_index, LV_ANIM_OFF);
+    lv_slider_set_value(_left_ext_led_slider, _left_ext_led_index, LV_ANIM_OFF);
+    lv_slider_set_value(_right_ext_led_slider, _right_ext_led_index, LV_ANIM_OFF);
     update_controls_labels();
     _controls_syncing = false;
     _brightness_changed = false;
@@ -761,6 +866,202 @@ static bool send_chat_prompt(uint32_t request_id, bool has_image)
     return notify_json(doc);
 }
 
+static bool parse_bridge_response(std::string_view body, std::string& response)
+{
+    ArduinoJson::JsonDocument doc;
+    auto error = ArduinoJson::deserializeJson(doc, body);
+    if (error) {
+        response.assign(body.data(), body.size());
+        return !response.empty();
+    }
+
+    const char* text = doc["text"] | "";
+    if (text[0] == '\0') {
+        text = doc["message"] | "";
+    }
+    if (text[0] == '\0') {
+        text = doc["detail"] | "";
+    }
+    response = text;
+    return true;
+}
+
+static bool post_evictl_bridge_json(const ArduinoJson::JsonDocument& doc, std::string* response)
+{
+    std::string json;
+    ArduinoJson::serializeJson(doc, json);
+    if (json.empty()) {
+        return false;
+    }
+
+    auto network = Board::GetInstance().GetNetwork();
+    if (!network) {
+        return false;
+    }
+
+    auto http = network->CreateHttp(0);
+    if (!http) {
+        return false;
+    }
+
+    http->SetHeader("Content-Type", "application/json");
+    http->SetContent(std::move(json));
+    if (!http->Open("POST", CONFIG_NUKOEVI_EVI_BRIDGE_ENDPOINT)) {
+        return false;
+    }
+
+    const int status_code = http->GetStatusCode();
+    std::string body = http->ReadAll();
+    http->Close();
+    if (status_code < 200 || status_code >= 300) {
+        mclog::tagError("NUKOEVI", "evictl bridge http failed: status={}, body={}", status_code, body);
+        return false;
+    }
+
+    if (response) {
+        parse_bridge_response(body, *response);
+    }
+    return true;
+}
+
+static bool send_evictl_camera_capture(uint32_t request_id)
+{
+    auto camera = hal_bridge::board_get_camera();
+    if (!camera) {
+        return false;
+    }
+
+    if (!camera->StreamCaptures()) {
+        return false;
+    }
+
+    const uint8_t* frame_data = camera->GetFrameData();
+    const size_t frame_size = camera->GetFrameSize();
+    const int width = camera->GetFrameWidth();
+    const int height = camera->GetFrameHeight();
+    const int format = camera->GetFrameFormat();
+    uint8_t* jpeg_data = nullptr;
+    size_t jpeg_size = 0;
+
+    const bool encoded = image_to_jpeg(const_cast<uint8_t*>(frame_data), frame_size, width, height,
+                                       static_cast<v4l2_pix_fmt_t>(format), 18, &jpeg_data, &jpeg_size);
+    if (!encoded || !jpeg_data || jpeg_size == 0) {
+        if (jpeg_data) {
+            free(jpeg_data);
+        }
+        return false;
+    }
+
+    constexpr size_t chunk_size = 300;
+    const size_t total_chunks = (jpeg_size + chunk_size - 1) / chunk_size;
+
+    ArduinoJson::JsonDocument start_doc;
+    start_doc["cmd"] = "cameraStart";
+    start_doc["data"]["id"] = request_id;
+    start_doc["data"]["size"] = jpeg_size;
+    start_doc["data"]["chunks"] = total_chunks;
+    start_doc["data"]["mime"] = "image/jpeg";
+    if (!post_evictl_bridge_json(start_doc, nullptr)) {
+        free(jpeg_data);
+        return false;
+    }
+    GetHAL().delay(20);
+
+    for (size_t index = 0; index < total_chunks; index++) {
+        const size_t offset = index * chunk_size;
+        const size_t part_size = std::min(chunk_size, jpeg_size - offset);
+        const std::string encoded_chunk = base64_encode(jpeg_data + offset, part_size);
+        if (encoded_chunk.empty()) {
+            free(jpeg_data);
+            return false;
+        }
+
+        ArduinoJson::JsonDocument chunk_doc;
+        chunk_doc["cmd"] = "cameraChunk";
+        chunk_doc["data"]["id"] = request_id;
+        chunk_doc["data"]["index"] = index;
+        chunk_doc["data"]["total"] = total_chunks;
+        chunk_doc["data"]["data"] = encoded_chunk;
+        if (!post_evictl_bridge_json(chunk_doc, nullptr)) {
+            free(jpeg_data);
+            return false;
+        }
+        GetHAL().delay(15);
+    }
+
+    free(jpeg_data);
+    return true;
+}
+
+static bool send_evictl_chat_prompt(uint32_t request_id, bool has_image, std::string& response)
+{
+    ArduinoJson::JsonDocument doc;
+    doc["cmd"] = "chatPrompt";
+    doc["data"]["id"] = request_id;
+    doc["data"]["hasImage"] = has_image;
+    doc["data"]["text"] = has_image ? "ｽﾀｯｸﾁｬﾝのカメラ画像を見て、ぬこエビちゃんとして短く答えて。見えているものを一言で教えて。"
+                                    : "ぬこエビちゃんとして、短く挨拶して。";
+    return post_evictl_bridge_json(doc, &response);
+}
+
+static void evictl_camera_task(void* arg)
+{
+    const uint32_t request_id = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(arg));
+
+    update_llm_status("カメラ撮影中");
+    const bool has_image = send_evictl_camera_capture(request_id);
+    update_llm_status("evictl送信中");
+
+    std::string response;
+    if (!send_evictl_chat_prompt(request_id, has_image, response)) {
+        finish_llm_request(request_id, "evictl send failed");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    if (response.empty()) {
+        response = "evictlへ送信しました";
+    }
+    finish_llm_request(request_id, response);
+
+    if (should_talk_for_text(response)) {
+        std::lock_guard<std::mutex> lock(_llm_mutex);
+        _talk_requested = true;
+        _talk_request_text_size = response.size();
+    }
+
+    vTaskDelete(nullptr);
+}
+
+static void begin_evictl_camera_task()
+{
+    uint32_t request_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(_llm_mutex);
+        if (_llm_running) {
+            return;
+        }
+
+        _llm_running            = true;
+        _llm_requested          = false;
+        _llm_status             = "カメラ撮影中";
+        _llm_status_changed     = true;
+        _llm_started_at         = GetHAL().millis();
+        _active_chat_request_id = ++_chat_request_id;
+        request_id              = _active_chat_request_id;
+    }
+
+    if (GetHAL().getWifiStatus() == WifiStatus::None) {
+        finish_llm_request(request_id, "Wi-Fi未接続");
+        return;
+    }
+
+    const auto arg = reinterpret_cast<void*>(static_cast<uintptr_t>(request_id));
+    if (xTaskCreate(evictl_camera_task, "nukoevi_evi", 12288, arg, 3, nullptr) != pdPASS) {
+        finish_llm_request(request_id, "Task start failed");
+    }
+}
+
 static void local_llm_task(void* arg)
 {
     const uint32_t request_id = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(arg));
@@ -1042,7 +1343,8 @@ void AppNukoevi::onOpen()
     if (_xiaozhi_text_signal_connection < 0) {
         _xiaozhi_text_signal_connection = GetHAL().onXiaozhiTextMessage.connect(handle_xiaozhi_text_message);
     }
-    GetHAL().startXiaozhiBackground();
+    GetHAL().initExternalLedPwm();
+    start_network_once();
     _espnow_receives = _enable_espnow_remote;
     if (_enable_espnow_remote && !_espnow_started) {
         GetHAL().startEspNow(1);
@@ -1101,7 +1403,7 @@ void AppNukoevi::onOpen()
 
     _listen_indicator = lv_obj_create(lv_screen_active());
     lv_obj_set_size(_listen_indicator, 24, 24);
-    lv_obj_align(_listen_indicator, LV_ALIGN_TOP_RIGHT, -50, 8);
+    lv_obj_align(_listen_indicator, LV_ALIGN_TOP_RIGHT, -92, 8);
     lv_obj_set_style_radius(_listen_indicator, 12, LV_PART_MAIN);
     lv_obj_set_style_border_width(_listen_indicator, 2, LV_PART_MAIN);
     lv_obj_set_style_border_color(_listen_indicator, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
@@ -1256,6 +1558,10 @@ static void handle_espnow_remote_motion()
 
 void AppNukoevi::onRunning()
 {
+    if (open_setup_wifi_if_requested()) {
+        return;
+    }
+
     LvglLockGuard lock;
     view::update_home_indicator();
     handle_espnow_remote_motion();
@@ -1373,6 +1679,9 @@ void AppNukoevi::onClose()
     if (_mic_button && lv_obj_is_valid(_mic_button)) {
         lv_obj_delete(_mic_button);
     }
+    if (_camera_button && lv_obj_is_valid(_camera_button)) {
+        lv_obj_delete(_camera_button);
+    }
     if (_wifi_button && lv_obj_is_valid(_wifi_button)) {
         lv_obj_delete(_wifi_button);
     }
@@ -1386,6 +1695,8 @@ void AppNukoevi::onClose()
         lv_obj_delete(_listen_indicator);
     }
     _mic_button = nullptr;
+    _camera_button = nullptr;
+    _camera_label = nullptr;
     _wifi_button = nullptr;
     _wifi_label = nullptr;
     _wifi_off_badge = nullptr;
@@ -1397,6 +1708,10 @@ void AppNukoevi::onClose()
     _brightness_slider = nullptr;
     _volume_label = nullptr;
     _volume_slider = nullptr;
+    _left_ext_led_label = nullptr;
+    _left_ext_led_slider = nullptr;
+    _right_ext_led_label = nullptr;
+    _right_ext_led_slider = nullptr;
     _llm_label     = nullptr;
     _caption_panel = nullptr;
     _listen_indicator = nullptr;

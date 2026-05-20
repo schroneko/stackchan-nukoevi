@@ -231,6 +231,10 @@ public:
     void setRgbColor(uint8_t index, uint8_t r, uint8_t g, uint8_t b);
     void showRgbColor(uint8_t r, uint8_t g, uint8_t b);
     void refreshRgb();
+    void initExternalLedPwm();
+    void setExternalLedBrightness(uint8_t left, uint8_t right, bool permanent = false);
+    uint8_t getLeftExternalLedBrightness();
+    uint8_t getRightExternalLedBrightness();
 
     /* ---------------------------------- Power --------------------------------- */
     void setServoPowerEnabled(bool enabled);

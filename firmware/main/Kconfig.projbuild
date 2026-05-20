@@ -14,6 +14,22 @@ config NUKOEVI_LLM_SYSTEM_PROMPT
     string "Nukoevi system prompt"
     default "あなたはぬこエビちゃんです。日本語で、短く、かわいく返事してください。"
 
+config NUKOEVI_EVI_BRIDGE_ENDPOINT
+    string "Nukoevi evictl bridge URL"
+    default "http://192.168.0.2:8787/"
+
+config NUKOEVI_EXTERNAL_LED_LEFT_GPIO
+    int "Nukoevi left external LED PWM GPIO"
+    default 9
+
+config NUKOEVI_EXTERNAL_LED_RIGHT_GPIO
+    int "Nukoevi right external LED PWM GPIO"
+    default 17
+
+config NUKOEVI_EXTERNAL_LED_PWM_INVERTED
+    bool "Invert Nukoevi external LED PWM output"
+    default n
+
 endmenu
 
 config OTA_URL

@@ -85,17 +85,33 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Latest iPhone app build result: success.
 - Latest iPhone app install result: success on device `CDCFCD1E-488F-57C8-90C6-694C51110809`.
 - Latest iPhone app launch result: success for bundle id `test.NukoeviBridge`.
+- Latest external LED finding: the attached photo shows LEDs powered from the Grove red and black power rails. Red is 5V and black is GND on CoreS3 Grove ports, so firmware PWM cannot dim that wiring without moving the LED current path through a controllable GPIO or driver circuit.
+- Latest external LED firmware build result: success. The current build adds GPIO PWM brightness sliders for two external LEDs only and does not change StackChan's standard RGB LED rows.
+- Latest external LED flash result: success on `/dev/cu.usbmodem101` after moving the left external LED wiring to yellow and black. Physical brightness change still needs visual confirmation on the device.
+- Latest external LED reset finding: releasing the external LED slider is not normal if it resets the device. The firmware now avoids flash/NVS writes on external LED slider release and starts external LEDs at 20% to reduce boot-time load, but this safer build has not been flashed because the StackChan USB serial port disappeared after the device disconnected.
 
-## Not Included Yet
+## Task List
 
-- Custom AI agent connection fully verified on the physical StackChan.
-- End-to-end speech conversation with Claude Code Channels fully verified on the physical StackChan.
-- Sprite animation from the original `spritesheet.webp`.
-- Microphone input.
-- Standard Camera app plus Apple Intelligence background inference. The current iOS workaround is to keep the Nukoevi Bridge app active and avoid requiring background inference while the standard Camera app owns the foreground.
-- Direct raw-image prompting into FoundationModels. The inspected iPhoneOS 26.4 SDK exposes text prompts for `LanguageModelSession`, so the current path uses VisionKit `ImageAnalyzer` transcript/context as the image input to FoundationModels.
-- More firmware animation frames. The assets partition is now close to full, so additional full-frame RGB565 assets need either compressed/runtime-decoded assets or a partition change.
-- Joy-Con or remote control mapping beyond the official ESP-NOW yaw/pitch packet path.
+- [ ] Verify the custom AI agent connection on the physical StackChan.
+- [ ] Verify end-to-end speech conversation with Claude Code Channels on the physical StackChan.
+- [ ] Keep short taps on the Nukoevi screen inactive except for explicit overlay icons.
+- [ ] Keep long press on the Nukoevi screen mapped to the brightness and volume modal.
+- [ ] Verify the microphone icon path starts StackChan's standard Xiaozhi voice flow only when the icon is pressed.
+- [ ] Verify the Wi-Fi icon opens Wi-Fi setup without crashing and reports the connected or disconnected state accurately.
+- [ ] Verify the battery indicator on the physical StackChan while charging and discharging.
+- [ ] Connect the camera icon flow to the current `evictl` bridge: capture the current frame, send it to the bridge, receive the response, and show the response on StackChan.
+- [ ] Add an operator-friendly way to run or locate the `evictl` bridge target without depending on the old iPhone BLE bridge path.
+- [ ] Audit the local branch `feat/stackchan-camera-bridge` and carry forward only the behavior still needed after the asset optimization work.
+- [ ] Reconcile any useful camera bridge behavior from `feat/stackchan-camera-bridge` with the current lighter firmware path instead of restoring the old heavy assets or deleted `channels/stackchan` server wholesale.
+- [x] Add firmware brightness controls for the two external LEDs without changing StackChan's standard RGB LED rows.
+- [x] Flash the external LED PWM firmware after the StackChan USB serial port is visible.
+- [ ] Flash the safer external LED slider build that removes release-time flash/NVS writes.
+- [ ] Confirm the external LED wiring uses a controllable GPIO or add a transistor/MOSFET driver path, because red and black Grove power rails alone cannot be PWM-dimmed by firmware.
+- [ ] Add sprite animation from the original `spritesheet.webp` if it still fits the optimized asset strategy.
+- [ ] Revisit Standard Camera app plus Apple Intelligence background inference. The current iOS workaround is to keep the Nukoevi Bridge app active and avoid requiring background inference while the standard Camera app owns the foreground.
+- [ ] Revisit direct raw-image prompting into FoundationModels. The inspected iPhoneOS 26.4 SDK exposes text prompts for `LanguageModelSession`, so the current path uses VisionKit `ImageAnalyzer` transcript/context as the image input to FoundationModels.
+- [ ] Add more firmware animation frames only after choosing compressed/runtime-decoded assets or a partition change.
+- [ ] Add Joy-Con or remote control mapping beyond the official ESP-NOW yaw/pitch packet path.
 
 ## Repository Handling
 
