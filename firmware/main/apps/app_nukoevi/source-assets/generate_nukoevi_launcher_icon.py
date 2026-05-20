@@ -5,7 +5,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 FIRMWARE_MAIN = ROOT.parents[1]
-SOURCE = ROOT / "source-assets" / "nukoevi-bridge-icon-source.png"
+SOURCE = ROOT / "source-assets" / "nukoevi-no-tail-closeup.png"
 ASSET = FIRMWARE_MAIN / "assets" / "assets_bin" / "nukoevi_icon.bin"
 WIDTH = 188
 HEIGHT = 150
@@ -19,11 +19,7 @@ def load_rgb_bytes():
             "magick",
             str(SOURCE),
             "-resize",
-            f"{WIDTH}x{HEIGHT}^",
-            "-gravity",
-            "center",
-            "-extent",
-            f"{WIDTH}x{HEIGHT}",
+            f"{WIDTH}x{HEIGHT}!",
             "-depth",
             "8",
             "RGB:-",
