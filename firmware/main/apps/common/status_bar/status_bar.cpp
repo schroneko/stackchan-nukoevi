@@ -184,11 +184,10 @@ public:
     {
         if (charging) {
             _bar->setBgColor(lv_color_hex(0x19C25F), LV_PART_INDICATOR);
-            _lightning_icon->setHidden(false);
         } else {
             _bar->setBgColor(lv_color_hex(_color_primary), LV_PART_INDICATOR);
-            _lightning_icon->setHidden(true);
         }
+        _lightning_icon->setHidden(true);
     }
 
 private:
@@ -221,7 +220,7 @@ public:
         auto level = GetHAL().getBatteryLevel();
         _label_level->setText(fmt::format("{}%", level));
         _battery_icon->setLevel(level);
-        _battery_icon->setCharging(GetHAL().isBatteryCharging());
+        _battery_icon->setCharging(GetHAL().isExternalPowerConnected());
     }
 
 private:

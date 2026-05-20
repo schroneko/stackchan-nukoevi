@@ -180,6 +180,7 @@ public:
     void updateHeapStatusLog();
     uint8_t getBatteryLevel();
     bool isBatteryCharging();
+    bool isExternalPowerConnected();
     void factoryReset();
 
     /* --------------------------------- Display -------------------------------- */

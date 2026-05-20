@@ -346,14 +346,13 @@ static void update_battery_indicator()
     }
 
     const auto level = GetHAL().getBatteryLevel();
-    const bool charging = GetHAL().isBatteryCharging();
+    const bool powered = GetHAL().isExternalPowerConnected();
     char text[32];
-    std::snprintf(text, sizeof(text), "%s%s %u%%", charging ? LV_SYMBOL_CHARGE " " : "", get_battery_symbol(level),
-                  static_cast<unsigned>(level));
+    std::snprintf(text, sizeof(text), "%s %u%%", get_battery_symbol(level), static_cast<unsigned>(level));
     lv_label_set_text(_battery_label, text);
 
     const uint32_t bg_color = level <= 15 ? 0x5A2525 : 0x2B1710;
-    const uint32_t text_color = charging ? 0x9CFFB5 : (level <= 15 ? 0xFFB3A7 : 0xFFF4E6);
+    const uint32_t text_color = powered ? 0x9CFFB5 : (level <= 15 ? 0xFFB3A7 : 0xFFF4E6);
     lv_obj_set_style_bg_color(_battery_panel, lv_color_hex(bg_color), LV_PART_MAIN);
     lv_obj_set_style_text_color(_battery_label, lv_color_hex(text_color), LV_PART_MAIN);
 }

@@ -313,6 +313,11 @@ bool Hal::isBatteryCharging()
     return hal_bridge::board_is_battery_charging();
 }
 
+bool Hal::isExternalPowerConnected()
+{
+    return hal_bridge::board_is_external_power_connected();
+}
+
 void Hal::factoryReset()
 {
     mclog::tagInfo(_tag, "start factory reset");

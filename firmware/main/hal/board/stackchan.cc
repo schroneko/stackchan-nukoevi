@@ -569,6 +569,11 @@ public:
     {
         return i2c_bus_;
     }
+
+    bool IsExternalPowerConnected()
+    {
+        return pmic_->IsExternalPowerConnected();
+    }
 };
 
 DECLARE_BOARD(M5StackCoreS3Board);
@@ -593,7 +598,7 @@ int hal_bridge::board_get_battery_level()
     bool charging    = false;
     bool discharging = false;
     if (board.GetBatteryLevel(level, charging, discharging)) {
-        return level;
+        return std::clamp(level, 0, 100);
     } else {
         return 100;
     }
@@ -610,6 +615,12 @@ bool hal_bridge::board_is_battery_charging()
     } else {
         return false;
     }
+}
+
+bool hal_bridge::board_is_external_power_connected()
+{
+    auto& board = (M5StackCoreS3Board&)Board::GetInstance();
+    return board.IsExternalPowerConnected();
 }
 
 void hal_bridge::board_set_backlight_brightness(uint8_t brightness, bool permanent)
