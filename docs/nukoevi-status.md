@@ -93,16 +93,19 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Latest external LED flash result: success on `/dev/cu.usbmodem101` for the synchronized one-slider LED build.
 - Latest external LED user verification: both left and right external LEDs were rewired to yellow and black and are working normally.
 - Latest external LED brightness target: start normal mode at 30% and switch to 10% during night sleepy mode.
+- Latest user verification: Wi-Fi setup opens without crashing, battery display works, startup defaults for display, volume, and external LEDs are 30%, short screen taps are inactive, mic flow only starts from the mic icon, and the long-press controls modal works.
+- Latest microphone finding: pressing the mic icon currently restarts or reinitializes the firmware flow instead of completing a stable voice connection.
 
 ## Task List
 
 - [ ] Verify the custom AI agent connection on the physical StackChan.
 - [ ] Verify end-to-end speech conversation with Claude Code Channels on the physical StackChan.
-- [ ] Keep short taps on the Nukoevi screen inactive except for explicit overlay icons.
-- [ ] Keep long press on the Nukoevi screen mapped to the brightness and volume modal.
-- [ ] Verify the microphone icon path starts StackChan's standard Xiaozhi voice flow only when the icon is pressed.
-- [ ] Verify the Wi-Fi icon opens Wi-Fi setup without crashing and reports the connected or disconnected state accurately.
-- [ ] Verify the battery indicator on the physical StackChan while charging and discharging.
+- [x] Keep short taps on the Nukoevi screen inactive except for explicit overlay icons.
+- [x] Keep long press on the Nukoevi screen mapped to the brightness and volume modal.
+- [x] Verify the microphone icon is the only path that starts the voice flow.
+- [ ] Fix the mic icon voice flow so it does not restart or reinitialize the firmware flow when starting Xiaozhi.
+- [x] Verify the Wi-Fi icon opens Wi-Fi setup without crashing and reports the connected or disconnected state accurately.
+- [x] Verify the battery indicator on the physical StackChan while charging and discharging.
 - [ ] Connect the camera icon flow to the current `evictl` bridge: capture the current frame, send it to the bridge, receive the response, and show the response on StackChan.
 - [ ] Add an operator-friendly way to run or locate the `evictl` bridge target without depending on the old iPhone BLE bridge path.
 - [ ] Audit the local branch `feat/stackchan-camera-bridge` and carry forward only the behavior still needed after the asset optimization work.
@@ -110,7 +113,7 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - [x] Add firmware brightness controls for the two external LEDs without changing StackChan's standard RGB LED rows.
 - [x] Flash the external LED PWM firmware after the StackChan USB serial port is visible.
 - [x] Flash the safer external LED slider build that removes release-time flash/NVS writes.
-- [ ] Verify Nukoevi startup defaults display, volume, and external LEDs to 30% on the physical device.
+- [x] Verify Nukoevi startup defaults display, volume, and external LEDs to 30% on the physical device.
 - [x] Confirm the external LED wiring uses controllable GPIO wiring for both left and right external LEDs.
 - [ ] Add sprite animation from the original `spritesheet.webp` if it still fits the optimized asset strategy.
 - [ ] Revisit Standard Camera app plus Apple Intelligence background inference. The current iOS workaround is to keep the Nukoevi Bridge app active and avoid requiring background inference while the standard Camera app owns the foreground.
