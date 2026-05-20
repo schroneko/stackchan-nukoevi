@@ -93,8 +93,10 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Latest external LED flash result: success on `/dev/cu.usbmodem101` for the synchronized one-slider LED build.
 - Latest external LED user verification: both left and right external LEDs were rewired to yellow and black and are working normally.
 - Latest external LED brightness target: start normal mode at 30% and switch to 10% during night sleepy mode.
+- Latest battery display task: firmware now treats external power as a powered battery display state, clamps the level to 0-100, and removes the charging lightning mark so charging is indicated by color only.
 - Latest user verification: Wi-Fi setup opens without crashing, battery display works, startup defaults for display, volume, and external LEDs are 30%, short screen taps are inactive, mic flow only starts from the mic icon, and the long-press controls modal works.
-- Latest microphone finding: pressing the mic icon currently restarts or reinitializes the firmware flow instead of completing a stable voice connection.
+- Latest Wi-Fi verification: `MyPhone` tethering connected after the hotspot became visible as a 2.4GHz AP. Firmware logs showed `Found AP: MyPhone`, `Got IP: 172.20.10.11`, and `Connected to WiFi: MyPhone`.
+- Latest microphone finding: pressing the mic icon was triggering Xiaozhi's automatic OTA upgrade to 1.4.1, which caused the apparent restart. Preserved-display background mode now skips the firmware upgrade, reconnects MQTT, and reaches `listening` without rebooting.
 
 ## Task List
 
@@ -103,9 +105,10 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - [x] Keep short taps on the Nukoevi screen inactive except for explicit overlay icons.
 - [x] Keep long press on the Nukoevi screen mapped to the brightness and volume modal.
 - [x] Verify the microphone icon is the only path that starts the voice flow.
-- [ ] Fix the mic icon voice flow so it does not restart or reinitialize the firmware flow when starting Xiaozhi.
+- [x] Fix the mic icon voice flow so it does not restart or reinitialize the firmware flow when starting Xiaozhi.
 - [x] Verify the Wi-Fi icon opens Wi-Fi setup without crashing and reports the connected or disconnected state accurately.
 - [x] Verify the battery indicator on the physical StackChan while charging and discharging.
+- [x] Fix the battery display based on the current physical UI behavior.
 - [ ] Connect the camera icon flow to the current `evictl` bridge: capture the current frame, send it to the bridge, receive the response, and show the response on StackChan.
 - [ ] Add an operator-friendly way to run or locate the `evictl` bridge target without depending on the old iPhone BLE bridge path.
 - [ ] Audit the local branch `feat/stackchan-camera-bridge` and carry forward only the behavior still needed after the asset optimization work.
