@@ -30,6 +30,7 @@ public:
     virtual ~CoreS3AudioCodec();
 
     virtual void SetOutputVolume(int volume) override;
+    void SetOutputVolumeVolatile(int volume);
     virtual void EnableInput(bool enable) override;
     virtual void EnableOutput(bool enable) override;
 };

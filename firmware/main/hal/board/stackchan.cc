@@ -643,6 +643,9 @@ void hal_bridge::board_set_speaker_volume(uint8_t volume, bool permanent)
     if (audio_codec) {
         if (permanent) {
             audio_codec->SetOutputVolume(volume);
+        } else {
+            auto cores3_audio_codec = static_cast<CoreS3AudioCodec*>(audio_codec);
+            cores3_audio_codec->SetOutputVolumeVolatile(volume);
         }
     }
 }
@@ -650,8 +653,14 @@ void hal_bridge::board_set_speaker_volume(uint8_t volume, bool permanent)
 uint8_t hal_bridge::board_get_speaker_volume()
 {
     int volume = 70;
-    Settings settings("audio", false);
-    volume = settings.GetInt("output_volume", volume);
+    auto& board      = Board::GetInstance();
+    auto audio_codec = board.GetAudioCodec();
+    if (audio_codec) {
+        volume = audio_codec->output_volume();
+    } else {
+        Settings settings("audio", false);
+        volume = settings.GetInt("output_volume", volume);
+    }
     if (volume <= 0) {
         volume = 10;
     }

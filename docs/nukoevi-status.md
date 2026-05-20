@@ -86,9 +86,13 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - Latest iPhone app install result: success on device `CDCFCD1E-488F-57C8-90C6-694C51110809`.
 - Latest iPhone app launch result: success for bundle id `test.NukoeviBridge`.
 - Latest external LED finding: the attached photo shows LEDs powered from the Grove red and black power rails. Red is 5V and black is GND on CoreS3 Grove ports, so firmware PWM cannot dim that wiring without moving the LED current path through a controllable GPIO or driver circuit.
-- Latest external LED firmware build result: success. The current build adds GPIO PWM brightness sliders for two external LEDs only and does not change StackChan's standard RGB LED rows.
+- Latest external LED firmware build result: success. The current build adds one synchronized GPIO PWM brightness slider for both external LEDs and does not change StackChan's standard RGB LED rows.
 - Latest external LED flash result: success on `/dev/cu.usbmodem101` after moving the left external LED wiring to yellow and black. Physical brightness change still needs visual confirmation on the device.
-- Latest external LED reset finding: releasing the external LED slider is not normal if it resets the device. The firmware now avoids flash/NVS writes on external LED slider release and starts external LEDs at 20% to reduce boot-time load, but this safer build has not been flashed because the StackChan USB serial port disappeared after the device disconnected.
+- Latest controls default target: opening Nukoevi sets display brightness, speaker volume, and both external LEDs to 30% without relying on saved slider values.
+- Latest external LED reset finding: releasing the external LED slider is not normal if it resets the device. The firmware now avoids flash/NVS writes on external LED slider release and keeps both external LEDs synchronized.
+- Latest external LED flash result: success on `/dev/cu.usbmodem101` for the synchronized one-slider LED build.
+- Latest external LED user verification: both left and right external LEDs were rewired to yellow and black and are working normally.
+- Latest external LED brightness target: start normal mode at 30% and switch to 10% during night sleepy mode.
 
 ## Task List
 
@@ -105,8 +109,9 @@ Show Nukoevi on the StackChan screen as the main character app, connect it to th
 - [ ] Reconcile any useful camera bridge behavior from `feat/stackchan-camera-bridge` with the current lighter firmware path instead of restoring the old heavy assets or deleted `channels/stackchan` server wholesale.
 - [x] Add firmware brightness controls for the two external LEDs without changing StackChan's standard RGB LED rows.
 - [x] Flash the external LED PWM firmware after the StackChan USB serial port is visible.
-- [ ] Flash the safer external LED slider build that removes release-time flash/NVS writes.
-- [ ] Confirm the external LED wiring uses a controllable GPIO or add a transistor/MOSFET driver path, because red and black Grove power rails alone cannot be PWM-dimmed by firmware.
+- [x] Flash the safer external LED slider build that removes release-time flash/NVS writes.
+- [ ] Verify Nukoevi startup defaults display, volume, and external LEDs to 30% on the physical device.
+- [x] Confirm the external LED wiring uses controllable GPIO wiring for both left and right external LEDs.
 - [ ] Add sprite animation from the original `spritesheet.webp` if it still fits the optimized asset strategy.
 - [ ] Revisit Standard Camera app plus Apple Intelligence background inference. The current iOS workaround is to keep the Nukoevi Bridge app active and avoid requiring background inference while the standard Camera app owns the foreground.
 - [ ] Revisit direct raw-image prompting into FoundationModels. The inspected iPhoneOS 26.4 SDK exposes text prompts for `LanguageModelSession`, so the current path uses VisionKit `ImageAnalyzer` transcript/context as the image input to FoundationModels.

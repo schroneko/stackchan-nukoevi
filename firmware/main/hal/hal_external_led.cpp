@@ -75,8 +75,8 @@ void Hal::initExternalLedPwm()
         return;
     }
 
-    _left_brightness = 20;
-    _right_brightness = 20;
+    _left_brightness = 30;
+    _right_brightness = 30;
 
     ledc_timer_config_t timer_config = {};
     timer_config.speed_mode = _speed_mode;

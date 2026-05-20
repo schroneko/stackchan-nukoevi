@@ -187,6 +187,11 @@ void CoreS3AudioCodec::SetOutputVolume(int volume) {
     AudioCodec::SetOutputVolume(volume);
 }
 
+void CoreS3AudioCodec::SetOutputVolumeVolatile(int volume) {
+    ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(output_dev_, volume));
+    output_volume_ = volume;
+}
+
 void CoreS3AudioCodec::EnableInput(bool enable) {
     if (enable == input_enabled_) {
         return;

@@ -47,6 +47,8 @@ static lv_obj_t* _camera_label = nullptr;
 static lv_obj_t* _wifi_button = nullptr;
 static lv_obj_t* _wifi_label = nullptr;
 static lv_obj_t* _wifi_off_badge = nullptr;
+static lv_obj_t* _home_button = nullptr;
+static lv_obj_t* _home_label = nullptr;
 static lv_obj_t* _battery_panel = nullptr;
 static lv_obj_t* _battery_label = nullptr;
 static lv_obj_t* _controls_scrim = nullptr;
@@ -55,10 +57,8 @@ static lv_obj_t* _brightness_label = nullptr;
 static lv_obj_t* _brightness_slider = nullptr;
 static lv_obj_t* _volume_label = nullptr;
 static lv_obj_t* _volume_slider = nullptr;
-static lv_obj_t* _left_ext_led_label = nullptr;
-static lv_obj_t* _left_ext_led_slider = nullptr;
-static lv_obj_t* _right_ext_led_label = nullptr;
-static lv_obj_t* _right_ext_led_slider = nullptr;
+static lv_obj_t* _external_led_label = nullptr;
+static lv_obj_t* _external_led_slider = nullptr;
 static lv_obj_t* _caption_panel = nullptr;
 static lv_obj_t* _llm_label     = nullptr;
 static lv_obj_t* _listen_indicator = nullptr;
@@ -103,6 +103,7 @@ static uint8_t _talk_index = 0;
 static uint32_t _talk_timecount = 0;
 static uint32_t _talk_until = 0;
 static bool _open_wifi_setup_requested = false;
+static bool _open_home_requested = false;
 static bool _network_started = false;
 static bool _sleep_mode = false;
 static uint8_t _sleep_index = 0;
@@ -111,6 +112,9 @@ static constexpr uint32_t _caption_auto_hide_ms = 6000;
 static constexpr int _caption_width       = 316;
 static constexpr int _caption_label_width = 300;
 static constexpr uint8_t _nukoevi_backlight_brightness = 30;
+static constexpr uint8_t _nukoevi_volume = 30;
+static constexpr uint8_t _external_led_normal_brightness = 30;
+static constexpr uint8_t _external_led_sleep_brightness = 10;
 static constexpr std::array<uint8_t, 8> _brightness_levels = {1, 15, 30, 45, 60, 75, 90, 100};
 static constexpr std::array<uint8_t, 11> _external_led_levels = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
 static constexpr std::array<uint8_t, 21> _volume_levels = {
@@ -118,10 +122,7 @@ static constexpr std::array<uint8_t, 21> _volume_levels = {
 static constexpr bool _enable_espnow_remote = false;
 static int32_t _brightness_index = 0;
 static int32_t _volume_index = 0;
-static int32_t _left_ext_led_index = 0;
-static int32_t _right_ext_led_index = 0;
-static bool _brightness_changed = false;
-static bool _volume_changed = false;
+static int32_t _external_led_index = 0;
 static bool _controls_syncing = false;
 static bool _xiaozhi_interaction_requested = false;
 static bool _motion_assets_loaded = false;
@@ -178,13 +179,28 @@ static void begin_evictl_camera_task();
 
 static int32_t value_to_index(uint8_t value, const uint8_t* levels, size_t size)
 {
+    if (size == 0) {
+        return 0;
+    }
+
+    size_t best_index = 0;
+    uint8_t best_distance = levels[0] > value ? levels[0] - value : value - levels[0];
     for (size_t i = 0; i < size; i++) {
-        if (levels[i] >= value) {
-            return static_cast<int32_t>(i);
+        const uint8_t distance = levels[i] > value ? levels[i] - value : value - levels[i];
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_index = i;
         }
     }
 
-    return static_cast<int32_t>(size - 1);
+    return static_cast<int32_t>(best_index);
+}
+
+static void snap_slider_to_level(lv_obj_t* slider, uint8_t value)
+{
+    _controls_syncing = true;
+    lv_slider_set_value(slider, value, LV_ANIM_OFF);
+    _controls_syncing = false;
 }
 
 static void set_button_style(lv_obj_t* button, uint32_t bg_color, uint32_t text_color)
@@ -214,31 +230,14 @@ static void update_controls_labels()
         std::snprintf(text, sizeof(text), "Volume %u%%", _volume_levels[_volume_index]);
         lv_label_set_text(_volume_label, text);
     }
-    if (_left_ext_led_label) {
-        std::snprintf(text, sizeof(text), "Left LED %u%%", _external_led_levels[_left_ext_led_index]);
-        lv_label_set_text(_left_ext_led_label, text);
-    }
-    if (_right_ext_led_label) {
-        std::snprintf(text, sizeof(text), "Right LED %u%%", _external_led_levels[_right_ext_led_index]);
-        lv_label_set_text(_right_ext_led_label, text);
-    }
-}
-
-static void save_controls_if_changed()
-{
-    if (_brightness_changed) {
-        GetHAL().setBackLightBrightness(_brightness_levels[_brightness_index], true);
-        _brightness_changed = false;
-    }
-    if (_volume_changed) {
-        GetHAL().setSpeakerVolume(_volume_levels[_volume_index], true);
-        _volume_changed = false;
+    if (_external_led_label) {
+        std::snprintf(text, sizeof(text), "LED %u%%", _external_led_levels[_external_led_index]);
+        lv_label_set_text(_external_led_label, text);
     }
 }
 
 static void hide_controls_modal()
 {
-    save_controls_if_changed();
     if (_controls_scrim) {
         lv_obj_add_flag(_controls_scrim, LV_OBJ_FLAG_HIDDEN);
     }
@@ -248,6 +247,12 @@ static void open_setup_wifi()
 {
     mclog::tagInfo("NUKOEVI", "open Wi-Fi setup requested");
     _open_wifi_setup_requested = true;
+}
+
+static void open_home()
+{
+    mclog::tagInfo("NUKOEVI", "open home requested");
+    _open_home_requested = true;
 }
 
 static void start_network_once()
@@ -278,6 +283,25 @@ static bool open_setup_wifi_if_requested()
         }
     }
     mclog::tagWarn("NUKOEVI", "SETUP app not found");
+    return false;
+}
+
+static bool open_home_if_requested()
+{
+    if (!_open_home_requested) {
+        return false;
+    }
+
+    _open_home_requested = false;
+    const auto app_num = GetMooncake().getAppNum();
+    for (std::size_t i = 0; i < app_num; i++) {
+        const auto info = GetMooncake().getAppInfo(static_cast<int>(i));
+        if (info.name == "Launcher") {
+            GetMooncake().openApp(static_cast<int>(i));
+            return true;
+        }
+    }
+    mclog::tagWarn("NUKOEVI", "Launcher app not found");
     return false;
 }
 
@@ -405,6 +429,10 @@ static void create_top_controls()
     create_control_button(&_wifi_button, &_wifi_label, LV_ALIGN_TOP_LEFT, 8, 8, LV_SYMBOL_WIFI,
                           [](lv_event_t*) { open_setup_wifi(); });
 
+    create_control_button(&_home_button, &_home_label, LV_ALIGN_TOP_LEFT, 50, 8, FONT_AWESOME_HOUSE,
+                          [](lv_event_t*) { open_home(); });
+    lv_obj_set_style_text_font(_home_label, &font_awesome_20_4, LV_PART_MAIN);
+
     _wifi_off_badge = lv_label_create(_wifi_button);
     lv_label_set_text(_wifi_off_badge, LV_SYMBOL_CLOSE);
     lv_obj_set_style_text_font(_wifi_off_badge, &lv_font_montserrat_16, LV_PART_MAIN);
@@ -452,12 +480,12 @@ static void create_controls_modal()
     _brightness_label = lv_label_create(_controls_modal);
     lv_obj_set_style_text_font(_brightness_label, &lv_font_montserrat_16, LV_PART_MAIN);
     lv_obj_set_style_text_color(_brightness_label, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
-    lv_obj_align(_brightness_label, LV_ALIGN_TOP_LEFT, 18, 12);
+    lv_obj_align(_brightness_label, LV_ALIGN_TOP_LEFT, 18, 22);
 
     _brightness_slider = lv_slider_create(_controls_modal);
     lv_obj_set_size(_brightness_slider, 250, 12);
-    lv_obj_align(_brightness_slider, LV_ALIGN_TOP_MID, 0, 38);
-    lv_slider_set_range(_brightness_slider, 0, _brightness_levels.size() - 1);
+    lv_obj_align(_brightness_slider, LV_ALIGN_TOP_MID, 0, 50);
+    lv_slider_set_range(_brightness_slider, 0, 100);
     lv_obj_set_style_bg_color(_brightness_slider, lv_color_hex(0xFFF4E6), LV_PART_KNOB);
     lv_obj_set_style_bg_color(_brightness_slider, lv_color_hex(0xF5B06F), LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(_brightness_slider, lv_color_hex(0x6D597A), LV_PART_MAIN);
@@ -467,23 +495,24 @@ static void create_controls_modal()
             if (_controls_syncing) {
                 return;
             }
-            _brightness_index = lv_slider_get_value(static_cast<lv_obj_t*>(lv_event_get_target(event)));
+            auto slider = static_cast<lv_obj_t*>(lv_event_get_target(event));
+            _brightness_index = value_to_index(lv_slider_get_value(slider), _brightness_levels.data(),
+                                               _brightness_levels.size());
+            snap_slider_to_level(slider, _brightness_levels[_brightness_index]);
             update_controls_labels();
             GetHAL().setBackLightBrightness(_brightness_levels[_brightness_index], false);
-            _brightness_changed = true;
         },
         LV_EVENT_VALUE_CHANGED, nullptr);
-    lv_obj_add_event_cb(_brightness_slider, [](lv_event_t*) { save_controls_if_changed(); }, LV_EVENT_RELEASED, nullptr);
 
     _volume_label = lv_label_create(_controls_modal);
     lv_obj_set_style_text_font(_volume_label, &lv_font_montserrat_16, LV_PART_MAIN);
     lv_obj_set_style_text_color(_volume_label, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
-    lv_obj_align(_volume_label, LV_ALIGN_TOP_LEFT, 18, 60);
+    lv_obj_align(_volume_label, LV_ALIGN_TOP_LEFT, 18, 86);
 
     _volume_slider = lv_slider_create(_controls_modal);
     lv_obj_set_size(_volume_slider, 250, 12);
-    lv_obj_align(_volume_slider, LV_ALIGN_TOP_MID, 0, 86);
-    lv_slider_set_range(_volume_slider, 0, _volume_levels.size() - 1);
+    lv_obj_align(_volume_slider, LV_ALIGN_TOP_MID, 0, 114);
+    lv_slider_set_range(_volume_slider, 0, 100);
     lv_obj_set_style_bg_color(_volume_slider, lv_color_hex(0xFFF4E6), LV_PART_KNOB);
     lv_obj_set_style_bg_color(_volume_slider, lv_color_hex(0xF5B06F), LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(_volume_slider, lv_color_hex(0x6D597A), LV_PART_MAIN);
@@ -493,61 +522,39 @@ static void create_controls_modal()
             if (_controls_syncing) {
                 return;
             }
-            _volume_index = lv_slider_get_value(static_cast<lv_obj_t*>(lv_event_get_target(event)));
+            auto slider = static_cast<lv_obj_t*>(lv_event_get_target(event));
+            _volume_index = value_to_index(lv_slider_get_value(slider), _volume_levels.data(), _volume_levels.size());
+            snap_slider_to_level(slider, _volume_levels[_volume_index]);
             update_controls_labels();
             GetHAL().setSpeakerVolume(_volume_levels[_volume_index], false);
-            _volume_changed = true;
         },
         LV_EVENT_VALUE_CHANGED, nullptr);
-    lv_obj_add_event_cb(_volume_slider, [](lv_event_t*) { save_controls_if_changed(); }, LV_EVENT_RELEASED, nullptr);
 
-    _left_ext_led_label = lv_label_create(_controls_modal);
-    lv_obj_set_style_text_font(_left_ext_led_label, &lv_font_montserrat_16, LV_PART_MAIN);
-    lv_obj_set_style_text_color(_left_ext_led_label, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
-    lv_obj_align(_left_ext_led_label, LV_ALIGN_TOP_LEFT, 18, 108);
+    _external_led_label = lv_label_create(_controls_modal);
+    lv_obj_set_style_text_font(_external_led_label, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(_external_led_label, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
+    lv_obj_align(_external_led_label, LV_ALIGN_TOP_LEFT, 18, 150);
 
-    _left_ext_led_slider = lv_slider_create(_controls_modal);
-    lv_obj_set_size(_left_ext_led_slider, 250, 12);
-    lv_obj_align(_left_ext_led_slider, LV_ALIGN_TOP_MID, 0, 134);
-    lv_slider_set_range(_left_ext_led_slider, 0, _external_led_levels.size() - 1);
-    lv_obj_set_style_bg_color(_left_ext_led_slider, lv_color_hex(0xFFF4E6), LV_PART_KNOB);
-    lv_obj_set_style_bg_color(_left_ext_led_slider, lv_color_hex(0xF5B06F), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(_left_ext_led_slider, lv_color_hex(0x6D597A), LV_PART_MAIN);
+    _external_led_slider = lv_slider_create(_controls_modal);
+    lv_obj_set_size(_external_led_slider, 250, 12);
+    lv_obj_align(_external_led_slider, LV_ALIGN_TOP_MID, 0, 178);
+    lv_slider_set_range(_external_led_slider, 0, 100);
+    lv_obj_set_style_bg_color(_external_led_slider, lv_color_hex(0xFFF4E6), LV_PART_KNOB);
+    lv_obj_set_style_bg_color(_external_led_slider, lv_color_hex(0xF5B06F), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(_external_led_slider, lv_color_hex(0x6D597A), LV_PART_MAIN);
     lv_obj_add_event_cb(
-        _left_ext_led_slider,
+        _external_led_slider,
         [](lv_event_t* event) {
             if (_controls_syncing) {
                 return;
             }
-            _left_ext_led_index = lv_slider_get_value(static_cast<lv_obj_t*>(lv_event_get_target(event)));
+            auto slider = static_cast<lv_obj_t*>(lv_event_get_target(event));
+            _external_led_index = value_to_index(lv_slider_get_value(slider), _external_led_levels.data(),
+                                                 _external_led_levels.size());
+            snap_slider_to_level(slider, _external_led_levels[_external_led_index]);
             update_controls_labels();
-            GetHAL().setExternalLedBrightness(_external_led_levels[_left_ext_led_index],
-                                              _external_led_levels[_right_ext_led_index], false);
-        },
-        LV_EVENT_VALUE_CHANGED, nullptr);
-
-    _right_ext_led_label = lv_label_create(_controls_modal);
-    lv_obj_set_style_text_font(_right_ext_led_label, &lv_font_montserrat_16, LV_PART_MAIN);
-    lv_obj_set_style_text_color(_right_ext_led_label, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
-    lv_obj_align(_right_ext_led_label, LV_ALIGN_TOP_LEFT, 18, 156);
-
-    _right_ext_led_slider = lv_slider_create(_controls_modal);
-    lv_obj_set_size(_right_ext_led_slider, 250, 12);
-    lv_obj_align(_right_ext_led_slider, LV_ALIGN_TOP_MID, 0, 182);
-    lv_slider_set_range(_right_ext_led_slider, 0, _external_led_levels.size() - 1);
-    lv_obj_set_style_bg_color(_right_ext_led_slider, lv_color_hex(0xFFF4E6), LV_PART_KNOB);
-    lv_obj_set_style_bg_color(_right_ext_led_slider, lv_color_hex(0xF5B06F), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(_right_ext_led_slider, lv_color_hex(0x6D597A), LV_PART_MAIN);
-    lv_obj_add_event_cb(
-        _right_ext_led_slider,
-        [](lv_event_t* event) {
-            if (_controls_syncing) {
-                return;
-            }
-            _right_ext_led_index = lv_slider_get_value(static_cast<lv_obj_t*>(lv_event_get_target(event)));
-            update_controls_labels();
-            GetHAL().setExternalLedBrightness(_external_led_levels[_left_ext_led_index],
-                                              _external_led_levels[_right_ext_led_index], false);
+            GetHAL().setExternalLedBrightness(_external_led_levels[_external_led_index],
+                                              _external_led_levels[_external_led_index], false);
         },
         LV_EVENT_VALUE_CHANGED, nullptr);
 
@@ -562,19 +569,14 @@ static void show_controls_modal()
 
     _brightness_index = value_to_index(GetHAL().getBackLightBrightness(), _brightness_levels.data(), _brightness_levels.size());
     _volume_index = value_to_index(GetHAL().getSpeakerVolume(), _volume_levels.data(), _volume_levels.size());
-    _left_ext_led_index = value_to_index(GetHAL().getLeftExternalLedBrightness(), _external_led_levels.data(),
+    _external_led_index = value_to_index(GetHAL().getLeftExternalLedBrightness(), _external_led_levels.data(),
                                          _external_led_levels.size());
-    _right_ext_led_index = value_to_index(GetHAL().getRightExternalLedBrightness(), _external_led_levels.data(),
-                                          _external_led_levels.size());
     _controls_syncing = true;
-    lv_slider_set_value(_brightness_slider, _brightness_index, LV_ANIM_OFF);
-    lv_slider_set_value(_volume_slider, _volume_index, LV_ANIM_OFF);
-    lv_slider_set_value(_left_ext_led_slider, _left_ext_led_index, LV_ANIM_OFF);
-    lv_slider_set_value(_right_ext_led_slider, _right_ext_led_index, LV_ANIM_OFF);
+    lv_slider_set_value(_brightness_slider, _brightness_levels[_brightness_index], LV_ANIM_OFF);
+    lv_slider_set_value(_volume_slider, _volume_levels[_volume_index], LV_ANIM_OFF);
+    lv_slider_set_value(_external_led_slider, _external_led_levels[_external_led_index], LV_ANIM_OFF);
     update_controls_labels();
     _controls_syncing = false;
-    _brightness_changed = false;
-    _volume_changed = false;
 
     lv_obj_clear_flag(_controls_scrim, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(_controls_scrim);
@@ -1284,6 +1286,7 @@ static bool update_sleep_animation(uint32_t now)
             _blink_index     = 0;
             _blink_timecount = now;
             _avatar->setSrc(&nukoevi_screen_open);
+            GetHAL().setExternalLedBrightness(_external_led_normal_brightness, _external_led_normal_brightness, false);
         }
         return false;
     }
@@ -1293,6 +1296,7 @@ static bool update_sleep_animation(uint32_t now)
         _sleep_index     = 0;
         _sleep_timecount = now;
         _avatar->setSrc(_sleep_sequence[_sleep_index]);
+        GetHAL().setExternalLedBrightness(_external_led_sleep_brightness, _external_led_sleep_brightness, false);
         return true;
     }
 
@@ -1326,7 +1330,8 @@ void AppNukoevi::onCreate()
 void AppNukoevi::onOpen()
 {
     mclog::tagInfo(getAppInfo().name, "on open");
-    GetHAL().setBackLightBrightness(_nukoevi_backlight_brightness, true);
+    GetHAL().setBackLightBrightness(_nukoevi_backlight_brightness, false);
+    GetHAL().setSpeakerVolume(_nukoevi_volume, false);
     if (_espnow_signal_connection < 0) {
         _espnow_signal_connection = GetHAL().onEspNowData.connect([](const std::vector<uint8_t>& data) {
             if (!_espnow_receives) {
@@ -1344,6 +1349,7 @@ void AppNukoevi::onOpen()
         _xiaozhi_text_signal_connection = GetHAL().onXiaozhiTextMessage.connect(handle_xiaozhi_text_message);
     }
     GetHAL().initExternalLedPwm();
+    GetHAL().setExternalLedBrightness(_external_led_normal_brightness, _external_led_normal_brightness, false);
     start_network_once();
     _espnow_receives = _enable_espnow_remote;
     if (_enable_espnow_remote && !_espnow_started) {
@@ -1558,6 +1564,11 @@ static void handle_espnow_remote_motion()
 
 void AppNukoevi::onRunning()
 {
+    if (open_home_if_requested()) {
+        close();
+        return;
+    }
+
     if (open_setup_wifi_if_requested()) {
         return;
     }
@@ -1685,6 +1696,9 @@ void AppNukoevi::onClose()
     if (_wifi_button && lv_obj_is_valid(_wifi_button)) {
         lv_obj_delete(_wifi_button);
     }
+    if (_home_button && lv_obj_is_valid(_home_button)) {
+        lv_obj_delete(_home_button);
+    }
     if (_battery_panel && lv_obj_is_valid(_battery_panel)) {
         lv_obj_delete(_battery_panel);
     }
@@ -1700,6 +1714,8 @@ void AppNukoevi::onClose()
     _wifi_button = nullptr;
     _wifi_label = nullptr;
     _wifi_off_badge = nullptr;
+    _home_button = nullptr;
+    _home_label = nullptr;
     _battery_panel = nullptr;
     _battery_label = nullptr;
     _controls_scrim = nullptr;
@@ -1708,10 +1724,8 @@ void AppNukoevi::onClose()
     _brightness_slider = nullptr;
     _volume_label = nullptr;
     _volume_slider = nullptr;
-    _left_ext_led_label = nullptr;
-    _left_ext_led_slider = nullptr;
-    _right_ext_led_label = nullptr;
-    _right_ext_led_slider = nullptr;
+    _external_led_label = nullptr;
+    _external_led_slider = nullptr;
     _llm_label     = nullptr;
     _caption_panel = nullptr;
     _listen_indicator = nullptr;
@@ -1722,6 +1736,7 @@ void AppNukoevi::onClose()
     _listen_indicator_requested = false;
     _caption_hide_requested = false;
     _xiaozhi_interaction_requested = false;
+    _open_home_requested = false;
     _avatar.reset();
     _panel.reset();
 }
