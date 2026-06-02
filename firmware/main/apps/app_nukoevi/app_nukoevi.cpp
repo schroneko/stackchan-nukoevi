@@ -38,6 +38,7 @@ LV_IMAGE_DECLARE(nukoevi_screen_open);
 LV_IMAGE_DECLARE(nukoevi_screen_half_a);
 LV_IMAGE_DECLARE(nukoevi_screen_closed);
 LV_IMAGE_DECLARE(nukoevi_screen_half_b);
+LV_IMAGE_DECLARE(nukoevi_sleep_drowsy);
 LV_FONT_DECLARE(font_puhui_14_1);
 LV_FONT_DECLARE(font_awesome_20_4);
 
@@ -156,12 +157,6 @@ static lv_image_dsc_t _talk_medium;
 static lv_image_dsc_t _talk_wide;
 static lv_image_dsc_t _talk_small;
 static lv_image_dsc_t _talk_smile;
-static lv_image_dsc_t _sleep_drowsy;
-static lv_image_dsc_t _sleep_nearly_closed;
-static lv_image_dsc_t _sleep_nod;
-static lv_image_dsc_t _sleep_asleep;
-static lv_image_dsc_t _sleep_wobble;
-static lv_image_dsc_t _sleep_return;
 
 static const lv_image_dsc_t* const _blink_sequence[] = {
     &nukoevi_screen_open,
@@ -181,26 +176,34 @@ static const lv_image_dsc_t* const _talk_sequence[] = {
 };
 
 static const lv_image_dsc_t* const _sleep_sequence[] = {
-    &_sleep_drowsy,
-    &_sleep_nearly_closed,
-    &_sleep_nod,
-    &_sleep_asleep,
-    &_sleep_wobble,
-    &_sleep_return,
+    &nukoevi_sleep_drowsy,
 };
 
 static const uint32_t _sleep_intervals[] = {
     3600,
-    700,
-    850,
-    2400,
-    850,
-    900,
 };
 
 static void start_xiaozhi_request();
 static void begin_evictl_camera_task();
 static void publish_mqtt_state(const char* event_type, const std::string& text, const char* role = nullptr);
+
+static bool is_valid_nukoevi_image(const lv_image_dsc_t* image)
+{
+    return image && image->data && image->data_size > 0 && image->header.magic == LV_IMAGE_HEADER_MAGIC &&
+           image->header.w > 0 && image->header.h > 0;
+}
+
+static bool set_avatar_motion_frame(const lv_image_dsc_t* image, const char* mode, uint8_t index)
+{
+    if (is_valid_nukoevi_image(image)) {
+        _avatar->setSrc(image);
+        return true;
+    }
+
+    mclog::tagWarn("NUKOEVI", "{} frame {} invalid, fallback to open image", mode, index);
+    _avatar->setSrc(&nukoevi_screen_open);
+    return false;
+}
 
 static void enqueue_mqtt_output_payload(const std::string& payload)
 {
@@ -814,16 +817,13 @@ static void load_motion_assets()
     _talk_wide = assets::get_image("nukoevi-talk-wide.bin");
     _talk_small = assets::get_image("nukoevi-talk-small.bin");
     _talk_smile = assets::get_image("nukoevi-talk-smile.bin");
-    _sleep_drowsy = assets::get_image("nukoevi-sleep-drowsy.bin");
-    _sleep_nearly_closed = assets::get_image("nukoevi-sleep-nearly-closed.bin");
-    _sleep_nod = assets::get_image("nukoevi-sleep-nod.bin");
-    _sleep_asleep = assets::get_image("nukoevi-sleep-asleep.bin");
-    _sleep_wobble = assets::get_image("nukoevi-sleep-wobble.bin");
-    _sleep_return = assets::get_image("nukoevi-sleep-return.bin");
     _motion_assets_loaded = _talk_closed.data && _talk_tiny.data && _talk_medium.data && _talk_wide.data &&
-                            _talk_small.data && _talk_smile.data && _sleep_drowsy.data &&
-                            _sleep_nearly_closed.data && _sleep_nod.data && _sleep_asleep.data &&
-                            _sleep_wobble.data && _sleep_return.data;
+                            _talk_small.data && _talk_smile.data;
+    mclog::tagInfo("NUKOEVI",
+                   "motion assets loaded={} talk=[{},{},{},{},{},{}] sleep_static={}",
+                   _motion_assets_loaded, _talk_closed.data != nullptr, _talk_tiny.data != nullptr,
+                   _talk_medium.data != nullptr, _talk_wide.data != nullptr, _talk_small.data != nullptr,
+                   _talk_smile.data != nullptr, is_valid_nukoevi_image(&nukoevi_sleep_drowsy));
 }
 
 static bool starts_with(std::string_view text, std::string_view prefix)
@@ -1557,7 +1557,7 @@ static bool update_talk_animation(uint32_t now)
     if (_talk_timecount == 0 || now - _talk_timecount >= talk_frame_ms) {
         _talk_timecount = now;
         _talk_index = (_talk_index + 1) % (sizeof(_talk_sequence) / sizeof(_talk_sequence[0]));
-        _avatar->setSrc(_talk_sequence[_talk_index]);
+        set_avatar_motion_frame(_talk_sequence[_talk_index], "talk", _talk_index);
     }
 
     return true;
@@ -1574,6 +1574,7 @@ static bool update_sleep_animation(uint32_t now)
             _blink_timecount = now;
             _avatar->setSrc(&nukoevi_screen_open);
             GetHAL().setExternalLedBrightness(_external_led_normal_brightness, _external_led_normal_brightness, false);
+            mclog::tagInfo("NUKOEVI", "sleep mode exit");
         }
         return false;
     }
@@ -1582,8 +1583,9 @@ static bool update_sleep_animation(uint32_t now)
         _sleep_mode      = true;
         _sleep_index     = 0;
         _sleep_timecount = now;
-        _avatar->setSrc(_sleep_sequence[_sleep_index]);
+        set_avatar_motion_frame(_sleep_sequence[_sleep_index], "sleep", _sleep_index);
         GetHAL().setExternalLedBrightness(_external_led_sleep_brightness, _external_led_sleep_brightness, false);
+        mclog::tagInfo("NUKOEVI", "sleep mode enter");
         return true;
     }
 
@@ -1594,7 +1596,7 @@ static bool update_sleep_animation(uint32_t now)
         if (_sleep_index >= sizeof(_sleep_sequence) / sizeof(_sleep_sequence[0])) {
             _sleep_index = 0;
         }
-        _avatar->setSrc(_sleep_sequence[_sleep_index]);
+        set_avatar_motion_frame(_sleep_sequence[_sleep_index], "sleep", _sleep_index);
     }
 
     return true;

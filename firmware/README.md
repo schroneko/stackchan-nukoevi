@@ -59,8 +59,27 @@ Useful startup log lines:
   playback.
 - Uses the standard StackChan/Xiaozhi microphone path as the basis for voice
   input.
+- Switches to a sleepy Nukoevi image between 22:00 and 07:00 JST.
 - Retries saved Wi-Fi credentials when connection startup times out instead of
   entering Wi-Fi configuration mode immediately.
+
+## Nukoevi image assets
+
+The normal face and sleepy face are compiled as C image descriptors and passed
+to LVGL with the same `setSrc()` path. This keeps the 22:00 to 07:00 sleepy
+mode on the same rendering path as the normal Nukoevi screen.
+
+Talk frames still use runtime `.bin` assets from the assets partition because
+there are six mouth frames and keeping every motion frame as uncompressed C
+data would use too much app partition space. The sleepy mode currently uses one
+static `320x240` frame generated from
+`main/apps/app_nukoevi/source-assets/nukoevi-sleep-frame-0.png`.
+
+Regenerate the sleepy C asset after changing the source frame:
+
+```bash
+uv run --with pillow python main/apps/app_nukoevi/source-assets/generate_nukoevi_sleep_asset.py
+```
 
 ## Upstream patch
 
