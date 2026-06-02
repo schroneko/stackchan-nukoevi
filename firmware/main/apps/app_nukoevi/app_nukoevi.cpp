@@ -114,12 +114,6 @@ static bool _touch_point_active = false;
 static uint32_t _touch_point_published_at = 0;
 static int _last_touch_point_x = -1;
 static int _last_touch_point_y = -1;
-static bool _talk_requested = false;
-static size_t _talk_request_text_size = 0;
-static bool _talk_active = false;
-static uint8_t _talk_index = 0;
-static uint32_t _talk_timecount = 0;
-static uint32_t _talk_until = 0;
 static bool _open_wifi_setup_requested = false;
 static bool _open_home_requested = false;
 static bool _network_started = false;
@@ -151,7 +145,6 @@ static int32_t _volume_index = 0;
 static int32_t _external_led_index = 0;
 static bool _controls_syncing = false;
 static bool _xiaozhi_interaction_requested = false;
-static bool _motion_assets_loaded = false;
 static std::unique_ptr<Mqtt> _mqtt_output_client;
 static std::mutex _mqtt_output_mutex;
 static std::queue<std::string> _mqtt_output_messages;
@@ -163,28 +156,12 @@ static constexpr const char* _mqtt_input_topic = "nukoevi/input/text";
 static constexpr const char* _mqtt_output_topic = "nukoevi/output/text";
 static constexpr const char* _mqtt_output_audio_topic = "nukoevi/output/audio/opus";
 static constexpr const char* _mqtt_state_topic = "nukoevi/device/stackchan/state";
-static lv_image_dsc_t _talk_closed;
-static lv_image_dsc_t _talk_tiny;
-static lv_image_dsc_t _talk_medium;
-static lv_image_dsc_t _talk_wide;
-static lv_image_dsc_t _talk_small;
-static lv_image_dsc_t _talk_smile;
-
 static const lv_image_dsc_t* const _blink_sequence[] = {
     &nukoevi_screen_open,
     &nukoevi_screen_half_a,
     &nukoevi_screen_closed,
     &nukoevi_screen_half_b,
     &nukoevi_screen_open,
-};
-
-static const lv_image_dsc_t* const _talk_sequence[] = {
-    &_talk_closed,
-    &_talk_tiny,
-    &_talk_medium,
-    &_talk_wide,
-    &_talk_small,
-    &_talk_smile,
 };
 
 static const lv_image_dsc_t* const _sleep_sequence[] = {
@@ -876,42 +853,6 @@ static void show_controls_modal()
     lv_obj_move_foreground(_controls_scrim);
 }
 
-static void load_motion_assets()
-{
-    if (_motion_assets_loaded) {
-        return;
-    }
-
-    _talk_closed = assets::get_image("nukoevi-talk-closed.bin");
-    _talk_tiny = assets::get_image("nukoevi-talk-tiny.bin");
-    _talk_medium = assets::get_image("nukoevi-talk-medium.bin");
-    _talk_wide = assets::get_image("nukoevi-talk-wide.bin");
-    _talk_small = assets::get_image("nukoevi-talk-small.bin");
-    _talk_smile = assets::get_image("nukoevi-talk-smile.bin");
-    _motion_assets_loaded = _talk_closed.data && _talk_tiny.data && _talk_medium.data && _talk_wide.data &&
-                            _talk_small.data && _talk_smile.data;
-    mclog::tagInfo("NUKOEVI",
-                   "motion assets loaded={} talk=[{},{},{},{},{},{}] sleep_static={}",
-                   _motion_assets_loaded, _talk_closed.data != nullptr, _talk_tiny.data != nullptr,
-                   _talk_medium.data != nullptr, _talk_wide.data != nullptr, _talk_small.data != nullptr,
-                   _talk_smile.data != nullptr, is_valid_nukoevi_image(&nukoevi_sleep_drowsy));
-}
-
-static bool starts_with(std::string_view text, std::string_view prefix)
-{
-    return text.size() >= prefix.size() && text.substr(0, prefix.size()) == prefix;
-}
-
-static bool should_talk_for_text(std::string_view text)
-{
-    if (text.empty()) {
-        return false;
-    }
-
-    return !starts_with(text, "AI ") && !starts_with(text, "Open ") && !starts_with(text, "BLE ") &&
-           !starts_with(text, "Starting ") && text != "考え中";
-}
-
 static bool is_night_time()
 {
     const time_t now_t = time(nullptr);
@@ -926,17 +867,6 @@ static bool is_night_time()
     }
 
     return jst_tm.tm_hour >= 22 || jst_tm.tm_hour < 7;
-}
-
-static void start_talk_animation(size_t text_size)
-{
-    const auto now = GetHAL().millis();
-    const uint32_t duration = uitk::clamp<uint32_t>(1400 + static_cast<uint32_t>(text_size) * 40, 1800, 5200);
-
-    _talk_active    = true;
-    _talk_index     = 0;
-    _talk_timecount = 0;
-    _talk_until     = now + duration;
 }
 
 static void start_local_llm_request()
@@ -1106,10 +1036,6 @@ static void handle_xiaozhi_text_message(const WsTextMessage_t& message)
     if (role == "assistant") {
         _llm_status = text;
         _llm_status_changed = true;
-        if (should_talk_for_text(text)) {
-            _talk_requested = true;
-            _talk_request_text_size = text.size();
-        }
         return;
     }
 
@@ -1393,12 +1319,6 @@ static void evictl_camera_task(void* arg)
     }
     finish_llm_request(request_id, response);
 
-    if (should_talk_for_text(response)) {
-        std::lock_guard<std::mutex> lock(_llm_mutex);
-        _talk_requested = true;
-        _talk_request_text_size = response.size();
-    }
-
     vTaskDelete(nullptr);
 }
 
@@ -1488,7 +1408,6 @@ static void handle_llm_timeout(uint32_t now)
     _active_chat_request_id = 0;
     _llm_status         = "応答がありません";
     _llm_status_changed = true;
-    _talk_requested     = false;
     mclog::tagWarn("NUKOEVI", "LLM request timed out");
 }
 
@@ -1637,29 +1556,6 @@ static void handle_caption_auto_hide(uint32_t now)
     hide_caption_panel();
 }
 
-static bool update_talk_animation(uint32_t now)
-{
-    if (!_talk_active) {
-        return false;
-    }
-
-    if (now >= _talk_until) {
-        _talk_active    = false;
-        _talk_index     = 0;
-        _talk_timecount = 0;
-        return false;
-    }
-
-    constexpr uint32_t talk_frame_ms = 120;
-    if (_talk_timecount == 0 || now - _talk_timecount >= talk_frame_ms) {
-        _talk_timecount = now;
-        _talk_index = (_talk_index + 1) % (sizeof(_talk_sequence) / sizeof(_talk_sequence[0]));
-        set_avatar_motion_frame(_talk_sequence[_talk_index], "talk", _talk_index);
-    }
-
-    return true;
-}
-
 static bool update_sleep_animation(uint32_t now)
 {
     if (!is_night_time()) {
@@ -1745,8 +1641,6 @@ void AppNukoevi::onOpen()
         _espnow_started = true;
         mclog::tagInfo(getAppInfo().name, "ESP-NOW remote receiver ready on channel 1, id 1");
     }
-    load_motion_assets();
-
     LvglLockGuard lock;
 
     _panel = std::make_unique<Container>(lv_screen_active());
@@ -1767,8 +1661,6 @@ void AppNukoevi::onOpen()
     lv_obj_add_event_cb(_avatar->get(), [](lv_event_t*) { show_controls_modal(); }, LV_EVENT_LONG_PRESSED, nullptr);
     _blink_index     = 0;
     _blink_timecount = GetHAL().millis();
-    _talk_active     = false;
-    _talk_requested  = false;
     _sleep_mode      = false;
     _sleep_index     = 0;
 
@@ -1860,10 +1752,6 @@ void AppNukoevi::onOpen()
 
         _llm_status         = text;
         _llm_status_changed = true;
-        if (should_talk_for_text(text)) {
-            _talk_requested = true;
-            _talk_request_text_size = strlen(text);
-        }
         _llm_running        = false;
         _llm_started_at     = 0;
         _active_chat_request_id = 0;
@@ -1983,11 +1871,9 @@ void AppNukoevi::onRunning()
     }
 
     bool should_start_llm = false;
-    bool should_start_talk = false;
     bool should_hide_caption = false;
     bool listen_indicator_visible = false;
     MicButtonState mic_button_state = MicButtonState::Idle;
-    size_t talk_text_size = 0;
     {
         std::lock_guard<std::mutex> lock(_llm_mutex);
         if (_llm_requested && !_llm_running) {
@@ -1999,12 +1885,6 @@ void AppNukoevi::onRunning()
         if (_llm_status_changed && _llm_label) {
             update_caption_text(_llm_status);
             _llm_status_changed = false;
-        }
-        if (_talk_requested) {
-            _talk_requested = false;
-            should_start_talk = true;
-            talk_text_size = _talk_request_text_size;
-            _talk_request_text_size = 0;
         }
         if (_caption_hide_requested) {
             _caption_hide_requested = false;
@@ -2022,14 +1902,6 @@ void AppNukoevi::onRunning()
 
     if (should_start_llm) {
         begin_local_llm_task();
-    }
-
-    if (should_start_talk) {
-        start_talk_animation(talk_text_size);
-    }
-
-    if (update_talk_animation(now)) {
-        return;
     }
 
     if (update_sleep_animation(now)) {
