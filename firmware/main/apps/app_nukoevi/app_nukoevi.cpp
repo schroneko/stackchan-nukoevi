@@ -41,6 +41,7 @@ LV_IMAGE_DECLARE(nukoevi_screen_half_b);
 LV_IMAGE_DECLARE(nukoevi_sleep_drowsy);
 LV_FONT_DECLARE(font_puhui_14_1);
 LV_FONT_DECLARE(font_awesome_20_4);
+LV_FONT_DECLARE(font_awesome_30_4);
 
 static std::unique_ptr<Container> _panel;
 static std::unique_ptr<Image> _avatar;
@@ -128,6 +129,14 @@ static uint32_t _sleep_timecount = 0;
 static constexpr uint32_t _caption_auto_hide_ms = 15000;
 static constexpr int _caption_width       = 316;
 static constexpr int _caption_label_width = 300;
+static constexpr int _top_mark_size = 54;
+static constexpr int _top_mark_radius = _top_mark_size / 2;
+static constexpr int _top_mark_y = 6;
+static constexpr int _top_mark_x_wifi = 5;
+static constexpr int _top_mark_x_home = 69;
+static constexpr int _top_mark_x_battery = 133;
+static constexpr int _top_mark_x_camera = 197;
+static constexpr int _top_mark_x_mic = 261;
 static constexpr uint8_t _nukoevi_backlight_brightness = 30;
 static constexpr uint8_t _nukoevi_volume = 30;
 static constexpr uint8_t _external_led_normal_brightness = 30;
@@ -150,6 +159,7 @@ static bool _mqtt_output_connecting = false;
 static uint32_t _mqtt_output_last_connect_at = 0;
 static constexpr const char* _mqtt_output_broker_host = "192.168.1.10";
 static constexpr int _mqtt_output_broker_port = 18883;
+static constexpr const char* _mqtt_input_topic = "nukoevi/input/text";
 static constexpr const char* _mqtt_output_topic = "nukoevi/output/text";
 static constexpr const char* _mqtt_output_audio_topic = "nukoevi/output/audio/opus";
 static constexpr const char* _mqtt_state_topic = "nukoevi/device/stackchan/state";
@@ -185,8 +195,11 @@ static const uint32_t _sleep_intervals[] = {
     3600,
 };
 
-static void start_xiaozhi_request();
+static void begin_xiaozhi_voice_input();
+static void end_xiaozhi_voice_input();
+static void handle_mic_button_event(lv_event_t* event);
 static void begin_evictl_camera_task();
+static void publish_mqtt_input(const std::string& text, const char* role = nullptr);
 static void publish_mqtt_state(const char* event_type, const std::string& text, const char* role = nullptr);
 
 static bool is_valid_nukoevi_image(const lv_image_dsc_t* image)
@@ -329,6 +342,36 @@ static void publish_mqtt_state(const char* event_type, const std::string& text, 
     _mqtt_output_client->Publish(_mqtt_state_topic, payload, 1);
 }
 
+static void publish_mqtt_input(const std::string& text, const char* role)
+{
+    if (!_mqtt_output_client || !_mqtt_output_client->IsConnected() || text.empty()) {
+        return;
+    }
+
+    const auto device_id = GetHAL().getFactoryMacString();
+    const auto now = GetHAL().millis();
+    char request_id[96];
+    std::snprintf(request_id, sizeof(request_id), "stackchan-%s-%lu", device_id.c_str(),
+                  static_cast<unsigned long>(now));
+
+    ArduinoJson::JsonDocument doc;
+    doc["id"] = request_id;
+    doc["type"] = "input.text";
+    doc["source"] = "stackchan";
+    doc["target"] = "claude";
+    doc["session_id"] = "xiaozhi";
+    doc["device_id"] = device_id;
+    doc["text"] = text;
+    if (role && std::strlen(role) > 0) {
+        doc["role"] = role;
+    }
+
+    std::string payload;
+    ArduinoJson::serializeJson(doc, payload);
+    _mqtt_output_client->Publish(_mqtt_input_topic, payload, 1);
+    publish_mqtt_state("mqtt.input.published", text, role);
+}
+
 static void mqtt_output_connect_task(void*)
 {
     bool connected = false;
@@ -424,8 +467,8 @@ static void snap_slider_to_level(lv_obj_t* slider, uint8_t value)
 
 static void set_button_style(lv_obj_t* button, uint32_t bg_color, uint32_t text_color)
 {
-    lv_obj_set_size(button, 36, 36);
-    lv_obj_set_style_radius(button, 18, LV_PART_MAIN);
+    lv_obj_set_size(button, _top_mark_size, _top_mark_size);
+    lv_obj_set_style_radius(button, _top_mark_radius, LV_PART_MAIN);
     lv_obj_set_style_border_width(button, 2, LV_PART_MAIN);
     lv_obj_set_style_border_color(button, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
     lv_obj_set_style_bg_color(button, lv_color_hex(bg_color), LV_PART_MAIN);
@@ -433,7 +476,7 @@ static void set_button_style(lv_obj_t* button, uint32_t bg_color, uint32_t text_
     lv_obj_set_style_shadow_width(button, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(button, 0, LV_PART_MAIN);
     lv_obj_set_style_text_color(button, lv_color_hex(text_color), LV_PART_MAIN);
-    lv_obj_set_style_text_font(button, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_font(button, &lv_font_montserrat_24, LV_PART_MAIN);
     lv_obj_clear_flag(button, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
 }
@@ -595,23 +638,22 @@ static void update_battery_indicator()
 
     const auto level = GetHAL().getBatteryLevel();
     const bool charging = GetHAL().isBatteryCharging();
-    char text[32];
-    std::snprintf(text, sizeof(text), "%s%s %u%%", charging ? LV_SYMBOL_CHARGE " " : "", get_battery_symbol(level),
-                  static_cast<unsigned>(level));
-    lv_label_set_text(_battery_label, text);
+    lv_label_set_text(_battery_label, get_battery_symbol(level));
 
     const uint32_t bg_color = level <= 15 ? 0x5A2525 : 0x2B1710;
     const uint32_t text_color = charging ? 0x9CFFB5 : (level <= 15 ? 0xFFB3A7 : 0xFFF4E6);
+    const uint32_t border_color = charging ? 0x9CFFB5 : 0xFFF4E6;
     lv_obj_set_style_bg_color(_battery_panel, lv_color_hex(bg_color), LV_PART_MAIN);
+    lv_obj_set_style_border_color(_battery_panel, lv_color_hex(border_color), LV_PART_MAIN);
     lv_obj_set_style_text_color(_battery_label, lv_color_hex(text_color), LV_PART_MAIN);
 }
 
 static void create_battery_indicator()
 {
     _battery_panel = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(_battery_panel, 86, 28);
-    lv_obj_align(_battery_panel, LV_ALIGN_TOP_MID, 0, 8);
-    lv_obj_set_style_radius(_battery_panel, 14, LV_PART_MAIN);
+    lv_obj_set_size(_battery_panel, _top_mark_size, _top_mark_size);
+    lv_obj_align(_battery_panel, LV_ALIGN_TOP_LEFT, _top_mark_x_battery, _top_mark_y);
+    lv_obj_set_style_radius(_battery_panel, _top_mark_radius, LV_PART_MAIN);
     lv_obj_set_style_border_width(_battery_panel, 2, LV_PART_MAIN);
     lv_obj_set_style_border_color(_battery_panel, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
     lv_obj_set_style_bg_color(_battery_panel, lv_color_hex(0x2B1710), LV_PART_MAIN);
@@ -622,7 +664,7 @@ static void create_battery_indicator()
     lv_obj_clear_flag(_battery_panel, LV_OBJ_FLAG_CLICKABLE);
 
     _battery_label = lv_label_create(_battery_panel);
-    lv_obj_set_style_text_font(_battery_label, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_font(_battery_label, &lv_font_montserrat_24, LV_PART_MAIN);
     lv_obj_set_style_text_color(_battery_label, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
     lv_obj_center(_battery_label);
     update_battery_indicator();
@@ -634,7 +676,9 @@ static void create_control_button(lv_obj_t** button, lv_obj_t** label, lv_align_
     *button = lv_obj_create(lv_screen_active());
     set_button_style(*button, 0x2B1710, 0xFFF4E6);
     lv_obj_align(*button, align, x, y);
-    lv_obj_add_event_cb(*button, callback, LV_EVENT_CLICKED, nullptr);
+    if (callback) {
+        lv_obj_add_event_cb(*button, callback, LV_EVENT_CLICKED, nullptr);
+    }
 
     *label = lv_label_create(*button);
     lv_label_set_text(*label, text);
@@ -656,28 +700,32 @@ static void create_mic_icon(lv_obj_t* parent)
         lv_obj_clear_flag(part, LV_OBJ_FLAG_CLICKABLE);
     };
 
-    create_part(12, 18, 6, LV_ALIGN_TOP_MID, 0, 6);
-    create_part(3, 7, 1, LV_ALIGN_BOTTOM_MID, 0, -7);
-    create_part(16, 3, 1, LV_ALIGN_BOTTOM_MID, 0, -5);
+    create_part(18, 27, 9, LV_ALIGN_TOP_MID, 0, 8);
+    create_part(5, 10, 2, LV_ALIGN_BOTTOM_MID, 0, -10);
+    create_part(24, 5, 2, LV_ALIGN_BOTTOM_MID, 0, -7);
 }
 
 static void create_top_controls()
 {
     lv_obj_t* mic_label = nullptr;
-    create_control_button(&_mic_button, &mic_label, LV_ALIGN_TOP_RIGHT, -8, 8, "",
-                          [](lv_event_t*) { start_xiaozhi_request(); });
+    create_control_button(&_mic_button, &mic_label, LV_ALIGN_TOP_LEFT, _top_mark_x_mic, _top_mark_y, "", nullptr);
+    lv_obj_add_event_cb(_mic_button, handle_mic_button_event, LV_EVENT_PRESSED, nullptr);
+    lv_obj_add_event_cb(_mic_button, handle_mic_button_event, LV_EVENT_RELEASED, nullptr);
+    lv_obj_add_event_cb(_mic_button, handle_mic_button_event, LV_EVENT_PRESS_LOST, nullptr);
     create_mic_icon(_mic_button);
 
-    create_control_button(&_camera_button, &_camera_label, LV_ALIGN_TOP_RIGHT, -50, 8, FONT_AWESOME_CAMERA,
+    create_control_button(&_camera_button, &_camera_label, LV_ALIGN_TOP_LEFT, _top_mark_x_camera, _top_mark_y,
+                          FONT_AWESOME_CAMERA,
                           [](lv_event_t*) { begin_evictl_camera_task(); });
-    lv_obj_set_style_text_font(_camera_label, &font_awesome_20_4, LV_PART_MAIN);
+    lv_obj_set_style_text_font(_camera_label, &font_awesome_30_4, LV_PART_MAIN);
 
-    create_control_button(&_wifi_button, &_wifi_label, LV_ALIGN_TOP_LEFT, 8, 8, LV_SYMBOL_WIFI,
+    create_control_button(&_wifi_button, &_wifi_label, LV_ALIGN_TOP_LEFT, _top_mark_x_wifi, _top_mark_y, LV_SYMBOL_WIFI,
                           [](lv_event_t*) { open_setup_wifi(); });
 
-    create_control_button(&_home_button, &_home_label, LV_ALIGN_TOP_LEFT, 50, 8, FONT_AWESOME_HOUSE,
+    create_control_button(&_home_button, &_home_label, LV_ALIGN_TOP_LEFT, _top_mark_x_home, _top_mark_y,
+                          FONT_AWESOME_HOUSE,
                           [](lv_event_t*) { open_home(); });
-    lv_obj_set_style_text_font(_home_label, &font_awesome_20_4, LV_PART_MAIN);
+    lv_obj_set_style_text_font(_home_label, &font_awesome_30_4, LV_PART_MAIN);
 
     _wifi_off_badge = lv_label_create(_wifi_button);
     lv_label_set_text(_wifi_off_badge, LV_SYMBOL_CLOSE);
@@ -925,30 +973,25 @@ static void set_mic_button_state_requested(MicButtonState state)
     _mic_button_state_requested = state;
 }
 
-static void start_xiaozhi_request()
+static void begin_xiaozhi_voice_input()
 {
     const auto now = GetHAL().millis();
-    if (_mic_button_event_at != 0 && now - _mic_button_event_at < 800) {
+    if (_mic_button_event_at != 0 && now - _mic_button_event_at < 300) {
         return;
     }
     _mic_button_event_at = now;
 
     if (GetHAL().isXiaozhiListening() || _xiaozhi_interaction_requested) {
-        publish_mqtt_state("mic.clicked", "stop");
-        set_mic_button_state_requested(MicButtonState::Starting);
-        update_llm_status("送信中");
-        GetHAL().stopXiaozhiListening();
-        _xiaozhi_interaction_requested = false;
         return;
     }
 
-    if (_last_llm_request_at != 0 && now - _last_llm_request_at < 1500) {
+    if (_last_llm_request_at != 0 && now - _last_llm_request_at < 300) {
         publish_mqtt_state("mic.debounced", "ignored");
         return;
     }
     _last_llm_request_at = now;
     _xiaozhi_interaction_requested = true;
-    publish_mqtt_state("mic.clicked", "start");
+    publish_mqtt_state("mic.pressed", "start");
     if (GetHAL().isXiaozhiSpeaking()) {
         set_mic_button_state_requested(MicButtonState::Starting);
         update_llm_status("キャンセル中");
@@ -957,6 +1000,32 @@ static void start_xiaozhi_request()
         update_llm_status("マイク準備中");
     }
     GetHAL().requestXiaozhiListening();
+}
+
+static void end_xiaozhi_voice_input()
+{
+    if (!GetHAL().isXiaozhiListening() && !_xiaozhi_interaction_requested) {
+        return;
+    }
+
+    publish_mqtt_state("mic.released", "stop");
+    set_mic_button_state_requested(MicButtonState::Starting);
+    update_llm_status("送信中");
+    GetHAL().stopXiaozhiListening();
+    _xiaozhi_interaction_requested = false;
+}
+
+static void handle_mic_button_event(lv_event_t* event)
+{
+    const auto code = lv_event_get_code(event);
+    if (code == LV_EVENT_PRESSED) {
+        begin_xiaozhi_voice_input();
+        return;
+    }
+
+    if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        end_xiaozhi_voice_input();
+    }
 }
 
 static void publish_touch_point()
@@ -988,7 +1057,7 @@ static void handle_xiaozhi_status(std::string_view status)
         std::lock_guard<std::mutex> lock(_llm_mutex);
         _listen_indicator_requested = true;
         _mic_button_state_requested = MicButtonState::Listening;
-        _llm_status = "聞いています";
+        _llm_status = "聞いてるよ〜";
         _llm_status_changed = true;
         return;
     }
@@ -1013,7 +1082,7 @@ static void handle_xiaozhi_status(std::string_view status)
         std::lock_guard<std::mutex> lock(_llm_mutex);
         _listen_indicator_requested = false;
         _mic_button_state_requested = MicButtonState::Idle;
-        if (_llm_status == "マイク準備中" || _llm_status == "キャンセル中" || _llm_status == "聞いています") {
+        if (_llm_status == "マイク準備中" || _llm_status == "キャンセル中" || _llm_status == "聞いてるよ〜") {
             _caption_hide_requested = true;
         }
         _xiaozhi_interaction_requested = false;
@@ -1028,8 +1097,12 @@ static void handle_xiaozhi_text_message(const WsTextMessage_t& message)
         return;
     }
 
-    std::lock_guard<std::mutex> lock(_llm_mutex);
     publish_mqtt_state("xiaozhi.text", text, role.c_str());
+    if (role == "user") {
+        publish_mqtt_input(text, role.c_str());
+    }
+
+    std::lock_guard<std::mutex> lock(_llm_mutex);
     if (role == "assistant") {
         _llm_status = text;
         _llm_status_changed = true;
@@ -1665,6 +1738,7 @@ void AppNukoevi::onOpen()
     GetHAL().initExternalLedPwm();
     GetHAL().setExternalLedBrightness(_external_led_normal_brightness, _external_led_normal_brightness, false);
     start_network_once();
+    GetHAL().startXiaozhiBackground();
     _espnow_receives = _enable_espnow_remote;
     if (_enable_espnow_remote && !_espnow_started) {
         GetHAL().startEspNow(1);
@@ -1722,9 +1796,9 @@ void AppNukoevi::onOpen()
     _caption_visible = false;
 
     _listen_indicator = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(_listen_indicator, 24, 24);
-    lv_obj_align(_listen_indicator, LV_ALIGN_TOP_RIGHT, -92, 8);
-    lv_obj_set_style_radius(_listen_indicator, 12, LV_PART_MAIN);
+    lv_obj_set_size(_listen_indicator, 18, 18);
+    lv_obj_align(_listen_indicator, LV_ALIGN_TOP_LEFT, _top_mark_x_mic + 35, _top_mark_y + 35);
+    lv_obj_set_style_radius(_listen_indicator, 9, LV_PART_MAIN);
     lv_obj_set_style_border_width(_listen_indicator, 2, LV_PART_MAIN);
     lv_obj_set_style_border_color(_listen_indicator, lv_color_hex(0xFFF4E6), LV_PART_MAIN);
     lv_obj_set_style_bg_color(_listen_indicator, lv_color_hex(0x2B1710), LV_PART_MAIN);
@@ -1734,9 +1808,9 @@ void AppNukoevi::onOpen()
     lv_obj_clear_flag(_listen_indicator, LV_OBJ_FLAG_CLICKABLE);
 
     _listen_indicator_dot = lv_obj_create(_listen_indicator);
-    lv_obj_set_size(_listen_indicator_dot, 8, 8);
+    lv_obj_set_size(_listen_indicator_dot, 6, 6);
     lv_obj_align(_listen_indicator_dot, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(_listen_indicator_dot, 4, LV_PART_MAIN);
+    lv_obj_set_style_radius(_listen_indicator_dot, 3, LV_PART_MAIN);
     lv_obj_set_style_border_width(_listen_indicator_dot, 0, LV_PART_MAIN);
     lv_obj_set_style_bg_color(_listen_indicator_dot, lv_color_hex(0xF5B06F), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(_listen_indicator_dot, LV_OPA_COVER, LV_PART_MAIN);

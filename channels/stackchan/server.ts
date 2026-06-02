@@ -741,6 +741,13 @@ function localOtaResponse(upstream: Record<string, unknown>, version: number) {
   return response
 }
 
+function cachedLocalOtaResponse(req: Request) {
+  const key = deviceKey(req)
+  const config = upstreamConfigs.get(key) ?? upstreamConfigs.get('stackchan')
+  if (!config) return undefined
+  return localOtaResponse({}, config.version)
+}
+
 async function emitChannel(text: string, meta: Record<string, string>) {
   lastChannelEmit = { text, meta, ts: nowIso() }
   const requestId = meta.request_id ?? randomUUID()
@@ -991,6 +998,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     session_id: entry.sessionId,
     device_id: entry.deviceId,
   }))
+  void speakStackChanAssistant(text, false)
   entry.resolve(text)
   return { content: [{ type: 'text', text: 'sent' }] }
 })
@@ -1063,7 +1071,7 @@ Bun.serve<StackChanConnection>({
         const upstream = await fetchUpstreamOta(req)
         const config = parseUpstreamConfig(upstream)
         if (!config) {
-          return Response.json(upstream)
+          return Response.json(cachedLocalOtaResponse(req) ?? upstream)
         }
         const key = deviceKey(req)
         upstreamConfigs.set(key, config)
@@ -1073,6 +1081,10 @@ Bun.serve<StackChanConnection>({
         return Response.json(localOtaResponse(upstream, config.version))
       } catch (err) {
         log(`ota proxy failed: ${err}`)
+        const cached = cachedLocalOtaResponse(req)
+        if (cached) {
+          return Response.json(cached)
+        }
         return Response.json({ error: 'upstream OTA failed' }, { status: 502 })
       }
     }
