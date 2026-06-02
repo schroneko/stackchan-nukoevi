@@ -107,6 +107,7 @@ const upstreamConfigs = new Map<string, UpstreamConfig>()
 const stackChanSockets = new Set<ServerWebSocket<StackChanConnection>>()
 const pendingAssistantSpeech: PendingAssistantSpeech[] = []
 const pendingMqttAssistantAudio: PendingMqttAssistantAudio[] = []
+const localOutputKeys = new Set<string>()
 let mqttClient: ReturnType<typeof mqtt.connect> | undefined
 let mqttReady: Promise<void> | undefined
 let mqttInputCount = 0
@@ -234,6 +235,25 @@ async function publishMqttOutput(event: NukoeviMqttEvent) {
   await publishMqtt(mqttOutputTopic, event)
 }
 
+function rememberLocalOutput(event: NukoeviMqttEvent) {
+  if (event.id) localOutputKeys.add(event.id)
+  if (event.correlation_id) localOutputKeys.add(event.correlation_id)
+  while (localOutputKeys.size > 256) {
+    const first = localOutputKeys.values().next().value
+    if (!first) break
+    localOutputKeys.delete(first)
+  }
+}
+
+function consumeLocalOutput(event: NukoeviMqttEvent) {
+  const keys = [event.id, event.correlation_id].filter((value): value is string => Boolean(value))
+  const local = keys.some(key => localOutputKeys.has(key))
+  if (local) {
+    for (const key of keys) localOutputKeys.delete(key)
+  }
+  return local
+}
+
 async function publishMqttOutputAudio(event: NukoeviMqttEvent) {
   mqttOutputAudioCount += 1
   lastMqttOutputAudio = event
@@ -257,6 +277,7 @@ async function handleMqttOutput(raw: string) {
   if (!text) return
   mqttOutputCount += 1
   lastMqttOutput = event
+  if (consumeLocalOutput(event)) return
 
   const requestId = event.correlation_id ?? event.id ?? ''
   const entry = requestId ? pending.get(requestId) : undefined
@@ -650,6 +671,12 @@ async function speakStackChanAssistant(text: string, queueWhenDisconnected: bool
   if (!normalized) return
 
   trimPendingAssistantSpeech()
+  if (mqttEnabled && irodoriTtsEnabled) {
+    lastAssistantSpeech = { text: normalized, queued: false, ts: nowIso() }
+    queueMqttAssistantAudio(normalized)
+    return
+  }
+
   if (stackChanSockets.size === 0) {
     if (mqttEnabled) {
       lastAssistantSpeech = { text: normalized, queued: false, ts: nowIso() }
@@ -915,7 +942,7 @@ class UpstreamConnection {
         this.local.data.claudeAsked = true
         this.suppressResponse = true
         this.abortUpstream()
-        void this.replyWithClaude(transcript)
+        finishStackChanTurn(this.local)
       }
       return
     }
@@ -930,11 +957,6 @@ class UpstreamConnection {
     this.ws?.send(JSON.stringify({ session_id: sessionId, type: 'abort' }))
   }
 
-  private async replyWithClaude(transcript: string) {
-    const reply = await askClaude(transcript, this.local, this.local.data.sessionId, this.local.data.deviceId)
-    await sendStackChanAssistant(this.local, this.local.data.sessionId, reply)
-    finishStackChanTurn(this.local)
-  }
 }
 
 const mcp = new Server(
@@ -981,23 +1003,28 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const text = String(args.text ?? '').trim()
   const entry = pending.get(requestId)
   if (!entry) {
-    await publishMqttOutput(mqttEvent('output.text', text, {
+    const event = mqttEvent('output.text', text, {
       correlation_id: requestId || randomUUID(),
       source: 'claude',
       target: 'all',
       session_id: 'broadcast',
       device_id: 'stackchan',
-    }))
+    })
+    rememberLocalOutput(event)
+    await publishMqttOutput(event)
+    void speakStackChanAssistant(text, false)
     return { content: [{ type: 'text', text: 'sent' }] }
   }
 
-  await publishMqttOutput(mqttEvent('output.text', text, {
+  const event = mqttEvent('output.text', text, {
     correlation_id: requestId,
     source: 'claude',
     target: 'all',
     session_id: entry.sessionId,
     device_id: entry.deviceId,
-  }))
+  })
+  rememberLocalOutput(event)
+  await publishMqttOutput(event)
   void speakStackChanAssistant(text, false)
   entry.resolve(text)
   return { content: [{ type: 'text', text: 'sent' }] }
