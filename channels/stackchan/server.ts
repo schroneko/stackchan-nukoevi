@@ -97,10 +97,16 @@ type PendingAssistantSpeech = {
   createdAt: number
 }
 
+type PendingMqttAssistantAudio = {
+  text: string
+  createdAt: number
+}
+
 const pending = new Map<string, StackChanRequest>()
 const upstreamConfigs = new Map<string, UpstreamConfig>()
 const stackChanSockets = new Set<ServerWebSocket<StackChanConnection>>()
 const pendingAssistantSpeech: PendingAssistantSpeech[] = []
+const pendingMqttAssistantAudio: PendingMqttAssistantAudio[] = []
 let mqttClient: ReturnType<typeof mqtt.connect> | undefined
 let mqttReady: Promise<void> | undefined
 let mqttInputCount = 0
@@ -108,6 +114,7 @@ let mqttOutputCount = 0
 let mqttOutputAudioCount = 0
 let mqttStateCount = 0
 let assistantSpeechSending = false
+let mqttAssistantAudioSending = false
 let lastMqttInput: NukoeviMqttEvent | undefined
 let lastMqttOutput: NukoeviMqttEvent | undefined
 let lastMqttOutputAudio: NukoeviMqttEvent | undefined
@@ -259,7 +266,7 @@ async function handleMqttOutput(raw: string) {
   }
 
   if (event.target && event.target !== 'stackchan' && event.target !== 'all') return
-  await speakStackChanAssistant(text, true)
+  void speakStackChanAssistant(text, true)
 }
 
 async function handleMqttState(raw: string) {
@@ -574,6 +581,41 @@ async function publishMqttAssistantAudio(text: string) {
   }
 }
 
+function trimPendingMqttAssistantAudio() {
+  const expiresAt = Date.now() - assistantSpeechQueueMs
+  while (pendingMqttAssistantAudio.length > 0 && pendingMqttAssistantAudio[0].createdAt < expiresAt) {
+    pendingMqttAssistantAudio.shift()
+  }
+  while (pendingMqttAssistantAudio.length > 4) {
+    pendingMqttAssistantAudio.shift()
+  }
+}
+
+async function flushPendingMqttAssistantAudio() {
+  if (mqttAssistantAudioSending) return
+  trimPendingMqttAssistantAudio()
+  if (pendingMqttAssistantAudio.length === 0) return
+
+  mqttAssistantAudioSending = true
+  try {
+    while (pendingMqttAssistantAudio.length > 0) {
+      const item = pendingMqttAssistantAudio.shift()
+      if (!item) continue
+      await publishMqttAssistantAudio(item.text)
+    }
+  } finally {
+    mqttAssistantAudioSending = false
+  }
+}
+
+function queueMqttAssistantAudio(text: string) {
+  const normalized = normalizeText(text)
+  if (!normalized || !mqttEnabled || !irodoriTtsEnabled) return
+  pendingMqttAssistantAudio.push({ text: normalized, createdAt: Date.now() })
+  trimPendingMqttAssistantAudio()
+  void flushPendingMqttAssistantAudio()
+}
+
 function trimPendingAssistantSpeech() {
   const expiresAt = Date.now() - assistantSpeechQueueMs
   while (pendingAssistantSpeech.length > 0 && pendingAssistantSpeech[0].createdAt < expiresAt) {
@@ -611,7 +653,7 @@ async function speakStackChanAssistant(text: string, queueWhenDisconnected: bool
   if (stackChanSockets.size === 0) {
     if (mqttEnabled) {
       lastAssistantSpeech = { text: normalized, queued: false, ts: nowIso() }
-      await publishMqttAssistantAudio(normalized)
+      queueMqttAssistantAudio(normalized)
     } else if (queueWhenDisconnected) {
       pendingAssistantSpeech.push({ text: normalized, createdAt: Date.now() })
       lastAssistantSpeech = { text: normalized, queued: true, ts: nowIso() }
@@ -622,7 +664,7 @@ async function speakStackChanAssistant(text: string, queueWhenDisconnected: bool
 
   lastAssistantSpeech = { text: normalized, queued: false, ts: nowIso() }
   for (const ws of Array.from(stackChanSockets)) {
-    await sendStackChanAssistantSafe(ws, normalized)
+    void sendStackChanAssistantSafe(ws, normalized)
   }
 }
 
@@ -899,7 +941,7 @@ const mcp = new Server(
     },
     instructions: [
       'Messages from StackChan arrive as <channel source="stackchan" request_id="..." session_id="..." device_id="..." user="stackchan" ts="...">.',
-      'Anything that should appear on the StackChan display must be sent with the reply tool. Pass request_id back unchanged when replying to StackChan input. For output mirrored from another channel, omit request_id and keep text concise in Japanese unless the user asks otherwise.',
+      'Anything that should appear on the StackChan display must be sent with the reply tool. Pass request_id back unchanged when replying to StackChan input. For output mirrored from another channel, reuse the exact same response text already sent to that channel, omit request_id, and do not compose a second variant.',
       'Do not use Telegram tools for StackChan replies.',
     ].join('\n'),
   },
@@ -1001,6 +1043,8 @@ Bun.serve<StackChanConnection>({
         stackChanClients: stackChanSockets.size,
         pendingRequests: pending.size,
         pendingAssistantSpeech: pendingAssistantSpeech.length,
+        pendingMqttAssistantAudio: pendingMqttAssistantAudio.length,
+        mqttAssistantAudioSending,
         mqttInputCount,
         mqttOutputCount,
         mqttOutputAudioCount,
