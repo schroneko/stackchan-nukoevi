@@ -66,6 +66,27 @@ index d69d43d..3b6f07e 100644
  }
  
  void Application::Alert(const char* status, const char* message, const char* emotion, const std::string_view& sound) {
+diff --git a/main/boards/common/wifi_board.cc b/main/boards/common/wifi_board.cc
+index 377685b..f675ddd 100644
+--- a/main/boards/common/wifi_board.cc
++++ b/main/boards/common/wifi_board.cc
+@@ -150,8 +150,15 @@ void WifiBoard::SetNetworkEventCallback(NetworkEventCallback callback) {
+ 
+ void WifiBoard::OnWifiConnectTimeout(void* arg) {
+     auto* board = static_cast<WifiBoard*>(arg);
+-    ESP_LOGW(TAG, "WiFi connection timeout, entering config mode");
++    auto& ssid_manager = SsidManager::GetInstance();
++    if (!ssid_manager.GetSsidList().empty()) {
++        ESP_LOGW(TAG, "WiFi connection timeout, retrying saved credentials");
++        WifiManager::GetInstance().StopStation();
++        board->TryWifiConnect();
++        return;
++    }
+ 
++    ESP_LOGW(TAG, "WiFi connection timeout, entering config mode");
+     WifiManager::GetInstance().StopStation();
+     board->StartWifiConfigMode();
+ }
 diff --git a/main/assets.cc b/main/assets.cc
 index ad61944..6b84daf 100644
 --- a/main/assets.cc
