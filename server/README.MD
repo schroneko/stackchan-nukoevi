@@ -1,5 +1,9 @@
 # StackChan Server
 
+Repository note: this directory is inherited from the StackChan open-source
+workspace and is kept for reference and compatibility in the unofficial Nukoevi
+StackChan repository. It is not required for the main Nukoevi firmware flow.
+
 **StackChan Server** is the backend server for the open-source StackChan project. It provides RESTful APIs for device management, user authentication, post management, comment systems, and dance control functionalities.
 
 ---
@@ -267,7 +271,9 @@ For major changes, please open an issue first to discuss what you would like to 
 
 ## Support
 
-For questions and support, please open an issue in the GitHub repository or contact the M5Stack team.
+For questions about this unofficial repository, please open an issue in this
+GitHub repository. Do not use M5Stack support channels for Nukoevi-specific
+custom firmware issues.
 
 ---
 
