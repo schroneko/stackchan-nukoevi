@@ -93,6 +93,8 @@ static bool _llm_running        = false;
 static bool _llm_requested      = false;
 static bool _llm_status_changed = false;
 static bool _caption_hide_requested = false;
+static std::mutex _audio_playback_mutex;
+static uint32_t _audio_playback_until = 0;
 static bool _listen_indicator_requested = false;
 static std::string _llm_status;
 static uint32_t _chat_request_id = 0;
@@ -232,6 +234,25 @@ static void enqueue_mqtt_output_payload(const std::string& payload)
     GetHAL().startXiaozhiBackground();
 }
 
+static void mark_audio_playback_active(int sequence, int total, int frame_duration)
+{
+    const uint32_t now = GetHAL().millis();
+    uint32_t active_ms = 2500;
+    if (sequence >= 0 && total > 0 && sequence < total && frame_duration > 0) {
+        const uint32_t remaining = static_cast<uint32_t>(total - sequence);
+        active_ms = std::min<uint32_t>(remaining * static_cast<uint32_t>(frame_duration) + 1500, 120000);
+    }
+
+    std::lock_guard<std::mutex> lock(_audio_playback_mutex);
+    _audio_playback_until = now + active_ms;
+}
+
+static bool is_audio_playback_active(uint32_t now)
+{
+    std::lock_guard<std::mutex> lock(_audio_playback_mutex);
+    return _audio_playback_until != 0 && static_cast<int32_t>(_audio_playback_until - now) > 0;
+}
+
 static void handle_mqtt_audio_payload(const std::string& payload)
 {
     ArduinoJson::JsonDocument doc;
@@ -270,6 +291,8 @@ static void handle_mqtt_audio_payload(const std::string& payload)
 
     const int sequence = doc["sequence"] | -1;
     const int total = doc["total"] | 0;
+    const int frame_duration = doc["frame_duration"] | 60;
+    mark_audio_playback_active(sequence, total, frame_duration);
     if (sequence == 0 || (total > 0 && sequence == total - 1)) {
         char status[64];
         std::snprintf(status, sizeof(status), "seq=%d total=%d bytes=%u", sequence, total,
@@ -279,7 +302,7 @@ static void handle_mqtt_audio_payload(const std::string& payload)
 
     auto packet = std::make_unique<AudioStreamPacket>();
     packet->sample_rate = doc["sample_rate"] | 16000;
-    packet->frame_duration = doc["frame_duration"] | 60;
+    packet->frame_duration = frame_duration;
     packet->timestamp = doc["timestamp"] | 0;
     packet->payload = std::move(decoded);
     Application::GetInstance().GetAudioService().PushPacketToDecodeQueue(std::move(packet), true);
@@ -1533,7 +1556,8 @@ static void update_listen_indicator(bool visible)
 
 static void handle_caption_auto_hide(uint32_t now)
 {
-    if (!_caption_panel || !_caption_visible || _llm_running || now - _caption_updated_at < _caption_auto_hide_ms) {
+    if (!_caption_panel || !_caption_visible || _llm_running || is_audio_playback_active(now) ||
+        now - _caption_updated_at < _caption_auto_hide_ms) {
         return;
     }
 
@@ -1918,7 +1942,7 @@ void AppNukoevi::onRunning()
 
     update_mic_button(mic_button_state);
     update_listen_indicator(listen_indicator_visible);
-    if (should_hide_caption) {
+    if (should_hide_caption && !is_audio_playback_active(now)) {
         hide_caption_panel();
     }
 
