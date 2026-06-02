@@ -44,7 +44,6 @@ LV_FONT_DECLARE(font_awesome_20_4);
 static std::unique_ptr<Container> _panel;
 static std::unique_ptr<Image> _avatar;
 static lv_obj_t* _mic_button = nullptr;
-static lv_obj_t* _mic_hit_area = nullptr;
 static lv_obj_t* _camera_button = nullptr;
 static lv_obj_t* _camera_label = nullptr;
 static lv_obj_t* _wifi_button = nullptr;
@@ -107,15 +106,10 @@ static bool _listen_indicator_visible = false;
 static MicButtonState _mic_button_state_requested = MicButtonState::Idle;
 static MicButtonState _mic_button_state_visible = MicButtonState::Idle;
 static uint32_t _mic_button_event_at = 0;
-static bool _mic_touch_area_active = false;
 static bool _touch_point_active = false;
 static uint32_t _touch_point_published_at = 0;
 static int _last_touch_point_x = -1;
 static int _last_touch_point_y = -1;
-static constexpr int _mic_touch_min_x = 272;
-static constexpr int _mic_touch_max_x = 318;
-static constexpr int _mic_touch_min_y = 12;
-static constexpr int _mic_touch_max_y = 56;
 static bool _talk_requested = false;
 static size_t _talk_request_text_size = 0;
 static bool _talk_active = false;
@@ -643,24 +637,10 @@ static void create_mic_icon(lv_obj_t* parent)
 
 static void create_top_controls()
 {
-    _mic_hit_area = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(_mic_hit_area, 40, 40);
-    lv_obj_align(_mic_hit_area, LV_ALIGN_TOP_RIGHT, -6, 12);
-    lv_obj_set_style_bg_opa(_mic_hit_area, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_border_width(_mic_hit_area, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(_mic_hit_area, 0, LV_PART_MAIN);
-    lv_obj_clear_flag(_mic_hit_area, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(_mic_hit_area, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(_mic_hit_area, [](lv_event_t*) { start_xiaozhi_request(); }, LV_EVENT_CLICKED, nullptr);
-    lv_obj_add_event_cb(_mic_hit_area, [](lv_event_t*) { start_xiaozhi_request(); }, LV_EVENT_PRESSED, nullptr);
-
-    _mic_button = lv_obj_create(lv_screen_active());
-    set_button_style(_mic_button, 0x2B1710, 0xFFF4E6);
-    lv_obj_align(_mic_button, LV_ALIGN_TOP_RIGHT, -8, 16);
-    lv_obj_add_event_cb(_mic_button, [](lv_event_t*) { start_xiaozhi_request(); }, LV_EVENT_CLICKED, nullptr);
-    lv_obj_add_event_cb(_mic_button, [](lv_event_t*) { start_xiaozhi_request(); }, LV_EVENT_PRESSED, nullptr);
+    lv_obj_t* mic_label = nullptr;
+    create_control_button(&_mic_button, &mic_label, LV_ALIGN_TOP_RIGHT, -8, 8, "",
+                          [](lv_event_t*) { start_xiaozhi_request(); });
     create_mic_icon(_mic_button);
-    lv_obj_move_foreground(_mic_button);
 
     create_control_button(&_camera_button, &_camera_label, LV_ALIGN_TOP_RIGHT, -50, 8, FONT_AWESOME_CAMERA,
                           [](lv_event_t*) { begin_evictl_camera_task(); });
@@ -956,7 +936,7 @@ static void start_xiaozhi_request()
     GetHAL().requestXiaozhiListening();
 }
 
-static void handle_mic_touch_area()
+static void publish_touch_point()
 {
     const auto touch = hal_bridge::get_touch_point();
     const auto now = GetHAL().millis();
@@ -976,22 +956,6 @@ static void handle_mic_touch_area()
         _last_touch_point_x = -1;
         _last_touch_point_y = -1;
     }
-
-    const bool active = touch.num > 0 && touch.x >= _mic_touch_min_x && touch.x <= _mic_touch_max_x &&
-                        touch.y >= _mic_touch_min_y && touch.y <= _mic_touch_max_y;
-    if (!active) {
-        _mic_touch_area_active = false;
-        return;
-    }
-    if (_mic_touch_area_active) {
-        return;
-    }
-
-    _mic_touch_area_active = true;
-    char text[40];
-    std::snprintf(text, sizeof(text), "x=%d y=%d", touch.x, touch.y);
-    publish_mqtt_state("mic.touch_area", text);
-    start_xiaozhi_request();
 }
 
 static void handle_xiaozhi_status(std::string_view status)
@@ -1907,7 +1871,7 @@ void AppNukoevi::onRunning()
     update_battery_indicator();
     ensure_mqtt_output_receiver();
     process_mqtt_output_messages();
-    handle_mic_touch_area();
+    publish_touch_point();
 
     constexpr uint32_t blink_interval_ms = 3200;
     constexpr uint32_t blink_frame_ms    = 85;
@@ -1952,12 +1916,6 @@ void AppNukoevi::onRunning()
     }
 
     update_mic_button(mic_button_state);
-    if (_mic_hit_area) {
-        lv_obj_move_foreground(_mic_hit_area);
-    }
-    if (_mic_button) {
-        lv_obj_move_foreground(_mic_button);
-    }
     update_listen_indicator(listen_indicator_visible);
     if (should_hide_caption) {
         hide_caption_panel();
@@ -2027,9 +1985,6 @@ void AppNukoevi::onClose()
     if (_mic_button && lv_obj_is_valid(_mic_button)) {
         lv_obj_delete(_mic_button);
     }
-    if (_mic_hit_area && lv_obj_is_valid(_mic_hit_area)) {
-        lv_obj_delete(_mic_hit_area);
-    }
     if (_camera_button && lv_obj_is_valid(_camera_button)) {
         lv_obj_delete(_camera_button);
     }
@@ -2049,7 +2004,6 @@ void AppNukoevi::onClose()
         lv_obj_delete(_listen_indicator);
     }
     _mic_button = nullptr;
-    _mic_hit_area = nullptr;
     _camera_button = nullptr;
     _camera_label = nullptr;
     _wifi_button = nullptr;
