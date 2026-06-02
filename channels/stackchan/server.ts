@@ -39,6 +39,9 @@ const irodoriTtsSteps = process.env.STACKCHAN_IRODORI_TTS_STEPS ?? '24'
 const irodoriTtsSeconds = process.env.STACKCHAN_IRODORI_TTS_SECONDS ?? ''
 const irodoriTtsEnabled = process.env.STACKCHAN_IRODORI_TTS_ENABLED !== '0'
 const irodoriTtsFrameDelayMs = Number(process.env.STACKCHAN_IRODORI_TTS_FRAME_DELAY_MS ?? '55')
+const irodoriTtsWarmupText = process.env.STACKCHAN_IRODORI_TTS_WARMUP_TEXT ?? 'あ'
+const irodoriTtsWarmupSteps = process.env.STACKCHAN_IRODORI_TTS_WARMUP_STEPS ?? '4'
+const irodoriTtsWarmupCooldownMs = Number(process.env.STACKCHAN_IRODORI_TTS_WARMUP_COOLDOWN_MS ?? '60000')
 const assistantSpeechQueueMs = Number(process.env.STACKCHAN_ASSISTANT_SPEECH_QUEUE_MS ?? '30000')
 const evictlBin = process.env.STACKCHAN_EVICTL_BIN ?? `${homedir()}/ghq/github.com/schroneko/evictl/bin/evictl`
 const evictlIdentity = process.env.STACKCHAN_EVICTL_IDENTITY ?? 'nukoevi'
@@ -102,6 +105,13 @@ type PendingMqttAssistantAudio = {
   createdAt: number
 }
 
+type IrodoriSynthesisResponse = {
+  success?: boolean
+  mp3StreamingUrl?: string
+  mp3DownloadUrl?: string
+  error?: string
+}
+
 const pending = new Map<string, StackChanRequest>()
 const upstreamConfigs = new Map<string, UpstreamConfig>()
 const stackChanSockets = new Set<ServerWebSocket<StackChanConnection>>()
@@ -116,11 +126,14 @@ let mqttOutputAudioCount = 0
 let mqttStateCount = 0
 let assistantSpeechSending = false
 let mqttAssistantAudioSending = false
+let irodoriWarmupInFlight: Promise<void> | undefined
+let lastIrodoriWarmupAt = 0
 let lastMqttInput: NukoeviMqttEvent | undefined
 let lastMqttOutput: NukoeviMqttEvent | undefined
 let lastMqttOutputAudio: NukoeviMqttEvent | undefined
 let lastMqttState: NukoeviMqttEvent | undefined
 let lastAssistantSpeech: { text: string; queued: boolean; ts: string } | undefined
+let lastIrodoriWarmup: { state: string; reason?: string; durationMs?: number; ts: string } | undefined
 const recentMqttStates: NukoeviMqttEvent[] = []
 let lastChannelEmit: { text: string; meta: Record<string, string>; ts: string } | undefined
 
@@ -508,28 +521,77 @@ function encodeMp3ToOpusPackets(mp3: Uint8Array) {
   return oggOpusPackets(new Uint8Array(result.stdout))
 }
 
-async function synthesizeIrodoriMp3(text: string) {
+function buildIrodoriSynthesisUrl(text: string, steps: string, seconds?: string) {
   const url = new URL(irodoriTtsUrl)
   url.searchParams.set('text', text)
   url.searchParams.set('speaker', irodoriTtsSpeaker)
-  url.searchParams.set('steps', irodoriTtsSteps)
-  if (irodoriTtsSeconds) url.searchParams.set('seconds', irodoriTtsSeconds)
+  url.searchParams.set('steps', steps)
+  if (seconds !== undefined) url.searchParams.set('seconds', seconds)
   if (irodoriTtsKey) url.searchParams.set('key', irodoriTtsKey)
+  return url
+}
 
+async function requestIrodoriSynthesis(url: URL, label: string) {
   const response = await fetch(url)
   const body = await response.text()
   if (!response.ok) {
-    throw new Error(`Irodori synthesis failed: ${response.status} ${body}`)
+    throw new Error(`Irodori ${label} failed: ${response.status} ${body}`)
   }
 
-  const json = JSON.parse(body) as { success?: boolean; mp3StreamingUrl?: string; mp3DownloadUrl?: string; error?: string }
+  const json = JSON.parse(body) as IrodoriSynthesisResponse
   if (json.success === false) {
-    throw new Error(`Irodori synthesis failed: ${json.error ?? body}`)
+    throw new Error(`Irodori ${label} failed: ${json.error ?? body}`)
   }
+  return json
+}
+
+async function warmIrodoriTts() {
+  if (!irodoriTtsEnabled) return
+  if (irodoriWarmupInFlight) return await irodoriWarmupInFlight
+
+  const now = Date.now()
+  const elapsed = now - lastIrodoriWarmupAt
+  if (elapsed < irodoriTtsWarmupCooldownMs) {
+    lastIrodoriWarmup = {
+      state: 'skipped',
+      reason: `cooldown ${irodoriTtsWarmupCooldownMs - elapsed}ms`,
+      ts: nowIso(),
+    }
+    return
+  }
+
+  irodoriWarmupInFlight = (async () => {
+    const started = Date.now()
+    lastIrodoriWarmupAt = started
+    lastIrodoriWarmup = { state: 'started', ts: nowIso() }
+    const url = buildIrodoriSynthesisUrl(irodoriTtsWarmupText, irodoriTtsWarmupSteps, '')
+    await requestIrodoriSynthesis(url, 'warmup')
+    lastIrodoriWarmup = {
+      state: 'ok',
+      durationMs: Date.now() - started,
+      ts: nowIso(),
+    }
+  })().catch(err => {
+    lastIrodoriWarmup = {
+      state: 'failed',
+      reason: String(err),
+      ts: nowIso(),
+    }
+    throw err
+  }).finally(() => {
+    irodoriWarmupInFlight = undefined
+  })
+
+  await irodoriWarmupInFlight
+}
+
+async function synthesizeIrodoriMp3(text: string) {
+  const url = buildIrodoriSynthesisUrl(text, irodoriTtsSteps, irodoriTtsSeconds || undefined)
+  const json = await requestIrodoriSynthesis(url, 'synthesis')
 
   const audioUrl = json.mp3StreamingUrl ?? json.mp3DownloadUrl
   if (!audioUrl) {
-    throw new Error(`Irodori response has no mp3 URL: ${body}`)
+    throw new Error('Irodori response has no mp3 URL')
   }
 
   const audioResponse = await fetch(audioUrl)
@@ -1080,6 +1142,11 @@ Bun.serve<StackChanConnection>({
         pendingAssistantSpeech: pendingAssistantSpeech.length,
         pendingMqttAssistantAudio: pendingMqttAssistantAudio.length,
         mqttAssistantAudioSending,
+        irodoriWarmup: {
+          inFlight: Boolean(irodoriWarmupInFlight),
+          cooldownMs: irodoriTtsWarmupCooldownMs,
+          last: lastIrodoriWarmup,
+        },
         mqttInputCount,
         mqttOutputCount,
         mqttOutputAudioCount,
@@ -1163,6 +1230,9 @@ Bun.serve<StackChanConnection>({
           if (parsed.type === 'listen' && parsed.state === 'start') {
             ws.data.transcript = undefined
             ws.data.claudeAsked = false
+            void warmIrodoriTts().catch(err => {
+              log(`Irodori warmup skipped: ${err}`)
+            })
             void publishStackChanState('listening', {
               source: 'stackchan',
               session_id: ws.data.sessionId,
