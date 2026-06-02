@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-plugins-official",
+  "description": "Local Nukoevi channel plugins.",
+  "owner": {
+    "name": "schroneko"
+  },
+  "plugins": [
+    {
+      "name": "stackchan",
+      "description": "StackChan and Nukoevi MQTT channel for Claude Code Channels.",
+      "author": {
+        "name": "schroneko"
+      },
+      "category": "productivity",
+      "source": "./",
+      "homepage": "https://huggingface.co/schroneko"
+    }
+  ]
+}

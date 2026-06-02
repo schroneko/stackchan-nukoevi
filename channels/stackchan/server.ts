@@ -9,16 +9,29 @@ import {
 import { spawnSync } from 'child_process'
 import { randomUUID } from 'crypto'
 import { mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { createServer } from 'net'
 import { homedir } from 'os'
+import { Aedes } from 'aedes'
+import mqtt from 'mqtt'
 
 const host = process.env.STACKCHAN_CHANNEL_HOST ?? '0.0.0.0'
 const publicHost = process.env.STACKCHAN_PUBLIC_HOST ?? '192.168.1.10'
 const port = Number(process.env.STACKCHAN_CHANNEL_PORT ?? '18080')
 const assistantTimeoutMs = Number(process.env.STACKCHAN_REPLY_TIMEOUT_MS ?? '120000')
-const fakeChatWsUrl = process.env.STACKCHAN_FAKECHAT_WS ?? 'ws://127.0.0.1:8787/ws'
 const upstreamOtaUrl = process.env.STACKCHAN_UPSTREAM_OTA_URL ?? 'https://api.tenclass.net/xiaozhi/ota/'
 const directMcpChannel = process.env.STACKCHAN_DIRECT_MCP_CHANNEL === '1'
 const statePath = process.env.STACKCHAN_RELAY_STATE_PATH ?? `${homedir()}/.local/state/stackchan-xiaozhi-relay/upstream.json`
+const mqttEnabled = process.env.NUKOEVI_MQTT_ENABLED !== '0'
+const mqttEmbedded = process.env.NUKOEVI_MQTT_EMBEDDED !== '0'
+const mqttBrokerHost = process.env.NUKOEVI_MQTT_BROKER_HOST ?? '0.0.0.0'
+const mqttHost = process.env.NUKOEVI_MQTT_HOST ?? '127.0.0.1'
+const mqttPort = Number(process.env.NUKOEVI_MQTT_PORT ?? '18883')
+const mqttUrl = process.env.NUKOEVI_MQTT_URL ?? `mqtt://${mqttHost}:${mqttPort}`
+const mqttTopicPrefix = process.env.NUKOEVI_MQTT_TOPIC_PREFIX ?? 'nukoevi'
+const mqttInputTopic = `${mqttTopicPrefix}/input/text`
+const mqttOutputTopic = `${mqttTopicPrefix}/output/text`
+const mqttOutputAudioTopic = `${mqttTopicPrefix}/output/audio/opus`
+const mqttStateTopic = `${mqttTopicPrefix}/device/stackchan/state`
 const irodoriTtsUrl = process.env.STACKCHAN_IRODORI_TTS_URL ?? 'https://schroneko-irodori-tts-stackchan-api.hf.space/synthesis'
 const irodoriTtsKey = process.env.STACKCHAN_IRODORI_TTS_KEY ?? ''
 const irodoriTtsSpeaker = process.env.STACKCHAN_IRODORI_TTS_SPEAKER ?? '3'
@@ -26,6 +39,9 @@ const irodoriTtsSteps = process.env.STACKCHAN_IRODORI_TTS_STEPS ?? '24'
 const irodoriTtsSeconds = process.env.STACKCHAN_IRODORI_TTS_SECONDS ?? ''
 const irodoriTtsEnabled = process.env.STACKCHAN_IRODORI_TTS_ENABLED !== '0'
 const irodoriTtsFrameDelayMs = Number(process.env.STACKCHAN_IRODORI_TTS_FRAME_DELAY_MS ?? '55')
+const assistantSpeechQueueMs = Number(process.env.STACKCHAN_ASSISTANT_SPEECH_QUEUE_MS ?? '30000')
+const evictlBin = process.env.STACKCHAN_EVICTL_BIN ?? `${homedir()}/ghq/github.com/schroneko/evictl/bin/evictl`
+const evictlIdentity = process.env.STACKCHAN_EVICTL_IDENTITY ?? 'nukoevi'
 
 type StackChanRequest = {
   id: string
@@ -58,14 +74,47 @@ type OpenAIMessage = {
   content?: unknown
 }
 
-type FakeChatPending = {
-  resolve: (text: string) => void
-  reject: (err: Error) => void
-  timer: ReturnType<typeof setTimeout>
+type NukoeviMqttEvent = {
+  id?: string
+  correlation_id?: string
+  type?: string
+  source?: string
+  target?: string
+  channel?: string
+  text?: string
+  session_id?: string
+  device_id?: string
+  sample_rate?: number
+  frame_duration?: number
+  sequence?: number
+  total?: number
+  payload?: string
+  ts?: string
+}
+
+type PendingAssistantSpeech = {
+  text: string
+  createdAt: number
 }
 
 const pending = new Map<string, StackChanRequest>()
 const upstreamConfigs = new Map<string, UpstreamConfig>()
+const stackChanSockets = new Set<ServerWebSocket<StackChanConnection>>()
+const pendingAssistantSpeech: PendingAssistantSpeech[] = []
+let mqttClient: ReturnType<typeof mqtt.connect> | undefined
+let mqttReady: Promise<void> | undefined
+let mqttInputCount = 0
+let mqttOutputCount = 0
+let mqttOutputAudioCount = 0
+let mqttStateCount = 0
+let assistantSpeechSending = false
+let lastMqttInput: NukoeviMqttEvent | undefined
+let lastMqttOutput: NukoeviMqttEvent | undefined
+let lastMqttOutputAudio: NukoeviMqttEvent | undefined
+let lastMqttState: NukoeviMqttEvent | undefined
+let lastAssistantSpeech: { text: string; queued: boolean; ts: string } | undefined
+const recentMqttStates: NukoeviMqttEvent[] = []
+let lastChannelEmit: { text: string; meta: Record<string, string>; ts: string } | undefined
 
 function loadUpstreamConfigs() {
   try {
@@ -93,6 +142,193 @@ function nowIso() {
 
 function log(message: string) {
   process.stderr.write(`stackchan channel: ${message}\n`)
+}
+
+function startEmbeddedMqttBroker() {
+  if (!mqttEnabled || !mqttEmbedded) return
+  void Aedes.createBroker().then(broker => {
+    const server = createServer(broker.handle)
+    server.listen(mqttPort, mqttBrokerHost, () => {
+      log(`MQTT broker listening: mqtt://${mqttBrokerHost}:${mqttPort}`)
+    })
+    server.on('error', err => {
+      log(`MQTT broker skipped: ${err}`)
+    })
+  }).catch(err => {
+    log(`MQTT broker skipped: ${err}`)
+  })
+}
+
+async function ensureMqtt() {
+  if (!mqttEnabled) return undefined
+  if (mqttClient) return mqttClient
+  if (mqttReady) {
+    await mqttReady
+    return mqttClient
+  }
+
+  mqttClient = mqtt.connect(mqttUrl, {
+    clientId: `stackchan-relay-${randomUUID()}`,
+    reconnectPeriod: 1000,
+  })
+
+  mqttClient.on('message', (topic, payload) => {
+    if (topic === mqttOutputTopic) void handleMqttOutput(payload.toString())
+    if (topic === mqttInputTopic) void handleMqttInput(payload.toString())
+    if (topic === mqttStateTopic) void handleMqttState(payload.toString())
+  })
+  mqttClient.on('error', err => {
+    log(`MQTT error: ${err}`)
+  })
+  mqttClient.on('reconnect', () => {
+    log('MQTT reconnecting')
+  })
+
+  mqttReady = new Promise(resolve => {
+    mqttClient?.once('connect', () => {
+      log(`MQTT connected: ${mqttUrl}`)
+      const topics = directMcpChannel ? [mqttOutputTopic, mqttInputTopic, mqttStateTopic] : [mqttOutputTopic, mqttStateTopic]
+      mqttClient?.subscribe(topics, err => {
+        if (err) log(`MQTT subscribe failed: ${err}`)
+        else log(`MQTT subscribed: ${topics.join(', ')}`)
+        resolve()
+      })
+    })
+  })
+
+  await mqttReady
+  return mqttClient
+}
+
+function mqttEvent(type: string, text: string, values: Partial<NukoeviMqttEvent> = {}): NukoeviMqttEvent {
+  return {
+    id: values.id ?? randomUUID(),
+    type,
+    source: values.source ?? 'stackchan',
+    text,
+    ts: nowIso(),
+    ...values,
+  }
+}
+
+async function publishMqtt(topic: string, event: NukoeviMqttEvent) {
+  const client = await ensureMqtt()
+  if (!client) return
+  client.publish(topic, JSON.stringify(event), { qos: 0 }, err => {
+    if (err) log(`MQTT publish failed: ${topic} ${err}`)
+  })
+}
+
+async function publishMqttInput(event: NukoeviMqttEvent) {
+  await publishMqtt(mqttInputTopic, event)
+}
+
+async function publishMqttOutput(event: NukoeviMqttEvent) {
+  await publishMqtt(mqttOutputTopic, event)
+}
+
+async function publishMqttOutputAudio(event: NukoeviMqttEvent) {
+  mqttOutputAudioCount += 1
+  lastMqttOutputAudio = event
+  await publishMqtt(mqttOutputAudioTopic, event)
+}
+
+async function publishStackChanState(state: string, values: Partial<NukoeviMqttEvent> = {}) {
+  await publishMqtt(mqttStateTopic, mqttEvent('device.state', state, values))
+}
+
+async function handleMqttOutput(raw: string) {
+  let event: NukoeviMqttEvent
+  try {
+    event = JSON.parse(raw) as NukoeviMqttEvent
+  } catch {
+    log(`MQTT output ignored: ${raw}`)
+    return
+  }
+
+  const text = normalizeText(String(event.text ?? ''))
+  if (!text) return
+  mqttOutputCount += 1
+  lastMqttOutput = event
+
+  const requestId = event.correlation_id ?? event.id ?? ''
+  const entry = requestId ? pending.get(requestId) : undefined
+  if (entry) {
+    entry.resolve(text)
+    return
+  }
+
+  if (event.target && event.target !== 'stackchan' && event.target !== 'all') return
+  await speakStackChanAssistant(text, true)
+}
+
+async function handleMqttState(raw: string) {
+  let event: NukoeviMqttEvent
+  try {
+    event = JSON.parse(raw) as NukoeviMqttEvent
+  } catch {
+    log(`MQTT state ignored: ${raw}`)
+    return
+  }
+
+  mqttStateCount += 1
+  lastMqttState = event
+  recentMqttStates.push(event)
+  while (recentMqttStates.length > 20) {
+    recentMqttStates.shift()
+  }
+}
+
+async function handleMqttInput(raw: string) {
+  if (!directMcpChannel) return
+
+  let event: NukoeviMqttEvent
+  try {
+    event = JSON.parse(raw) as NukoeviMqttEvent
+  } catch {
+    log(`MQTT input ignored: ${raw}`)
+    return
+  }
+
+  const text = normalizeText(String(event.text ?? ''))
+  if (!text) return
+  mqttInputCount += 1
+  lastMqttInput = event
+
+  const requestId = event.id ?? randomUUID()
+  if (pending.has(requestId)) return
+
+  const sessionId = event.session_id ?? 'mqtt'
+  const deviceId = event.device_id ?? event.source ?? 'mqtt'
+  const started = Date.now()
+  const timer = setTimeout(() => {
+    pending.delete(requestId)
+    log(`MQTT input timed out: ${requestId}`)
+  }, assistantTimeoutMs)
+
+  pending.set(requestId, {
+    id: requestId,
+    sessionId,
+    deviceId,
+    createdAt: started,
+    resolve: value => {
+      clearTimeout(timer)
+      pending.delete(requestId)
+      log(`MQTT input resolved: ${requestId} ${value}`)
+    },
+  })
+
+  await emitChannel(text, {
+    source: event.source ?? 'mqtt',
+    request_id: requestId,
+    session_id: sessionId,
+    device_id: deviceId,
+    user: event.source ?? 'mqtt',
+  }).catch(err => {
+    clearTimeout(timer)
+    pending.delete(requestId)
+    log(`failed to deliver MQTT inbound to Claude: ${err}`)
+  })
 }
 
 function textFromContent(content: unknown): string {
@@ -303,6 +539,93 @@ async function sendStackChanAssistant(ws: ServerWebSocket<StackChanConnection>, 
   sendJson(ws, { session_id: sessionId, type: 'tts', state: 'stop' })
 }
 
+async function sendStackChanAssistantSafe(ws: ServerWebSocket<StackChanConnection>, text: string) {
+  try {
+    await sendStackChanAssistant(ws, ws.data.sessionId, text)
+  } catch (err) {
+    log(`StackChan assistant speech failed: ${err}`)
+  }
+}
+
+async function publishMqttAssistantAudio(text: string) {
+  if (!mqttEnabled || !irodoriTtsEnabled) return
+
+  try {
+    log(`Irodori MQTT TTS request: ${text}`)
+    const mp3 = await synthesizeIrodoriMp3(text)
+    const packets = encodeMp3ToOpusPackets(mp3)
+    log(`Irodori MQTT TTS packets: ${packets.length}`)
+    for (let i = 0; i < packets.length; i++) {
+      await publishMqttOutputAudio(mqttEvent('output.audio.opus', text, {
+        source: 'stackchan-relay',
+        target: 'stackchan',
+        sample_rate: 16000,
+        frame_duration: 60,
+        sequence: i,
+        total: packets.length,
+        payload: Buffer.from(packets[i]).toString('base64'),
+      }))
+      if (irodoriTtsFrameDelayMs > 0) {
+        await sleep(irodoriTtsFrameDelayMs)
+      }
+    }
+  } catch (err) {
+    log(`Irodori MQTT TTS skipped: ${err}`)
+  }
+}
+
+function trimPendingAssistantSpeech() {
+  const expiresAt = Date.now() - assistantSpeechQueueMs
+  while (pendingAssistantSpeech.length > 0 && pendingAssistantSpeech[0].createdAt < expiresAt) {
+    pendingAssistantSpeech.shift()
+  }
+  while (pendingAssistantSpeech.length > 4) {
+    pendingAssistantSpeech.shift()
+  }
+}
+
+async function flushPendingAssistantSpeech() {
+  if (assistantSpeechSending) return
+  trimPendingAssistantSpeech()
+  if (pendingAssistantSpeech.length === 0 || stackChanSockets.size === 0) return
+
+  assistantSpeechSending = true
+  try {
+    while (pendingAssistantSpeech.length > 0 && stackChanSockets.size > 0) {
+      const item = pendingAssistantSpeech.shift()
+      if (!item) continue
+      for (const ws of Array.from(stackChanSockets)) {
+        await sendStackChanAssistantSafe(ws, item.text)
+      }
+    }
+  } finally {
+    assistantSpeechSending = false
+  }
+}
+
+async function speakStackChanAssistant(text: string, queueWhenDisconnected: boolean) {
+  const normalized = normalizeText(text)
+  if (!normalized) return
+
+  trimPendingAssistantSpeech()
+  if (stackChanSockets.size === 0) {
+    if (mqttEnabled) {
+      lastAssistantSpeech = { text: normalized, queued: false, ts: nowIso() }
+      await publishMqttAssistantAudio(normalized)
+    } else if (queueWhenDisconnected) {
+      pendingAssistantSpeech.push({ text: normalized, createdAt: Date.now() })
+      lastAssistantSpeech = { text: normalized, queued: true, ts: nowIso() }
+      log(`StackChan assistant speech queued: ${normalized}`)
+    }
+    return
+  }
+
+  lastAssistantSpeech = { text: normalized, queued: false, ts: nowIso() }
+  for (const ws of Array.from(stackChanSockets)) {
+    await sendStackChanAssistantSafe(ws, normalized)
+  }
+}
+
 function finishStackChanTurn(ws: ServerWebSocket<StackChanConnection>) {
   if (ws.data.turnClosing) return
   ws.data.turnClosing = true
@@ -377,29 +700,30 @@ function localOtaResponse(upstream: Record<string, unknown>, version: number) {
 }
 
 async function emitChannel(text: string, meta: Record<string, string>) {
-  await mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        ...meta,
-        ts: nowIso(),
-      },
-    },
+  lastChannelEmit = { text, meta, ts: nowIso() }
+  const requestId = meta.request_id ?? randomUUID()
+  const source = meta.source ?? 'stackchan'
+  const sessionId = meta.session_id ?? 'stackchan'
+  const deviceId = meta.device_id ?? 'stackchan'
+  const prompt = [
+    `StackChan voice input arrived from ${source}.`,
+    `request_id: ${requestId}`,
+    `session_id: ${sessionId}`,
+    `device_id: ${deviceId}`,
+    `text: ${text}`,
+    '',
+    'Reply by calling mcp__stackchan__reply with this exact request_id and a concise Japanese text.',
+    'Do not call Telegram tools for this StackChan voice input.',
+  ].join('\n')
+  const result = spawnSync(evictlBin, ['send', evictlIdentity, '--text', prompt, '--source', 'stackchan-relay'], {
+    encoding: 'utf8',
   })
+  if (result.status !== 0) {
+    throw new Error(`evictl send failed: ${result.stderr || result.stdout}`)
+  }
 }
 
 async function askClaude(text: string, socket: ServerWebSocket<StackChanConnection> | undefined, sessionId: string, deviceId: string): Promise<string> {
-  if (!directMcpChannel) {
-    try {
-      log(`ask fakechat: ${text}`)
-      return await fakeChat.ask(text)
-    } catch (err) {
-      log(`fakechat relay failed: ${err}`)
-      return 'Claude Code Channels に送れなかったの。Mac 側を確認してね。'
-    }
-  }
-
   const id = randomUUID()
   const started = Date.now()
   return await new Promise<string>((resolve) => {
@@ -421,6 +745,24 @@ async function askClaude(text: string, socket: ServerWebSocket<StackChanConnecti
       },
     })
 
+    const event = mqttEvent('input.text', text, {
+      id,
+      source: socket ? 'stackchan' : 'http',
+      channel: socket ? 'stackchan' : 'openai-compatible',
+      session_id: sessionId,
+      device_id: deviceId,
+      target: 'claude',
+    })
+
+    void publishMqttInput(event).catch(err => {
+      log(`failed to publish MQTT input: ${err}`)
+    })
+
+    if (!directMcpChannel) {
+      log(`waiting MQTT output: ${id}`)
+      return
+    }
+
     void emitChannel(text, {
       source: 'stackchan',
       request_id: id,
@@ -434,74 +776,6 @@ async function askClaude(text: string, socket: ServerWebSocket<StackChanConnecti
       resolve('Claude Code Channels に送れなかったの。Mac 側を確認してね。')
     })
   })
-}
-
-class FakeChatClient {
-  private ws?: WebSocket
-  private connecting?: Promise<void>
-  private pending: FakeChatPending[] = []
-
-  constructor(private readonly endpoint: string) {}
-
-  async ask(text: string): Promise<string> {
-    await this.ensureConnected()
-    return await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending = this.pending.filter(entry => entry.resolve !== resolve)
-        reject(new Error('fakechat reply timeout'))
-      }, assistantTimeoutMs)
-      this.pending.push({ resolve, reject, timer })
-      this.ws?.send(JSON.stringify({ id: randomUUID(), text }))
-    })
-  }
-
-  private async ensureConnected(): Promise<void> {
-    if (this.ws?.readyState === WebSocket.OPEN) return
-    if (this.connecting) return await this.connecting
-
-    this.connecting = new Promise((resolve, reject) => {
-      const ws = new WebSocket(this.endpoint)
-      const timer = setTimeout(() => {
-        ws.close()
-        reject(new Error(`fakechat connect timeout: ${this.endpoint}`))
-      }, 5000)
-
-      ws.addEventListener('open', () => {
-        log(`fakechat connected: ${this.endpoint}`)
-        clearTimeout(timer)
-        this.ws = ws
-        resolve()
-      })
-      ws.addEventListener('message', event => this.handleMessage(String(event.data)))
-      ws.addEventListener('close', () => {
-        log('fakechat disconnected')
-        if (this.ws === ws) this.ws = undefined
-      })
-      ws.addEventListener('error', () => {
-        reject(new Error(`fakechat connect failed: ${this.endpoint}`))
-      })
-    }).finally(() => {
-      this.connecting = undefined
-    })
-
-    return await this.connecting
-  }
-
-  private handleMessage(raw: string) {
-    let message: { type?: string; from?: string; text?: string }
-    try {
-      message = JSON.parse(raw)
-    } catch {
-      return
-    }
-
-    if (message.type !== 'msg' || message.from !== 'assistant' || !message.text) return
-    log(`fakechat reply: ${message.text}`)
-    const entry = this.pending.shift()
-    if (!entry) return
-    clearTimeout(entry.timer)
-    entry.resolve(message.text)
-  }
 }
 
 class UpstreamConnection {
@@ -625,26 +899,24 @@ const mcp = new Server(
     },
     instructions: [
       'Messages from StackChan arrive as <channel source="stackchan" request_id="..." session_id="..." device_id="..." user="stackchan" ts="...">.',
-      'Anything that should appear on the StackChan display must be sent with the reply tool. Pass request_id back unchanged and keep text concise in Japanese unless the user asks otherwise.',
+      'Anything that should appear on the StackChan display must be sent with the reply tool. Pass request_id back unchanged when replying to StackChan input. For output mirrored from another channel, omit request_id and keep text concise in Japanese unless the user asks otherwise.',
       'Do not use Telegram tools for StackChan replies.',
     ].join('\n'),
   },
 )
 
-const fakeChat = new FakeChatClient(fakeChatWsUrl)
-
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'reply',
-      description: 'Reply to StackChan. Pass request_id from the inbound channel message. The text appears on the StackChan display.',
+      description: 'Reply to StackChan. Pass request_id from an inbound StackChan channel message when available. Without request_id, the text is broadcast to the StackChan display and voice output.',
       inputSchema: {
         type: 'object',
         properties: {
           request_id: { type: 'string' },
           text: { type: 'string' },
         },
-        required: ['request_id', 'text'],
+        required: ['text'],
       },
     },
   ],
@@ -660,9 +932,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const text = String(args.text ?? '').trim()
   const entry = pending.get(requestId)
   if (!entry) {
-    return { content: [{ type: 'text', text: `request not pending: ${requestId}` }] }
+    await publishMqttOutput(mqttEvent('output.text', text, {
+      correlation_id: requestId || randomUUID(),
+      source: 'claude',
+      target: 'all',
+      session_id: 'broadcast',
+      device_id: 'stackchan',
+    }))
+    return { content: [{ type: 'text', text: 'sent' }] }
   }
 
+  await publishMqttOutput(mqttEvent('output.text', text, {
+    correlation_id: requestId,
+    source: 'claude',
+    target: 'all',
+    session_id: entry.sessionId,
+    device_id: entry.deviceId,
+  }))
   entry.resolve(text)
   return { content: [{ type: 'text', text: 'sent' }] }
 })
@@ -699,7 +985,34 @@ Bun.serve<StackChanConnection>({
   async fetch(req, server) {
     const url = new URL(req.url)
     if (url.pathname === '/health') {
-      return Response.json({ status: 'ok', upstreamOtaUrl })
+      return Response.json({
+        status: 'ok',
+        upstreamOtaUrl,
+        mqtt: {
+          enabled: mqttEnabled,
+          embedded: mqttEmbedded,
+          brokerHost: mqttBrokerHost,
+          url: mqttUrl,
+          inputTopic: mqttInputTopic,
+          outputTopic: mqttOutputTopic,
+          outputAudioTopic: mqttOutputAudioTopic,
+          stateTopic: mqttStateTopic,
+        },
+        stackChanClients: stackChanSockets.size,
+        pendingRequests: pending.size,
+        pendingAssistantSpeech: pendingAssistantSpeech.length,
+        mqttInputCount,
+        mqttOutputCount,
+        mqttOutputAudioCount,
+        mqttStateCount,
+        lastMqttInput,
+        lastMqttOutput,
+        lastMqttOutputAudio,
+        lastMqttState,
+        lastAssistantSpeech,
+        recentMqttStates,
+        lastChannelEmit,
+      })
     }
     if (url.pathname.startsWith('/ota')) {
       try {
@@ -736,7 +1049,16 @@ Bun.serve<StackChanConnection>({
   },
   websocket: {
     open(ws) {
+      stackChanSockets.add(ws)
       log(`connected ${ws.data.deviceId} session=${ws.data.sessionId}`)
+      void publishStackChanState('connected', {
+        source: 'stackchan',
+        session_id: ws.data.sessionId,
+        device_id: ws.data.deviceId,
+      })
+      setTimeout(() => {
+        void flushPendingAssistantSpeech()
+      }, 500)
     },
     async message(ws, message) {
       const config = upstreamConfigs.get(ws.data.deviceId) ?? upstreamConfigs.get('stackchan')
@@ -758,6 +1080,18 @@ Bun.serve<StackChanConnection>({
           if (parsed.type === 'listen' && parsed.state === 'start') {
             ws.data.transcript = undefined
             ws.data.claudeAsked = false
+            void publishStackChanState('listening', {
+              source: 'stackchan',
+              session_id: ws.data.sessionId,
+              device_id: ws.data.deviceId,
+            })
+          }
+          if (parsed.type === 'listen' && parsed.state === 'stop') {
+            void publishStackChanState('idle', {
+              source: 'stackchan',
+              session_id: ws.data.sessionId,
+              device_id: ws.data.deviceId,
+            })
           }
           log(`xiaozhi -> upstream: ${message}`)
           await ws.data.upstream.send(message)
@@ -771,14 +1105,22 @@ Bun.serve<StackChanConnection>({
       }
     },
     close(ws, code, reason) {
+      stackChanSockets.delete(ws)
       ws.data.upstream?.close()
       log(`disconnected ${ws.data.deviceId} code=${code} reason=${reason}`)
+      void publishStackChanState('disconnected', {
+        source: 'stackchan',
+        session_id: ws.data.sessionId,
+        device_id: ws.data.deviceId,
+      })
     },
   },
 })
 
 const transport = new StdioServerTransport()
 loadUpstreamConfigs()
+startEmbeddedMqttBroker()
+void ensureMqtt()
 if (directMcpChannel) {
   await mcp.connect(transport)
 }

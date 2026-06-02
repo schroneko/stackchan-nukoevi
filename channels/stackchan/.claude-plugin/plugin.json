@@ -1,0 +1,12 @@
+{
+  "name": "stackchan",
+  "description": "StackChan and Nukoevi MQTT channel for Claude Code Channels.",
+  "version": "0.0.1",
+  "keywords": [
+    "stackchan",
+    "nukoevi",
+    "mqtt",
+    "channel",
+    "mcp"
+  ]
+}

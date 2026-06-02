@@ -6,7 +6,9 @@
 #include <font_awesome.h>
 #include <hal/board/hal_bridge.h>
 #include <hal/hal.h>
+#include <application.h>
 #include <lvgl.h>
+#include <mqtt.h>
 #include <mooncake.h>
 #include <mooncake_log.h>
 #include <stackchan/stackchan.h>
@@ -20,6 +22,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <smooth_lvgl.hpp>
 #include <string>
 #include <string_view>
@@ -41,6 +44,7 @@ LV_FONT_DECLARE(font_awesome_20_4);
 static std::unique_ptr<Container> _panel;
 static std::unique_ptr<Image> _avatar;
 static lv_obj_t* _mic_button = nullptr;
+static lv_obj_t* _mic_hit_area = nullptr;
 static lv_obj_t* _camera_button = nullptr;
 static lv_obj_t* _camera_label = nullptr;
 static lv_obj_t* _wifi_button = nullptr;
@@ -62,6 +66,11 @@ static lv_obj_t* _caption_panel = nullptr;
 static lv_obj_t* _llm_label     = nullptr;
 static lv_obj_t* _listen_indicator = nullptr;
 static lv_obj_t* _listen_indicator_dot = nullptr;
+enum class MicButtonState {
+    Idle,
+    Starting,
+    Listening,
+};
 static uint32_t _blink_timecount = 0;
 static uint8_t _blink_index      = 0;
 static bool _head_pet_receives                = false;
@@ -95,6 +104,16 @@ static constexpr uint32_t _llm_request_interval_ms = 2500;
 static uint32_t _caption_updated_at = 0;
 static bool _caption_visible = false;
 static bool _listen_indicator_visible = false;
+static MicButtonState _mic_button_state_requested = MicButtonState::Idle;
+static MicButtonState _mic_button_state_visible = MicButtonState::Idle;
+static uint32_t _mic_button_event_at = 0;
+static bool _mic_touch_area_active = false;
+static bool _touch_point_active = false;
+static uint32_t _touch_point_published_at = 0;
+static int _last_touch_point_x = -1;
+static int _last_touch_point_y = -1;
+static constexpr int _mic_touch_min_x = 256;
+static constexpr int _mic_touch_max_y = 64;
 static bool _talk_requested = false;
 static size_t _talk_request_text_size = 0;
 static bool _talk_active = false;
@@ -107,7 +126,7 @@ static bool _network_started = false;
 static bool _sleep_mode = false;
 static uint8_t _sleep_index = 0;
 static uint32_t _sleep_timecount = 0;
-static constexpr uint32_t _caption_auto_hide_ms = 6000;
+static constexpr uint32_t _caption_auto_hide_ms = 15000;
 static constexpr int _caption_width       = 316;
 static constexpr int _caption_label_width = 300;
 static constexpr uint8_t _nukoevi_backlight_brightness = 30;
@@ -125,6 +144,16 @@ static int32_t _external_led_index = 0;
 static bool _controls_syncing = false;
 static bool _xiaozhi_interaction_requested = false;
 static bool _motion_assets_loaded = false;
+static std::unique_ptr<Mqtt> _mqtt_output_client;
+static std::mutex _mqtt_output_mutex;
+static std::queue<std::string> _mqtt_output_messages;
+static bool _mqtt_output_connecting = false;
+static uint32_t _mqtt_output_last_connect_at = 0;
+static constexpr const char* _mqtt_output_broker_host = "192.168.1.10";
+static constexpr int _mqtt_output_broker_port = 18883;
+static constexpr const char* _mqtt_output_topic = "nukoevi/output/text";
+static constexpr const char* _mqtt_output_audio_topic = "nukoevi/output/audio/opus";
+static constexpr const char* _mqtt_state_topic = "nukoevi/device/stackchan/state";
 static lv_image_dsc_t _talk_closed;
 static lv_image_dsc_t _talk_tiny;
 static lv_image_dsc_t _talk_medium;
@@ -175,6 +204,175 @@ static const uint32_t _sleep_intervals[] = {
 
 static void start_xiaozhi_request();
 static void begin_evictl_camera_task();
+static void publish_mqtt_state(const char* event_type, const std::string& text, const char* role = nullptr);
+
+static void enqueue_mqtt_output_payload(const std::string& payload)
+{
+    ArduinoJson::JsonDocument doc;
+    auto error = ArduinoJson::deserializeJson(doc, payload);
+    if (error) {
+        return;
+    }
+
+    const char* target = doc["target"] | "";
+    if (std::strlen(target) > 0 && std::strcmp(target, "stackchan") != 0 && std::strcmp(target, "all") != 0) {
+        return;
+    }
+
+    const char* text = doc["text"] | "";
+    if (std::strlen(text) == 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(_mqtt_output_mutex);
+    while (_mqtt_output_messages.size() >= 4) {
+        _mqtt_output_messages.pop();
+    }
+    _mqtt_output_messages.emplace(text);
+
+    GetHAL().startXiaozhiBackground();
+}
+
+static void handle_mqtt_audio_payload(const std::string& payload)
+{
+    ArduinoJson::JsonDocument doc;
+    auto error = ArduinoJson::deserializeJson(doc, payload);
+    if (error) {
+        return;
+    }
+
+    const char* target = doc["target"] | "";
+    if (std::strlen(target) > 0 && std::strcmp(target, "stackchan") != 0 && std::strcmp(target, "all") != 0) {
+        return;
+    }
+
+    const char* encoded = doc["payload"] | "";
+    const auto encoded_size = std::strlen(encoded);
+    if (encoded_size == 0) {
+        return;
+    }
+
+    GetHAL().startXiaozhiBackground();
+
+    size_t decoded_size = 0;
+    auto ret = mbedtls_base64_decode(nullptr, 0, &decoded_size, reinterpret_cast<const unsigned char*>(encoded),
+                                     encoded_size);
+    if (ret != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL || decoded_size == 0) {
+        return;
+    }
+
+    std::vector<uint8_t> decoded(decoded_size);
+    ret = mbedtls_base64_decode(decoded.data(), decoded.size(), &decoded_size,
+                                reinterpret_cast<const unsigned char*>(encoded), encoded_size);
+    if (ret != 0 || decoded_size == 0) {
+        return;
+    }
+    decoded.resize(decoded_size);
+
+    const int sequence = doc["sequence"] | -1;
+    const int total = doc["total"] | 0;
+    if (sequence == 0 || (total > 0 && sequence == total - 1)) {
+        char status[64];
+        std::snprintf(status, sizeof(status), "seq=%d total=%d bytes=%u", sequence, total,
+                      static_cast<unsigned>(decoded.size()));
+        publish_mqtt_state("audio.opus", status);
+    }
+
+    auto packet = std::make_unique<AudioStreamPacket>();
+    packet->sample_rate = doc["sample_rate"] | 16000;
+    packet->frame_duration = doc["frame_duration"] | 60;
+    packet->timestamp = doc["timestamp"] | 0;
+    packet->payload = std::move(decoded);
+    Application::GetInstance().GetAudioService().PushPacketToDecodeQueue(std::move(packet), true);
+}
+
+static void publish_mqtt_state(const char* event_type, const std::string& text, const char* role)
+{
+    if (!_mqtt_output_client || !_mqtt_output_client->IsConnected()) {
+        return;
+    }
+
+    ArduinoJson::JsonDocument doc;
+    doc["type"] = event_type;
+    doc["source"] = "stackchan";
+    doc["target"] = "claude";
+    doc["device_id"] = GetHAL().getFactoryMacString();
+    doc["text"] = text;
+    if (role && std::strlen(role) > 0) {
+        doc["role"] = role;
+    }
+
+    std::string payload;
+    ArduinoJson::serializeJson(doc, payload);
+    _mqtt_output_client->Publish(_mqtt_state_topic, payload, 1);
+}
+
+static void mqtt_output_connect_task(void*)
+{
+    bool connected = false;
+    if (_mqtt_output_client) {
+        const auto client_id = "nukoevi-stackchan-" + GetHAL().getFactoryMacString();
+        connected = _mqtt_output_client->Connect(_mqtt_output_broker_host, _mqtt_output_broker_port, client_id, "", "");
+    }
+    if (!connected) {
+        mclog::tagWarn("NUKOEVI", "MQTT output receiver connect failed");
+    }
+    _mqtt_output_connecting = false;
+    vTaskDelete(nullptr);
+}
+
+static void ensure_mqtt_output_receiver()
+{
+    if (GetHAL().getWifiStatus() == WifiStatus::None) {
+        return;
+    }
+    if (_mqtt_output_client && _mqtt_output_client->IsConnected()) {
+        return;
+    }
+    if (_mqtt_output_connecting) {
+        return;
+    }
+
+    const auto now = GetHAL().millis();
+    if (_mqtt_output_last_connect_at != 0 && now - _mqtt_output_last_connect_at < 5000) {
+        return;
+    }
+    _mqtt_output_last_connect_at = now;
+
+    auto network = Board::GetInstance().GetNetwork();
+    if (!network) {
+        return;
+    }
+
+    _mqtt_output_client = network->CreateMqtt(2);
+    if (!_mqtt_output_client) {
+        mclog::tagWarn("NUKOEVI", "MQTT output receiver create failed");
+        return;
+    }
+
+    _mqtt_output_client->OnConnected([]() {
+        mclog::tagInfo("NUKOEVI", "MQTT output receiver connected");
+        _mqtt_output_client->Subscribe(_mqtt_output_topic, 0);
+        _mqtt_output_client->Subscribe(_mqtt_output_audio_topic, 0);
+        publish_mqtt_state("mqtt.connected", "connected");
+    });
+    _mqtt_output_client->OnDisconnected([]() { mclog::tagInfo("NUKOEVI", "MQTT output receiver disconnected"); });
+    _mqtt_output_client->OnMessage([](const std::string& topic, const std::string& payload) {
+        if (topic == _mqtt_output_audio_topic) {
+            handle_mqtt_audio_payload(payload);
+            return;
+        }
+        if (topic == _mqtt_output_topic) {
+            enqueue_mqtt_output_payload(payload);
+        }
+    });
+
+    _mqtt_output_connecting = true;
+    if (xTaskCreate(mqtt_output_connect_task, "nukoevi_mqtt", 6144, nullptr, 3, nullptr) != pdPASS) {
+        _mqtt_output_connecting = false;
+        mclog::tagWarn("NUKOEVI", "MQTT output receiver task failed");
+    }
+}
 
 static int32_t value_to_index(uint8_t value, const uint8_t* levels, size_t size)
 {
@@ -322,6 +520,34 @@ static void update_wifi_button()
     }
 }
 
+static void update_mic_button(MicButtonState state)
+{
+    if (!_mic_button) {
+        return;
+    }
+    if (_mic_button_state_visible == state) {
+        return;
+    }
+
+    uint32_t bg_color = 0x2B1710;
+    uint32_t mark_color = 0xFFF4E6;
+    if (state == MicButtonState::Starting) {
+        bg_color = 0x5A3518;
+        mark_color = 0xF5B06F;
+    } else if (state == MicButtonState::Listening) {
+        bg_color = 0x123F35;
+        mark_color = 0x9CFFB5;
+    }
+
+    lv_obj_set_style_bg_color(_mic_button, lv_color_hex(bg_color), LV_PART_MAIN);
+    lv_obj_set_style_border_color(_mic_button, lv_color_hex(mark_color), LV_PART_MAIN);
+    for (uint32_t i = 0; i < lv_obj_get_child_count(_mic_button); i++) {
+        auto child = lv_obj_get_child(_mic_button, i);
+        lv_obj_set_style_bg_color(child, lv_color_hex(mark_color), LV_PART_MAIN);
+    }
+    _mic_button_state_visible = state;
+}
+
 static const char* get_battery_symbol(uint8_t level)
 {
     if (level >= 90) {
@@ -415,11 +641,24 @@ static void create_mic_icon(lv_obj_t* parent)
 
 static void create_top_controls()
 {
+    _mic_hit_area = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(_mic_hit_area, 48, 48);
+    lv_obj_align(_mic_hit_area, LV_ALIGN_TOP_RIGHT, -2, 2);
+    lv_obj_set_style_bg_opa(_mic_hit_area, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(_mic_hit_area, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(_mic_hit_area, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(_mic_hit_area, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(_mic_hit_area, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(_mic_hit_area, [](lv_event_t*) { start_xiaozhi_request(); }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(_mic_hit_area, [](lv_event_t*) { start_xiaozhi_request(); }, LV_EVENT_PRESSED, nullptr);
+
     _mic_button = lv_obj_create(lv_screen_active());
     set_button_style(_mic_button, 0x2B1710, 0xFFF4E6);
     lv_obj_align(_mic_button, LV_ALIGN_TOP_RIGHT, -8, 8);
     lv_obj_add_event_cb(_mic_button, [](lv_event_t*) { start_xiaozhi_request(); }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(_mic_button, [](lv_event_t*) { start_xiaozhi_request(); }, LV_EVENT_PRESSED, nullptr);
     create_mic_icon(_mic_button);
+    lv_obj_move_foreground(_mic_button);
 
     create_control_button(&_camera_button, &_camera_label, LV_ALIGN_TOP_RIGHT, -50, 8, FONT_AWESOME_CAMERA,
                           [](lv_event_t*) { begin_evictl_camera_task(); });
@@ -675,30 +914,92 @@ static void set_listen_indicator_requested(bool visible)
     _listen_indicator_requested = visible;
 }
 
+static void set_mic_button_state_requested(MicButtonState state)
+{
+    std::lock_guard<std::mutex> lock(_llm_mutex);
+    _mic_button_state_requested = state;
+}
+
 static void start_xiaozhi_request()
 {
     const auto now = GetHAL().millis();
+    if (_mic_button_event_at != 0 && now - _mic_button_event_at < 800) {
+        return;
+    }
+    _mic_button_event_at = now;
+
+    if (GetHAL().isXiaozhiListening() || _xiaozhi_interaction_requested) {
+        publish_mqtt_state("mic.clicked", "stop");
+        set_mic_button_state_requested(MicButtonState::Starting);
+        update_llm_status("送信中");
+        GetHAL().stopXiaozhiListening();
+        _xiaozhi_interaction_requested = false;
+        return;
+    }
+
     if (_last_llm_request_at != 0 && now - _last_llm_request_at < 1500) {
+        publish_mqtt_state("mic.debounced", "ignored");
         return;
     }
     _last_llm_request_at = now;
     _xiaozhi_interaction_requested = true;
-    if (GetHAL().isXiaozhiListening() || GetHAL().isXiaozhiSpeaking()) {
+    publish_mqtt_state("mic.clicked", "start");
+    if (GetHAL().isXiaozhiSpeaking()) {
+        set_mic_button_state_requested(MicButtonState::Starting);
         update_llm_status("キャンセル中");
     } else {
-        update_llm_status("マイク起動中");
+        set_mic_button_state_requested(MicButtonState::Starting);
+        update_llm_status("マイク準備中");
     }
     GetHAL().requestXiaozhiListening();
 }
 
+static void handle_mic_touch_area()
+{
+    const auto touch = hal_bridge::get_touch_point();
+    const auto now = GetHAL().millis();
+    if (touch.num > 0) {
+        const bool moved = std::abs(touch.x - _last_touch_point_x) > 8 || std::abs(touch.y - _last_touch_point_y) > 8;
+        if (!_touch_point_active || moved || now - _touch_point_published_at > 750) {
+            char text[40];
+            std::snprintf(text, sizeof(text), "x=%d y=%d", touch.x, touch.y);
+            publish_mqtt_state("touch.point", text);
+            _touch_point_active = true;
+            _touch_point_published_at = now;
+            _last_touch_point_x = touch.x;
+            _last_touch_point_y = touch.y;
+        }
+    } else {
+        _touch_point_active = false;
+        _last_touch_point_x = -1;
+        _last_touch_point_y = -1;
+    }
+
+    const bool active = touch.num > 0 && touch.x >= _mic_touch_min_x && touch.y <= _mic_touch_max_y;
+    if (!active) {
+        _mic_touch_area_active = false;
+        return;
+    }
+    if (_mic_touch_area_active) {
+        return;
+    }
+
+    _mic_touch_area_active = true;
+    char text[40];
+    std::snprintf(text, sizeof(text), "x=%d y=%d", touch.x, touch.y);
+    publish_mqtt_state("mic.touch_area", text);
+    start_xiaozhi_request();
+}
+
 static void handle_xiaozhi_status(std::string_view status)
 {
+    publish_mqtt_state("xiaozhi.status", std::string(status));
     if (status == "Listening...") {
         std::lock_guard<std::mutex> lock(_llm_mutex);
         _listen_indicator_requested = true;
-        if (_llm_status == "マイク起動中") {
-            _caption_hide_requested = true;
-        }
+        _mic_button_state_requested = MicButtonState::Listening;
+        _llm_status = "聞いています";
+        _llm_status_changed = true;
         return;
     }
 
@@ -706,20 +1007,23 @@ static void handle_xiaozhi_status(std::string_view status)
         status == "Activation") {
         set_listen_indicator_requested(false);
         if (_xiaozhi_interaction_requested) {
-            update_llm_status("マイク起動中");
+            set_mic_button_state_requested(MicButtonState::Starting);
+            update_llm_status("マイク準備中");
         }
         return;
     }
 
     if (status == "Speaking...") {
         set_listen_indicator_requested(false);
+        set_mic_button_state_requested(MicButtonState::Idle);
         return;
     }
 
     if (status == "Standby") {
         std::lock_guard<std::mutex> lock(_llm_mutex);
         _listen_indicator_requested = false;
-        if (_llm_status == "マイク起動中" || _llm_status == "キャンセル中") {
+        _mic_button_state_requested = MicButtonState::Idle;
+        if (_llm_status == "マイク準備中" || _llm_status == "キャンセル中" || _llm_status == "聞いています") {
             _caption_hide_requested = true;
         }
         _xiaozhi_interaction_requested = false;
@@ -735,6 +1039,7 @@ static void handle_xiaozhi_text_message(const WsTextMessage_t& message)
     }
 
     std::lock_guard<std::mutex> lock(_llm_mutex);
+    publish_mqtt_state("xiaozhi.text", text, role.c_str());
     if (role == "assistant") {
         _llm_status = text;
         _llm_status_changed = true;
@@ -1214,6 +1519,22 @@ static void update_caption_text(const std::string& text)
     mclog::tagInfo("NUKOEVI", "caption updated: {}", caption_text);
 }
 
+static void process_mqtt_output_messages()
+{
+    while (true) {
+        std::string text;
+        {
+            std::lock_guard<std::mutex> lock(_mqtt_output_mutex);
+            if (_mqtt_output_messages.empty()) {
+                return;
+            }
+            text = _mqtt_output_messages.front();
+            _mqtt_output_messages.pop();
+        }
+        update_caption_text(text);
+    }
+}
+
 static void hide_caption_panel()
 {
     if (!_caption_panel || !_caption_visible) {
@@ -1580,6 +1901,9 @@ void AppNukoevi::onRunning()
     GetStackChan().update();
     update_wifi_button();
     update_battery_indicator();
+    ensure_mqtt_output_receiver();
+    process_mqtt_output_messages();
+    handle_mic_touch_area();
 
     constexpr uint32_t blink_interval_ms = 3200;
     constexpr uint32_t blink_frame_ms    = 85;
@@ -1595,6 +1919,7 @@ void AppNukoevi::onRunning()
     bool should_start_talk = false;
     bool should_hide_caption = false;
     bool listen_indicator_visible = false;
+    MicButtonState mic_button_state = MicButtonState::Idle;
     size_t talk_text_size = 0;
     {
         std::lock_guard<std::mutex> lock(_llm_mutex);
@@ -1619,8 +1944,16 @@ void AppNukoevi::onRunning()
             should_hide_caption = true;
         }
         listen_indicator_visible = _listen_indicator_requested;
+        mic_button_state = _mic_button_state_requested;
     }
 
+    update_mic_button(mic_button_state);
+    if (_mic_hit_area) {
+        lv_obj_move_foreground(_mic_hit_area);
+    }
+    if (_mic_button) {
+        lv_obj_move_foreground(_mic_button);
+    }
     update_listen_indicator(listen_indicator_visible);
     if (should_hide_caption) {
         hide_caption_panel();
@@ -1690,6 +2023,9 @@ void AppNukoevi::onClose()
     if (_mic_button && lv_obj_is_valid(_mic_button)) {
         lv_obj_delete(_mic_button);
     }
+    if (_mic_hit_area && lv_obj_is_valid(_mic_hit_area)) {
+        lv_obj_delete(_mic_hit_area);
+    }
     if (_camera_button && lv_obj_is_valid(_camera_button)) {
         lv_obj_delete(_camera_button);
     }
@@ -1709,6 +2045,7 @@ void AppNukoevi::onClose()
         lv_obj_delete(_listen_indicator);
     }
     _mic_button = nullptr;
+    _mic_hit_area = nullptr;
     _camera_button = nullptr;
     _camera_label = nullptr;
     _wifi_button = nullptr;
@@ -1734,6 +2071,8 @@ void AppNukoevi::onClose()
     _caption_updated_at = 0;
     _listen_indicator_visible = false;
     _listen_indicator_requested = false;
+    _mic_button_state_visible = MicButtonState::Idle;
+    _mic_button_state_requested = MicButtonState::Idle;
     _caption_hide_requested = false;
     _xiaozhi_interaction_requested = false;
     _open_home_requested = false;

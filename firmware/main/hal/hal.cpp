@@ -209,11 +209,12 @@ static void _xiaozhi_background_task(void*)
 }
 
 static bool _xiaozhi_start_listening_scheduled = false;
+static bool _xiaozhi_stop_listening_scheduled = false;
 
 static void _xiaozhi_start_listening_task(void*)
 {
     vTaskDelay(pdMS_TO_TICKS(200));
-    Application::GetInstance().ToggleChatState();
+    Application::GetInstance().StartListening();
     _xiaozhi_start_listening_scheduled = false;
     vTaskDelete(nullptr);
 }
@@ -226,6 +227,23 @@ static void _schedule_xiaozhi_start_listening()
 
     _xiaozhi_start_listening_scheduled = true;
     xTaskCreatePinnedToCore(_xiaozhi_start_listening_task, "xiaozhi-listen", 4096, nullptr, 5, nullptr, 0);
+}
+
+static void _xiaozhi_stop_listening_task(void*)
+{
+    Application::GetInstance().StopListening();
+    _xiaozhi_stop_listening_scheduled = false;
+    vTaskDelete(nullptr);
+}
+
+static void _schedule_xiaozhi_stop_listening()
+{
+    if (_xiaozhi_stop_listening_scheduled) {
+        return;
+    }
+
+    _xiaozhi_stop_listening_scheduled = true;
+    xTaskCreatePinnedToCore(_xiaozhi_stop_listening_task, "xiaozhi-stop", 4096, nullptr, 5, nullptr, 0);
 }
 
 void Hal::startXiaozhiBackground()
@@ -256,6 +274,16 @@ void Hal::requestXiaozhiListening()
 
     _xiaozhi_listen_requested = false;
     _schedule_xiaozhi_start_listening();
+}
+
+void Hal::stopXiaozhiListening()
+{
+    _xiaozhi_listen_requested = false;
+    if (!_xiaozhi_background_started) {
+        return;
+    }
+
+    _schedule_xiaozhi_stop_listening();
 }
 
 void Hal::notifyXiaozhiReady()

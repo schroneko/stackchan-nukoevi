@@ -202,6 +202,7 @@ public:
     void startXiaozhi();
     void startXiaozhiBackground();
     void requestXiaozhiListening();
+    void stopXiaozhiListening();
     void notifyXiaozhiReady();
     bool isXiaozhiListening();
     bool isXiaozhiSpeaking();
