@@ -112,8 +112,10 @@ static bool _touch_point_active = false;
 static uint32_t _touch_point_published_at = 0;
 static int _last_touch_point_x = -1;
 static int _last_touch_point_y = -1;
-static constexpr int _mic_touch_min_x = 256;
-static constexpr int _mic_touch_max_y = 64;
+static constexpr int _mic_touch_min_x = 272;
+static constexpr int _mic_touch_max_x = 318;
+static constexpr int _mic_touch_min_y = 12;
+static constexpr int _mic_touch_max_y = 56;
 static bool _talk_requested = false;
 static size_t _talk_request_text_size = 0;
 static bool _talk_active = false;
@@ -642,8 +644,8 @@ static void create_mic_icon(lv_obj_t* parent)
 static void create_top_controls()
 {
     _mic_hit_area = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(_mic_hit_area, 48, 48);
-    lv_obj_align(_mic_hit_area, LV_ALIGN_TOP_RIGHT, -2, 2);
+    lv_obj_set_size(_mic_hit_area, 40, 40);
+    lv_obj_align(_mic_hit_area, LV_ALIGN_TOP_RIGHT, -6, 12);
     lv_obj_set_style_bg_opa(_mic_hit_area, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_border_width(_mic_hit_area, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(_mic_hit_area, 0, LV_PART_MAIN);
@@ -654,7 +656,7 @@ static void create_top_controls()
 
     _mic_button = lv_obj_create(lv_screen_active());
     set_button_style(_mic_button, 0x2B1710, 0xFFF4E6);
-    lv_obj_align(_mic_button, LV_ALIGN_TOP_RIGHT, -8, 8);
+    lv_obj_align(_mic_button, LV_ALIGN_TOP_RIGHT, -8, 16);
     lv_obj_add_event_cb(_mic_button, [](lv_event_t*) { start_xiaozhi_request(); }, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(_mic_button, [](lv_event_t*) { start_xiaozhi_request(); }, LV_EVENT_PRESSED, nullptr);
     create_mic_icon(_mic_button);
@@ -975,7 +977,8 @@ static void handle_mic_touch_area()
         _last_touch_point_y = -1;
     }
 
-    const bool active = touch.num > 0 && touch.x >= _mic_touch_min_x && touch.y <= _mic_touch_max_y;
+    const bool active = touch.num > 0 && touch.x >= _mic_touch_min_x && touch.x <= _mic_touch_max_x &&
+                        touch.y >= _mic_touch_min_y && touch.y <= _mic_touch_max_y;
     if (!active) {
         _mic_touch_area_active = false;
         return;
