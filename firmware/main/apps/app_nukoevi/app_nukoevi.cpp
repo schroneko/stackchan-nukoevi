@@ -1858,7 +1858,6 @@ void AppNukoevi::onRunning()
     }
 
     if (open_setup_wifi_if_requested()) {
-        close();
         return;
     }
 
