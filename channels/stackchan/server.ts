@@ -35,7 +35,7 @@ const mqttAudioQos = mqttQosFromEnv(process.env.NUKOEVI_MQTT_AUDIO_QOS ?? '1')
 const irodoriTtsUrl = process.env.STACKCHAN_IRODORI_TTS_URL ?? 'https://schroneko-irodori-tts-stackchan-api.hf.space/synthesis'
 const irodoriTtsKey = process.env.STACKCHAN_IRODORI_TTS_KEY ?? ''
 const irodoriTtsSpeaker = process.env.STACKCHAN_IRODORI_TTS_SPEAKER ?? '3'
-const irodoriTtsSteps = process.env.STACKCHAN_IRODORI_TTS_STEPS ?? '24'
+const irodoriTtsSteps = process.env.STACKCHAN_IRODORI_TTS_STEPS ?? '18'
 const irodoriTtsSeconds = process.env.STACKCHAN_IRODORI_TTS_SECONDS ?? ''
 const irodoriTtsDurationScale = process.env.STACKCHAN_IRODORI_TTS_DURATION_SCALE ?? '0.95'
 const irodoriTtsEnabled = process.env.STACKCHAN_IRODORI_TTS_ENABLED !== '0'
