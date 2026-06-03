@@ -54,6 +54,8 @@ do not assume a fixed device port.
 ## Current status
 
 See `docs/nukoevi-status.md` for the current public status summary.
+See `docs/irodori-tts-runtime-notes.md` for the Irodori TTS runtime notes and
+debug checklist.
 
 At a high level, the current firmware boots into Nukoevi, shows StackChan
 status indicators, accepts text output over MQTT, displays responses, and can
