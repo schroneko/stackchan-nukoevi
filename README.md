@@ -43,11 +43,9 @@ See `firmware/README.md` for the firmware build and flash flow.
 Short version:
 
 ```bash
-cd firmware
-uv run python ./fetch_repos.py
-. /path/to/esp-idf/export.sh
-idf.py build
-idf.py -p /dev/tty.usbmodemXXXX flash
+uv run python firmware/fetch_repos.py
+tools/idf.sh build
+tools/idf.sh -p /dev/tty.usbmodemXXXX flash
 ```
 
 Use the serial port shown by your local machine. The checked-in paths and docs

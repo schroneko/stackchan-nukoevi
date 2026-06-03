@@ -8,8 +8,10 @@ patched with `firmware/patches/xiaozhi-esp32.patch` during dependency setup.
 
 ## Fetch dependencies
 
+From the repository root:
+
 ```bash
-uv run python ./fetch_repos.py
+uv run python firmware/fetch_repos.py
 ```
 
 If `uv` is not available, install it first or run the script with the Python
@@ -17,16 +19,18 @@ tooling used in your local development environment.
 
 ## Toolchain
 
-The firmware has been built with ESP-IDF v5.5.4.
+The firmware has been built with ESP-IDF v5.5.4. Use the repository wrapper
+from the repository root. It sources ESP-IDF from `IDF_PATH`,
+`${GHQ_ROOT:-$HOME/ghq}/github.com/espressif/esp-idf`, or `$HOME/esp/esp-idf`.
 
 ```bash
-. /path/to/esp-idf/export.sh
+tools/idf.sh --version
 ```
 
 ## Build
 
 ```bash
-idf.py build
+tools/idf.sh build
 ```
 
 ## Flash
@@ -34,13 +38,13 @@ idf.py build
 Connect StackChan over USB-C and use the serial port shown by your machine.
 
 ```bash
-idf.py -p /dev/tty.usbmodemXXXX flash
+tools/idf.sh -p /dev/tty.usbmodemXXXX flash
 ```
 
 ## Monitor
 
 ```bash
-idf.py -p /dev/tty.usbmodemXXXX monitor
+tools/idf.sh -p /dev/tty.usbmodemXXXX monitor
 ```
 
 Useful startup log lines:
