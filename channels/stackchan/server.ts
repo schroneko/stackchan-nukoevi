@@ -46,6 +46,8 @@ const xiaozhiListeningStaleMs = Number(process.env.STACKCHAN_XIAOZHI_LISTENING_S
 const irodoriTtsWarmupText = process.env.STACKCHAN_IRODORI_TTS_WARMUP_TEXT ?? 'あ'
 const irodoriTtsWarmupSteps = process.env.STACKCHAN_IRODORI_TTS_WARMUP_STEPS ?? '4'
 const irodoriTtsWarmupCooldownMs = Number(process.env.STACKCHAN_IRODORI_TTS_WARMUP_COOLDOWN_MS ?? '60000')
+const irodoriTtsWarmupOnListen = process.env.STACKCHAN_IRODORI_TTS_WARMUP_ON_LISTEN === '1'
+const irodoriTtsRateLimitCooldownMs = Number(process.env.STACKCHAN_IRODORI_TTS_RATE_LIMIT_COOLDOWN_MS ?? '180000')
 const assistantSpeechQueueMs = Number(process.env.STACKCHAN_ASSISTANT_SPEECH_QUEUE_MS ?? '30000')
 const evictlBin = process.env.STACKCHAN_EVICTL_BIN ?? `${homedir()}/ghq/github.com/schroneko/evictl/bin/evictl`
 const evictlIdentity = process.env.STACKCHAN_EVICTL_IDENTITY ?? 'nukoevi'
@@ -193,6 +195,8 @@ let lastMqttOutputAudio: NukoeviMqttEvent | undefined
 let lastMqttState: NukoeviMqttEvent | undefined
 let lastAssistantSpeech: { text: string; queued: boolean; ts: string } | undefined
 let lastIrodoriWarmup: { state: string; reason?: string; durationMs?: number; ts: string } | undefined
+let irodoriTtsRateLimitedUntil = 0
+let lastIrodoriTtsRateLimit: { reason: string; until: string; ts: string } | undefined
 let xiaozhiAudioFramesIn = 0
 let xiaozhiAudioBytesIn = 0
 let xiaozhiAudioFramesOut = 0
@@ -744,16 +748,40 @@ function buildIrodoriSynthesisUrl(text: string, steps: string, seconds?: string)
   return url
 }
 
+function markIrodoriRateLimited(reason: string) {
+  irodoriTtsRateLimitedUntil = Date.now() + irodoriTtsRateLimitCooldownMs
+  lastIrodoriTtsRateLimit = {
+    reason,
+    until: new Date(irodoriTtsRateLimitedUntil).toISOString(),
+    ts: nowIso(),
+  }
+}
+
+function maybeMarkIrodoriRateLimited(reason: string) {
+  if (!reason.includes('429') && !reason.includes('Too Many Requests')) return
+  markIrodoriRateLimited(reason)
+}
+
+function assertIrodoriNotRateLimited(label: string) {
+  if (irodoriTtsRateLimitedUntil <= Date.now()) return
+  throw new Error(`Irodori ${label} skipped: rate limit cooldown until ${new Date(irodoriTtsRateLimitedUntil).toISOString()}`)
+}
+
 async function requestIrodoriSynthesis(url: URL, label: string, signal?: AbortSignal) {
+  assertIrodoriNotRateLimited(label)
   const response = await fetch(url, { signal })
   const body = await response.text()
   if (!response.ok) {
-    throw new Error(`Irodori ${label} failed: ${response.status} ${body}`)
+    const reason = `${response.status} ${body}`
+    maybeMarkIrodoriRateLimited(reason)
+    throw new Error(`Irodori ${label} failed: ${reason}`)
   }
 
   const json = JSON.parse(body) as IrodoriSynthesisResponse
   if (json.success === false) {
-    throw new Error(`Irodori ${label} failed: ${json.error ?? body}`)
+    const reason = json.error ?? body
+    maybeMarkIrodoriRateLimited(reason)
+    throw new Error(`Irodori ${label} failed: ${reason}`)
   }
   return json
 }
@@ -1523,6 +1551,10 @@ Bun.serve<StackChanConnection>({
           mqttFrameDelayMs: irodoriTtsMqttFrameDelayMs,
           durationScale: irodoriTtsDurationScale,
           audioWsWaitMs: stackChanAudioWsWaitMs,
+          warmupOnListen: irodoriTtsWarmupOnListen,
+          rateLimitCooldownMs: irodoriTtsRateLimitCooldownMs,
+          rateLimitedUntil: irodoriTtsRateLimitedUntil > Date.now() ? new Date(irodoriTtsRateLimitedUntil).toISOString() : undefined,
+          lastRateLimit: lastIrodoriTtsRateLimit,
         },
         stackChanClients: stackChanSockets.size,
         stackChanAudioClients: stackChanAudioSockets.size,
@@ -1657,9 +1689,11 @@ Bun.serve<StackChanConnection>({
             ws.data.transcript = undefined
             ws.data.claudeAsked = false
             markXiaozhiListening(ws.data.sessionId, ws.data.deviceId)
-            void warmIrodoriTts().catch(err => {
-              log(`Irodori warmup skipped: ${err}`)
-            })
+            if (irodoriTtsWarmupOnListen) {
+              void warmIrodoriTts().catch(err => {
+                log(`Irodori warmup skipped: ${err}`)
+              })
+            }
             void publishStackChanState('listening', {
               source: 'stackchan',
               session_id: ws.data.sessionId,
