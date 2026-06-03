@@ -36,10 +36,6 @@
 using namespace mooncake;
 using namespace smooth_ui_toolkit::lvgl_cpp;
 
-LV_IMAGE_DECLARE(nukoevi_screen_open);
-LV_IMAGE_DECLARE(nukoevi_screen_half_a);
-LV_IMAGE_DECLARE(nukoevi_screen_closed);
-LV_IMAGE_DECLARE(nukoevi_screen_half_b);
 LV_IMAGE_DECLARE(nukoevi_sleep_drowsy);
 LV_FONT_DECLARE(font_puhui_14_1);
 LV_FONT_DECLARE(font_awesome_20_4);
@@ -197,20 +193,37 @@ static constexpr const char* _mqtt_input_topic = "nukoevi/input/text";
 static constexpr const char* _mqtt_output_topic = "nukoevi/output/text";
 static constexpr const char* _mqtt_output_audio_topic = "nukoevi/output/audio/opus";
 static constexpr const char* _mqtt_state_topic = "nukoevi/device/stackchan/state";
-static const lv_image_dsc_t* const _blink_sequence[] = {
-    &nukoevi_screen_open,
-    &nukoevi_screen_half_a,
-    &nukoevi_screen_closed,
-    &nukoevi_screen_half_b,
-    &nukoevi_screen_open,
+static constexpr const char* _blink_asset_names[] = {
+    "nukoevi-screen-open.bin",
+    "nukoevi-screen-half-a.bin",
+    "nukoevi-screen-closed.bin",
+    "nukoevi-screen-half-b.bin",
 };
+static constexpr size_t _blink_frame_count = sizeof(_blink_asset_names) / sizeof(_blink_asset_names[0]);
+static constexpr uint8_t _blink_sequence_indices[] = {0, 1, 2, 3, 0};
+static constexpr size_t _blink_sequence_count = sizeof(_blink_sequence_indices) / sizeof(_blink_sequence_indices[0]);
+static std::array<lv_image_dsc_t, _blink_frame_count> _blink_assets;
+static bool _blink_assets_loaded = false;
 
-static const lv_image_dsc_t* const _sleep_sequence[] = {
-    &nukoevi_sleep_drowsy,
+static constexpr const char* _sleep_asset_names[] = {
+    "nukoevi-sleep-drowsy.bin",
+    "nukoevi-sleep-nearly-closed.bin",
+    "nukoevi-sleep-nod.bin",
+    "nukoevi-sleep-asleep.bin",
+    "nukoevi-sleep-wobble.bin",
+    "nukoevi-sleep-return.bin",
 };
+static constexpr size_t _sleep_frame_count = sizeof(_sleep_asset_names) / sizeof(_sleep_asset_names[0]);
+static std::array<lv_image_dsc_t, _sleep_frame_count> _sleep_assets;
+static bool _sleep_assets_loaded = false;
 
 static const uint32_t _sleep_intervals[] = {
-    3600,
+    1200,
+    1200,
+    2400,
+    2400,
+    1200,
+    1200,
 };
 
 static void begin_xiaozhi_voice_input();
@@ -227,6 +240,61 @@ static bool is_valid_nukoevi_image(const lv_image_dsc_t* image)
            image->header.w > 0 && image->header.h > 0;
 }
 
+static void load_blink_motion_assets()
+{
+    bool all_valid = true;
+
+    for (size_t index = 0; index < _blink_frame_count; index++) {
+        _blink_assets[index] = assets::get_image(_blink_asset_names[index]);
+        if (!is_valid_nukoevi_image(&_blink_assets[index])) {
+            all_valid = false;
+            mclog::tagWarn("NUKOEVI", "blink asset {} invalid", _blink_asset_names[index]);
+        }
+    }
+
+    _blink_assets_loaded = all_valid;
+    mclog::tagInfo("NUKOEVI", "blink assets loaded: {}", all_valid ? "ok" : "fallback");
+}
+
+static const lv_image_dsc_t* get_blink_motion_frame(uint8_t index)
+{
+    if (_blink_assets_loaded && index < _blink_frame_count && is_valid_nukoevi_image(&_blink_assets[index])) {
+        return &_blink_assets[index];
+    }
+
+    return &nukoevi_sleep_drowsy;
+}
+
+static void load_sleep_motion_assets()
+{
+    bool all_valid = true;
+
+    for (size_t index = 0; index < _sleep_frame_count; index++) {
+        _sleep_assets[index] = assets::get_image(_sleep_asset_names[index]);
+        if (!is_valid_nukoevi_image(&_sleep_assets[index])) {
+            all_valid = false;
+            mclog::tagWarn("NUKOEVI", "sleep asset {} invalid", _sleep_asset_names[index]);
+        }
+    }
+
+    _sleep_assets_loaded = all_valid;
+    mclog::tagInfo("NUKOEVI", "sleep assets loaded: {}", all_valid ? "ok" : "fallback");
+}
+
+static const lv_image_dsc_t* get_sleep_motion_frame(uint8_t index)
+{
+    if (_sleep_assets_loaded && index < _sleep_frame_count && is_valid_nukoevi_image(&_sleep_assets[index])) {
+        return &_sleep_assets[index];
+    }
+
+    return &nukoevi_sleep_drowsy;
+}
+
+static const lv_image_dsc_t* get_fallback_avatar_frame()
+{
+    return get_blink_motion_frame(0);
+}
+
 static bool set_avatar_motion_frame(const lv_image_dsc_t* image, const char* mode, uint8_t index)
 {
     if (is_valid_nukoevi_image(image)) {
@@ -235,7 +303,7 @@ static bool set_avatar_motion_frame(const lv_image_dsc_t* image, const char* mod
     }
 
     mclog::tagWarn("NUKOEVI", "{} frame {} invalid, fallback to open image", mode, index);
-    _avatar->setSrc(&nukoevi_screen_open);
+    _avatar->setSrc(get_fallback_avatar_frame());
     return false;
 }
 
@@ -2089,7 +2157,7 @@ static bool update_sleep_animation(uint32_t now)
             _sleep_timecount = 0;
             _blink_index     = 0;
             _blink_timecount = now;
-            _avatar->setSrc(&nukoevi_screen_open);
+            set_avatar_motion_frame(get_blink_motion_frame(0), "blink", 0);
             GetHAL().setExternalLedBrightness(_external_led_normal_brightness, _external_led_normal_brightness, false);
             mclog::tagInfo("NUKOEVI", "sleep mode exit");
         }
@@ -2100,7 +2168,7 @@ static bool update_sleep_animation(uint32_t now)
         _sleep_mode      = true;
         _sleep_index     = 0;
         _sleep_timecount = now;
-        set_avatar_motion_frame(_sleep_sequence[_sleep_index], "sleep", _sleep_index);
+        set_avatar_motion_frame(get_sleep_motion_frame(_sleep_index), "sleep", _sleep_index);
         GetHAL().setExternalLedBrightness(_external_led_sleep_brightness, _external_led_sleep_brightness, false);
         mclog::tagInfo("NUKOEVI", "sleep mode enter");
         return true;
@@ -2110,10 +2178,10 @@ static bool update_sleep_animation(uint32_t now)
     if (now - _sleep_timecount >= interval) {
         _sleep_timecount = now;
         _sleep_index++;
-        if (_sleep_index >= sizeof(_sleep_sequence) / sizeof(_sleep_sequence[0])) {
+        if (_sleep_index >= _sleep_frame_count) {
             _sleep_index = 0;
         }
-        set_avatar_motion_frame(_sleep_sequence[_sleep_index], "sleep", _sleep_index);
+        set_avatar_motion_frame(get_sleep_motion_frame(_sleep_index), "sleep", _sleep_index);
     }
 
     return true;
@@ -2178,8 +2246,11 @@ void AppNukoevi::onOpen()
     _panel->addFlag(LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(_panel->get(), [](lv_event_t*) { show_controls_modal(); }, LV_EVENT_LONG_PRESSED, nullptr);
 
+    load_blink_motion_assets();
+    load_sleep_motion_assets();
+
     _avatar = std::make_unique<Image>(_panel->get());
-    _avatar->setSrc(&nukoevi_screen_open);
+    _avatar->setSrc(get_blink_motion_frame(0));
     _avatar->align(LV_ALIGN_CENTER, 0, 0);
     _avatar->addFlag(LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(_avatar->get(), [](lv_event_t*) { show_controls_modal(); }, LV_EVENT_LONG_PRESSED, nullptr);
@@ -2439,18 +2510,18 @@ void AppNukoevi::onRunning()
         if (now - _blink_timecount >= blink_interval_ms) {
             _blink_index     = 1;
             _blink_timecount = now;
-            _avatar->setSrc(_blink_sequence[_blink_index]);
+            set_avatar_motion_frame(get_blink_motion_frame(_blink_sequence_indices[_blink_index]), "blink", _blink_index);
         }
         return;
     }
 
     if (now - _blink_timecount >= blink_frame_ms) {
         _blink_index++;
-        if (_blink_index >= sizeof(_blink_sequence) / sizeof(_blink_sequence[0])) {
+        if (_blink_index >= _blink_sequence_count) {
             _blink_index = 0;
         }
         _blink_timecount = now;
-        _avatar->setSrc(_blink_sequence[_blink_index]);
+        set_avatar_motion_frame(get_blink_motion_frame(_blink_sequence_indices[_blink_index]), "blink", _blink_index);
     }
 }
 

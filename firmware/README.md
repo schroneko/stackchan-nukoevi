@@ -52,6 +52,8 @@ Useful startup log lines:
 - `[NUKOEVI] on open`
 - `WifiBoard: Connected to WiFi`
 - `NUKOEVI MQTT output receiver connected`
+- `blink assets loaded: ok`
+- `sleep assets loaded: ok`
 
 ## Current firmware behavior
 
@@ -69,20 +71,37 @@ Useful startup log lines:
 
 ## Nukoevi image assets
 
-The normal face and sleepy face are compiled as C image descriptors and passed
-to LVGL with the same `setSrc()` path. This keeps the 22:00 to 07:00 sleepy
-mode on the same rendering path as the normal Nukoevi screen.
+Nukoevi full-screen motion frames are loaded from the firmware `assets`
+partition as raw RGB565 `.bin` image descriptors. The normal blink frames and
+sleepy frames both use this path.
 
-Talk frames still use runtime `.bin` assets from the assets partition because
-there are six mouth frames and keeping every motion frame as uncompressed C
-data would use too much app partition space. The sleepy mode currently uses one
-static `320x240` frame generated from
-`main/apps/app_nukoevi/source-assets/nukoevi-sleep-frame-0.png`.
+Each raw frame is `320x240` RGB565 with a 12 byte LVGL image header followed by
+`153600` bytes of pixel data. The header uses `LV_COLOR_FORMAT_RGB565`, no
+compression flag, and `stride=0` so LVGL computes the same stride as the
+working C image descriptor path.
 
-Regenerate the sleepy C asset after changing the source frame:
+The project avoids LZ4-compressed full-screen avatar assets for the Nukoevi
+avatar path. LZ4 kept flash usage smaller, but this rendering path produced a
+white screen with `Avatar is invalid` during testing. Keep these avatar frames
+raw unless the display path is changed and verified on hardware.
+
+The `assets` partition is `5M` in `partitions.csv`. This gives room for the
+normal blink frames, sleepy frames, talk frames, icons, fonts, and other runtime
+assets while keeping the app partition below its OTA size limit. Use full
+`flash`, not `app-flash`, after changing runtime assets or the partition table.
+
+Regenerate normal blink C previews and runtime `.bin` assets after changing the
+normal source frames:
 
 ```bash
-uv run --with pillow python main/apps/app_nukoevi/source-assets/generate_nukoevi_sleep_asset.py
+uv run --with pillow python main/apps/app_nukoevi/source-assets/generate_nukoevi_blink_assets.py
+```
+
+Regenerate talk and sleepy runtime `.bin` assets after changing talk or sleepy
+source frames:
+
+```bash
+uv run --with pillow --with lz4 python main/apps/app_nukoevi/source-assets/generate_nukoevi_motion_assets.py
 ```
 
 ## Upstream patch

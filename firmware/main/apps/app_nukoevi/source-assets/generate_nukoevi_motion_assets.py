@@ -118,7 +118,7 @@ def rgb565_bytes(image):
     return data
 
 
-def write_bin_asset(name, frame):
+def write_compressed_bin_asset(name, frame):
     data = rgb565_bytes(frame)
     compressed = lz4.block.compress(bytes(data), store_size=False)
     header = struct.pack(
@@ -140,6 +140,21 @@ def write_bin_asset(name, frame):
     (ASSET_BIN_DIR / name).write_bytes(header + compression_header + compressed)
 
 
+def write_raw_bin_asset(name, frame):
+    data = rgb565_bytes(frame)
+    header = struct.pack(
+        "<BBHHHHH",
+        LV_IMAGE_HEADER_MAGIC,
+        LV_COLOR_FORMAT_RGB565,
+        0,
+        FRAME_WIDTH,
+        FRAME_HEIGHT,
+        0,
+        0,
+    )
+    (ASSET_BIN_DIR / name).write_bytes(header + data)
+
+
 def write_preview(sequence_name, frames):
     preview = Image.new("RGB", (FRAME_WIDTH * len(frames), FRAME_HEIGHT))
     for index, frame in enumerate(frames):
@@ -155,7 +170,10 @@ def main():
         frames = split_strip(strip_source)
         write_preview(sequence_name, frames)
         for asset_name, frame in zip(asset_names, frames):
-            write_bin_asset(asset_name, frame)
+            if sequence_name == "sleep":
+                write_raw_bin_asset(asset_name, frame)
+            else:
+                write_compressed_bin_asset(asset_name, frame)
 
 
 if __name__ == "__main__":

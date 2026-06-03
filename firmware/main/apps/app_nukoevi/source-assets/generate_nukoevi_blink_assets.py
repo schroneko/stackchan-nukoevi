@@ -1,11 +1,14 @@
 from pathlib import Path
+import struct
 
 from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
+FIRMWARE_MAIN = ROOT.parents[1]
 SOURCE_DIR = ROOT / "source-assets"
 ASSET_DIR = ROOT / "assets"
+ASSET_BIN_DIR = FIRMWARE_MAIN / "assets" / "assets_bin"
 SOURCE = SOURCE_DIR / "nukoevi-blink-imagegen-contact.png"
 OUTPUT = ASSET_DIR / "nukoevi_screen.c"
 PREVIEW = SOURCE_DIR / "nukoevi-blink-preview.png"
@@ -13,12 +16,14 @@ PREVIEW = SOURCE_DIR / "nukoevi-blink-preview.png"
 FRAME_WIDTH = 320
 FRAME_HEIGHT = 240
 FRAME_ASPECT = FRAME_WIDTH / FRAME_HEIGHT
+LV_IMAGE_HEADER_MAGIC = 0x19
+LV_COLOR_FORMAT_RGB565 = 0x12
 
 FRAMES = [
-    ("nukoevi_screen_open", "NUKOEVI_SCREEN_OPEN"),
-    ("nukoevi_screen_half_a", "NUKOEVI_SCREEN_HALF_A"),
-    ("nukoevi_screen_closed", "NUKOEVI_SCREEN_CLOSED"),
-    ("nukoevi_screen_half_b", "NUKOEVI_SCREEN_HALF_B"),
+    ("nukoevi_screen_open", "NUKOEVI_SCREEN_OPEN", "nukoevi-screen-open.bin"),
+    ("nukoevi_screen_half_a", "NUKOEVI_SCREEN_HALF_A", "nukoevi-screen-half-a.bin"),
+    ("nukoevi_screen_closed", "NUKOEVI_SCREEN_CLOSED", "nukoevi-screen-closed.bin"),
+    ("nukoevi_screen_half_b", "NUKOEVI_SCREEN_HALF_B", "nukoevi-screen-half-b.bin"),
 ]
 
 
@@ -92,7 +97,7 @@ def write_c_file(frames):
         "#ifndef LV_ATTRIBUTE_MEM_ALIGN\n#define LV_ATTRIBUTE_MEM_ALIGN\n#endif\n",
     ]
 
-    for (name, attr), frame in zip(FRAMES, frames):
+    for (name, attr, _asset_name), frame in zip(FRAMES, frames):
         data = rgb565_bytes(frame)
         pieces.append(f"#ifndef LV_ATTRIBUTE_IMAGE_{attr}\n#define LV_ATTRIBUTE_IMAGE_{attr}\n#endif\n")
         pieces.append(
@@ -114,6 +119,24 @@ def write_c_file(frames):
     OUTPUT.write_text("\n".join(pieces), encoding="utf-8")
 
 
+def write_bin_assets(frames):
+    ASSET_BIN_DIR.mkdir(parents=True, exist_ok=True)
+
+    for (_name, _attr, asset_name), frame in zip(FRAMES, frames):
+        data = rgb565_bytes(frame)
+        header = struct.pack(
+            "<BBHHHHH",
+            LV_IMAGE_HEADER_MAGIC,
+            LV_COLOR_FORMAT_RGB565,
+            0,
+            FRAME_WIDTH,
+            FRAME_HEIGHT,
+            0,
+            0,
+        )
+        (ASSET_BIN_DIR / asset_name).write_bytes(header + data)
+
+
 def write_preview(frames):
     preview = Image.new("RGB", (FRAME_WIDTH * len(frames), FRAME_HEIGHT))
     for index, frame in enumerate(frames):
@@ -126,6 +149,7 @@ def main():
     frames = frame_images()
     write_preview(frames)
     write_c_file(frames)
+    write_bin_assets(frames)
 
 
 if __name__ == "__main__":
