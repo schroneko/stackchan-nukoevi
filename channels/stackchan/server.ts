@@ -37,6 +37,7 @@ const irodoriTtsKey = process.env.STACKCHAN_IRODORI_TTS_KEY ?? ''
 const irodoriTtsSpeaker = process.env.STACKCHAN_IRODORI_TTS_SPEAKER ?? '3'
 const irodoriTtsSteps = process.env.STACKCHAN_IRODORI_TTS_STEPS ?? '24'
 const irodoriTtsSeconds = process.env.STACKCHAN_IRODORI_TTS_SECONDS ?? ''
+const irodoriTtsDurationScale = process.env.STACKCHAN_IRODORI_TTS_DURATION_SCALE ?? '0.95'
 const irodoriTtsEnabled = process.env.STACKCHAN_IRODORI_TTS_ENABLED !== '0'
 const irodoriTtsFrameDelayMs = Number(process.env.STACKCHAN_IRODORI_TTS_FRAME_DELAY_MS ?? '55')
 const irodoriTtsMqttFrameDelayMs = Number(process.env.STACKCHAN_IRODORI_TTS_MQTT_FRAME_DELAY_MS ?? '90')
@@ -696,6 +697,7 @@ function buildIrodoriSynthesisUrl(text: string, steps: string, seconds?: string)
   url.searchParams.set('speaker', irodoriTtsSpeaker)
   url.searchParams.set('steps', steps)
   if (seconds !== undefined) url.searchParams.set('seconds', seconds)
+  if (irodoriTtsDurationScale) url.searchParams.set('duration_scale', irodoriTtsDurationScale)
   if (irodoriTtsKey) url.searchParams.set('key', irodoriTtsKey)
   return url
 }
@@ -1475,6 +1477,7 @@ Bun.serve<StackChanConnection>({
         irodoriTts: {
           frameDelayMs: irodoriTtsFrameDelayMs,
           mqttFrameDelayMs: irodoriTtsMqttFrameDelayMs,
+          durationScale: irodoriTtsDurationScale,
           audioWsWaitMs: stackChanAudioWsWaitMs,
         },
         stackChanClients: stackChanSockets.size,
