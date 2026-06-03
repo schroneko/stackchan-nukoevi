@@ -19,7 +19,6 @@ const publicHost = process.env.STACKCHAN_PUBLIC_HOST ?? '192.168.1.10'
 const port = Number(process.env.STACKCHAN_CHANNEL_PORT ?? '18080')
 const assistantTimeoutMs = Number(process.env.STACKCHAN_REPLY_TIMEOUT_MS ?? '120000')
 const upstreamOtaUrl = process.env.STACKCHAN_UPSTREAM_OTA_URL ?? 'https://api.tenclass.net/xiaozhi/ota/'
-const directMcpChannel = process.env.STACKCHAN_DIRECT_MCP_CHANNEL === '1'
 const statePath = process.env.STACKCHAN_RELAY_STATE_PATH ?? `${homedir()}/.local/state/stackchan-xiaozhi-relay/upstream.json`
 const mqttEnabled = process.env.NUKOEVI_MQTT_ENABLED !== '0'
 const mqttEmbedded = process.env.NUKOEVI_MQTT_EMBEDDED !== '0'
@@ -32,6 +31,7 @@ const mqttInputTopic = `${mqttTopicPrefix}/input/text`
 const mqttOutputTopic = `${mqttTopicPrefix}/output/text`
 const mqttOutputAudioTopic = `${mqttTopicPrefix}/output/audio/opus`
 const mqttStateTopic = `${mqttTopicPrefix}/device/stackchan/state`
+const mqttAudioQos = mqttQosFromEnv(process.env.NUKOEVI_MQTT_AUDIO_QOS ?? '1')
 const irodoriTtsUrl = process.env.STACKCHAN_IRODORI_TTS_URL ?? 'https://schroneko-irodori-tts-stackchan-api.hf.space/synthesis'
 const irodoriTtsKey = process.env.STACKCHAN_IRODORI_TTS_KEY ?? ''
 const irodoriTtsSpeaker = process.env.STACKCHAN_IRODORI_TTS_SPEAKER ?? '3'
@@ -39,12 +39,35 @@ const irodoriTtsSteps = process.env.STACKCHAN_IRODORI_TTS_STEPS ?? '24'
 const irodoriTtsSeconds = process.env.STACKCHAN_IRODORI_TTS_SECONDS ?? ''
 const irodoriTtsEnabled = process.env.STACKCHAN_IRODORI_TTS_ENABLED !== '0'
 const irodoriTtsFrameDelayMs = Number(process.env.STACKCHAN_IRODORI_TTS_FRAME_DELAY_MS ?? '55')
+const irodoriTtsMqttFrameDelayMs = Number(process.env.STACKCHAN_IRODORI_TTS_MQTT_FRAME_DELAY_MS ?? '90')
+const stackChanAudioWsWaitMs = Number(process.env.STACKCHAN_AUDIO_WS_WAIT_MS ?? '1500')
 const irodoriTtsWarmupText = process.env.STACKCHAN_IRODORI_TTS_WARMUP_TEXT ?? 'あ'
 const irodoriTtsWarmupSteps = process.env.STACKCHAN_IRODORI_TTS_WARMUP_STEPS ?? '4'
 const irodoriTtsWarmupCooldownMs = Number(process.env.STACKCHAN_IRODORI_TTS_WARMUP_COOLDOWN_MS ?? '60000')
 const assistantSpeechQueueMs = Number(process.env.STACKCHAN_ASSISTANT_SPEECH_QUEUE_MS ?? '30000')
 const evictlBin = process.env.STACKCHAN_EVICTL_BIN ?? `${homedir()}/ghq/github.com/schroneko/evictl/bin/evictl`
 const evictlIdentity = process.env.STACKCHAN_EVICTL_IDENTITY ?? 'nukoevi'
+
+type StackChanAgentTransport = 'mqtt' | 'claude-code-channels' | 'evictl'
+type MqttQos = 0 | 1 | 2
+
+function mqttQosFromEnv(value: string): MqttQos {
+  const qos = Number(value)
+  if (qos === 1) return 1
+  if (qos === 2) return 2
+  return 0
+}
+
+function stackChanAgentTransportFromEnv(): StackChanAgentTransport {
+  const value = (process.env.STACKCHAN_AGENT_TRANSPORT ?? '').toLowerCase()
+  if (value === 'evictl') return 'evictl'
+  if (value === 'mqtt') return 'mqtt'
+  if (value === 'direct' || value === 'claude' || value === 'claude-code-channels') return 'claude-code-channels'
+  return process.env.STACKCHAN_DIRECT_MCP_CHANNEL === '1' ? 'claude-code-channels' : 'mqtt'
+}
+
+const stackChanAgentTransport = stackChanAgentTransportFromEnv()
+const directMcpChannel = stackChanAgentTransport !== 'mqtt'
 
 type StackChanRequest = {
   id: string
@@ -56,6 +79,7 @@ type StackChanRequest = {
 }
 
 type StackChanConnection = {
+  kind: 'xiaozhi' | 'audio'
   sessionId: string
   deviceId: string
   clientId: string
@@ -89,10 +113,41 @@ type NukoeviMqttEvent = {
   device_id?: string
   sample_rate?: number
   frame_duration?: number
+  audio_id?: string
   sequence?: number
   total?: number
   payload?: string
   ts?: string
+}
+
+type MqttAudioPublishSession = {
+  id: string
+  text: string
+  transport?: 'mqtt' | 'ws'
+  qos: MqttQos
+  frameDelayMs: number
+  total: number
+  published: number
+  startedAt: string
+  finishedAt?: string
+  durationMs?: number
+  synthesisStartedAt?: string
+  synthesisFinishedAt?: string
+  synthesisDurationMs?: number
+  encodeDurationMs?: number
+  publishStartedAt?: string
+  publishFinishedAt?: string
+  publishDurationMs?: number
+  firstFrameAt?: string
+  lastFrameAt?: string
+  error?: string
+}
+
+type MqttBrokerEvent = {
+  type: string
+  clientId?: string
+  topics?: string[]
+  ts: string
 }
 
 type PendingAssistantSpeech = {
@@ -115,6 +170,7 @@ type IrodoriSynthesisResponse = {
 const pending = new Map<string, StackChanRequest>()
 const upstreamConfigs = new Map<string, UpstreamConfig>()
 const stackChanSockets = new Set<ServerWebSocket<StackChanConnection>>()
+const stackChanAudioSockets = new Set<ServerWebSocket<StackChanConnection>>()
 const pendingAssistantSpeech: PendingAssistantSpeech[] = []
 const pendingMqttAssistantAudio: PendingMqttAssistantAudio[] = []
 const localOutputKeys = new Set<string>()
@@ -127,6 +183,7 @@ let mqttStateCount = 0
 let assistantSpeechSending = false
 let mqttAssistantAudioSending = false
 let irodoriWarmupInFlight: Promise<void> | undefined
+let irodoriWarmupAbortController: AbortController | undefined
 let lastIrodoriWarmupAt = 0
 let lastMqttInput: NukoeviMqttEvent | undefined
 let lastMqttOutput: NukoeviMqttEvent | undefined
@@ -134,8 +191,66 @@ let lastMqttOutputAudio: NukoeviMqttEvent | undefined
 let lastMqttState: NukoeviMqttEvent | undefined
 let lastAssistantSpeech: { text: string; queued: boolean; ts: string } | undefined
 let lastIrodoriWarmup: { state: string; reason?: string; durationMs?: number; ts: string } | undefined
+let xiaozhiAudioFramesIn = 0
+let xiaozhiAudioBytesIn = 0
+let xiaozhiAudioFramesOut = 0
+let xiaozhiAudioBytesOut = 0
+let lastXiaozhiAudioIn: { bytes: number; ts: string; sessionId: string; deviceId: string } | undefined
+let lastXiaozhiAudioOut: { bytes: number; ts: string; sessionId: string; deviceId: string } | undefined
+let lastUpstreamTextMessage:
+  | { type?: string; state?: string; textPreview?: string; hasText: boolean; ts: string; sessionId: string; deviceId: string }
+  | undefined
+let lastDirectStackChanInput: { text: string; sessionId: string; deviceId: string; ts: number } | undefined
+const recentUpstreamTextMessages: Array<{
+  type?: string
+  state?: string
+  textPreview?: string
+  hasText: boolean
+  ts: string
+  sessionId: string
+  deviceId: string
+}> = []
+let xiaozhiListening = false
+let xiaozhiFramesInAtLastStop = 0
+let xiaozhiBytesInAtLastStop = 0
 const recentMqttStates: NukoeviMqttEvent[] = []
-let lastChannelEmit: { text: string; meta: Record<string, string>; ts: string } | undefined
+const recentMqttAudioPublishes: MqttAudioPublishSession[] = []
+const mqttBrokerClients = new Set<string>()
+const mqttBrokerSubscriptions = new Map<string, string[]>()
+const recentMqttBrokerEvents: MqttBrokerEvent[] = []
+const recentXiaozhiEvents: Array<{
+  type: string
+  state?: string
+  framesIn: number
+  bytesIn: number
+  ts: string
+  sessionId: string
+  deviceId: string
+}> = []
+let lastChannelEmit: { text: string; meta: Record<string, string>; transport: StackChanAgentTransport; ts: string } | undefined
+
+function pushXiaozhiEvent(event: {
+  type: string
+  state?: string
+  sessionId: string
+  deviceId: string
+}) {
+  recentXiaozhiEvents.push({
+    ...event,
+    framesIn: xiaozhiAudioFramesIn,
+    bytesIn: xiaozhiAudioBytesIn,
+    ts: nowIso(),
+  })
+  while (recentXiaozhiEvents.length > 20) recentXiaozhiEvents.shift()
+}
+
+function pushMqttBrokerEvent(event: Omit<MqttBrokerEvent, 'ts'>) {
+  recentMqttBrokerEvents.push({
+    ...event,
+    ts: nowIso(),
+  })
+  while (recentMqttBrokerEvents.length > 40) recentMqttBrokerEvents.shift()
+}
 
 function loadUpstreamConfigs() {
   try {
@@ -168,6 +283,36 @@ function log(message: string) {
 function startEmbeddedMqttBroker() {
   if (!mqttEnabled || !mqttEmbedded) return
   void Aedes.createBroker().then(broker => {
+    broker.on('client', client => {
+      const clientId = client?.id ?? 'unknown'
+      mqttBrokerClients.add(clientId)
+      pushMqttBrokerEvent({ type: 'client.connected', clientId })
+      log(`MQTT broker client connected: ${clientId}`)
+    })
+    broker.on('clientDisconnect', client => {
+      const clientId = client?.id ?? 'unknown'
+      mqttBrokerClients.delete(clientId)
+      mqttBrokerSubscriptions.delete(clientId)
+      pushMqttBrokerEvent({ type: 'client.disconnected', clientId })
+      log(`MQTT broker client disconnected: ${clientId}`)
+    })
+    broker.on('subscribe', (subscriptions, client) => {
+      const clientId = client?.id ?? 'unknown'
+      const topics = subscriptions.map(sub => sub.topic)
+      mqttBrokerSubscriptions.set(clientId, topics)
+      pushMqttBrokerEvent({ type: 'client.subscribed', clientId, topics })
+      log(`MQTT broker client subscribed: ${clientId} ${topics.join(', ')}`)
+    })
+    broker.on('unsubscribe', (subscriptions, client) => {
+      const clientId = client?.id ?? 'unknown'
+      const topics = subscriptions.map(sub => sub.topic)
+      mqttBrokerSubscriptions.set(
+        clientId,
+        (mqttBrokerSubscriptions.get(clientId) ?? []).filter(topic => !topics.includes(topic)),
+      )
+      pushMqttBrokerEvent({ type: 'client.unsubscribed', clientId, topics })
+      log(`MQTT broker client unsubscribed: ${clientId} ${topics.join(', ')}`)
+    })
     const server = createServer(broker.handle)
     server.listen(mqttPort, mqttBrokerHost, () => {
       log(`MQTT broker listening: mqtt://${mqttBrokerHost}:${mqttPort}`)
@@ -232,11 +377,14 @@ function mqttEvent(type: string, text: string, values: Partial<NukoeviMqttEvent>
   }
 }
 
-async function publishMqtt(topic: string, event: NukoeviMqttEvent) {
+async function publishMqtt(topic: string, event: NukoeviMqttEvent, qos: MqttQos = 0) {
   const client = await ensureMqtt()
   if (!client) return
-  client.publish(topic, JSON.stringify(event), { qos: 0 }, err => {
-    if (err) log(`MQTT publish failed: ${topic} ${err}`)
+  await new Promise<void>(resolve => {
+    client.publish(topic, JSON.stringify(event), { qos }, err => {
+      if (err) log(`MQTT publish failed: ${topic} ${err}`)
+      resolve()
+    })
   })
 }
 
@@ -270,7 +418,7 @@ function consumeLocalOutput(event: NukoeviMqttEvent) {
 async function publishMqttOutputAudio(event: NukoeviMqttEvent) {
   mqttOutputAudioCount += 1
   lastMqttOutputAudio = event
-  await publishMqtt(mqttOutputAudioTopic, event)
+  await publishMqtt(mqttOutputAudioTopic, event, mqttAudioQos)
 }
 
 async function publishStackChanState(state: string, values: Partial<NukoeviMqttEvent> = {}) {
@@ -315,7 +463,7 @@ async function handleMqttState(raw: string) {
   mqttStateCount += 1
   lastMqttState = event
   recentMqttStates.push(event)
-  while (recentMqttStates.length > 20) {
+  while (recentMqttStates.length > 80) {
     recentMqttStates.shift()
   }
 }
@@ -333,6 +481,16 @@ async function handleMqttInput(raw: string) {
 
   const text = normalizeText(String(event.text ?? ''))
   if (!text) return
+  if (
+    event.source === 'stackchan' &&
+    lastDirectStackChanInput &&
+    lastDirectStackChanInput.text === text &&
+    normalizeDeviceId(lastDirectStackChanInput.deviceId) === normalizeDeviceId(event.device_id ?? event.source ?? 'mqtt') &&
+    Date.now() - lastDirectStackChanInput.ts < 5000
+  ) {
+    log(`MQTT input skipped duplicate: ${text}`)
+    return
+  }
   mqttInputCount += 1
   lastMqttInput = event
 
@@ -408,6 +566,10 @@ function normalizeText(text: string) {
   return text.replace(/\s+/g, ' ').trim()
 }
 
+function normalizeDeviceId(value: string) {
+  return value.replace(/[^0-9a-f]/gi, '').toLowerCase()
+}
+
 function sendStackChanText(ws: ServerWebSocket<StackChanConnection>, sessionId: string, text: string, role: 'user' | 'assistant') {
   const normalized = normalizeText(text)
   if (!normalized) return
@@ -423,6 +585,13 @@ function sendStackChanText(ws: ServerWebSocket<StackChanConnection>, sessionId: 
 
 function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function waitForStackChanAudioSockets(timeoutMs: number) {
+  const started = Date.now()
+  while (stackChanAudioSockets.size === 0 && Date.now() - started < timeoutMs) {
+    await sleep(50)
+  }
 }
 
 function concatUint8Arrays(chunks: Uint8Array[]) {
@@ -531,8 +700,8 @@ function buildIrodoriSynthesisUrl(text: string, steps: string, seconds?: string)
   return url
 }
 
-async function requestIrodoriSynthesis(url: URL, label: string) {
-  const response = await fetch(url)
+async function requestIrodoriSynthesis(url: URL, label: string, signal?: AbortSignal) {
+  const response = await fetch(url, { signal })
   const body = await response.text()
   if (!response.ok) {
     throw new Error(`Irodori ${label} failed: ${response.status} ${body}`)
@@ -543,6 +712,16 @@ async function requestIrodoriSynthesis(url: URL, label: string) {
     throw new Error(`Irodori ${label} failed: ${json.error ?? body}`)
   }
   return json
+}
+
+function cancelIrodoriWarmup(reason: string) {
+  if (!irodoriWarmupInFlight || !irodoriWarmupAbortController) return
+  lastIrodoriWarmup = {
+    state: 'canceled',
+    reason,
+    ts: nowIso(),
+  }
+  irodoriWarmupAbortController.abort(reason)
 }
 
 async function warmIrodoriTts() {
@@ -564,14 +743,19 @@ async function warmIrodoriTts() {
     const started = Date.now()
     lastIrodoriWarmupAt = started
     lastIrodoriWarmup = { state: 'started', ts: nowIso() }
+    const controller = new AbortController()
+    irodoriWarmupAbortController = controller
     const url = buildIrodoriSynthesisUrl(irodoriTtsWarmupText, irodoriTtsWarmupSteps, '')
-    await requestIrodoriSynthesis(url, 'warmup')
+    await requestIrodoriSynthesis(url, 'warmup', controller.signal)
     lastIrodoriWarmup = {
       state: 'ok',
       durationMs: Date.now() - started,
       ts: nowIso(),
     }
   })().catch(err => {
+    if (irodoriWarmupAbortController?.signal.aborted) {
+      return
+    }
     lastIrodoriWarmup = {
       state: 'failed',
       reason: String(err),
@@ -580,12 +764,14 @@ async function warmIrodoriTts() {
     throw err
   }).finally(() => {
     irodoriWarmupInFlight = undefined
+    irodoriWarmupAbortController = undefined
   })
 
   await irodoriWarmupInFlight
 }
 
 async function synthesizeIrodoriMp3(text: string) {
+  cancelIrodoriWarmup('synthesis request started')
   const url = buildIrodoriSynthesisUrl(text, irodoriTtsSteps, irodoriTtsSeconds || undefined)
   const json = await requestIrodoriSynthesis(url, 'synthesis')
 
@@ -640,26 +826,109 @@ async function sendStackChanAssistantSafe(ws: ServerWebSocket<StackChanConnectio
 async function publishMqttAssistantAudio(text: string) {
   if (!mqttEnabled || !irodoriTtsEnabled) return
 
+  const audioId = randomUUID()
+  const started = Date.now()
+  const session: MqttAudioPublishSession = {
+    id: audioId,
+    text,
+    qos: mqttAudioQos,
+    frameDelayMs: irodoriTtsMqttFrameDelayMs,
+    total: 0,
+    published: 0,
+    startedAt: nowIso(),
+  }
+  recentMqttAudioPublishes.push(session)
+  while (recentMqttAudioPublishes.length > 12) {
+    recentMqttAudioPublishes.shift()
+  }
+
   try {
-    log(`Irodori MQTT TTS request: ${text}`)
+    log(`Irodori MQTT TTS request: ${audioId} ${text}`)
+    const synthesisStarted = Date.now()
+    session.synthesisStartedAt = nowIso()
     const mp3 = await synthesizeIrodoriMp3(text)
+    session.synthesisFinishedAt = nowIso()
+    session.synthesisDurationMs = Date.now() - synthesisStarted
+    const encodeStarted = Date.now()
     const packets = encodeMp3ToOpusPackets(mp3)
-    log(`Irodori MQTT TTS packets: ${packets.length}`)
-    for (let i = 0; i < packets.length; i++) {
-      await publishMqttOutputAudio(mqttEvent('output.audio.opus', text, {
-        source: 'stackchan-relay',
-        target: 'stackchan',
+    session.encodeDurationMs = Date.now() - encodeStarted
+    session.total = packets.length
+    session.publishStartedAt = nowIso()
+    const publishStarted = Date.now()
+    if (stackChanAudioSockets.size === 0 && stackChanAudioWsWaitMs > 0) {
+      await waitForStackChanAudioSockets(stackChanAudioWsWaitMs)
+    }
+
+    const audioSockets = Array.from(stackChanAudioSockets)
+    if (audioSockets.length > 0) {
+      session.transport = 'ws'
+      session.frameDelayMs = irodoriTtsFrameDelayMs
+      const startMessage = JSON.stringify({
+        type: 'audio.start',
+        audio_id: audioId,
+        text,
         sample_rate: 16000,
         frame_duration: 60,
-        sequence: i,
         total: packets.length,
-        payload: Buffer.from(packets[i]).toString('base64'),
-      }))
-      if (irodoriTtsFrameDelayMs > 0) {
-        await sleep(irodoriTtsFrameDelayMs)
+      })
+      const stopMessage = JSON.stringify({
+        type: 'audio.stop',
+        audio_id: audioId,
+        total: packets.length,
+      })
+      log(`Irodori WS TTS packets: ${audioId} total=${packets.length} clients=${audioSockets.length} delay=${irodoriTtsFrameDelayMs} synthesis=${session.synthesisDurationMs} encode=${session.encodeDurationMs}`)
+      for (const ws of audioSockets) {
+        ws.send(startMessage)
+      }
+      for (let i = 0; i < packets.length; i++) {
+        if (i === 0) {
+          session.firstFrameAt = nowIso()
+        }
+        for (const ws of audioSockets) {
+          ws.send(packets[i])
+        }
+        session.published = i + 1
+        session.lastFrameAt = nowIso()
+        if (irodoriTtsFrameDelayMs > 0) {
+          await sleep(irodoriTtsFrameDelayMs)
+        }
+      }
+      for (const ws of audioSockets) {
+        ws.send(stopMessage)
+      }
+    } else {
+      session.transport = 'mqtt'
+      log(`Irodori MQTT TTS packets: ${audioId} total=${packets.length} qos=${mqttAudioQos} delay=${irodoriTtsMqttFrameDelayMs} synthesis=${session.synthesisDurationMs} encode=${session.encodeDurationMs}`)
+      for (let i = 0; i < packets.length; i++) {
+        if (i === 0) {
+          session.firstFrameAt = nowIso()
+        }
+        await publishMqttOutputAudio(mqttEvent('output.audio.opus', text, {
+          source: 'stackchan-relay',
+          target: 'stackchan',
+          sample_rate: 16000,
+          frame_duration: 60,
+          audio_id: audioId,
+          sequence: i,
+          total: packets.length,
+          payload: Buffer.from(packets[i]).toString('base64'),
+        }))
+        session.published = i + 1
+        session.lastFrameAt = nowIso()
+        if (irodoriTtsMqttFrameDelayMs > 0) {
+          await sleep(irodoriTtsMqttFrameDelayMs)
+        }
       }
     }
+    session.publishFinishedAt = nowIso()
+    session.publishDurationMs = Date.now() - publishStarted
+    session.finishedAt = nowIso()
+    session.durationMs = Date.now() - started
+    log(`Irodori ${session.transport?.toUpperCase() ?? 'AUDIO'} TTS published: ${audioId} total=${session.total} duration=${session.durationMs} synthesis=${session.synthesisDurationMs} publish=${session.publishDurationMs}`)
   } catch (err) {
+    session.error = String(err)
+    session.finishedAt = nowIso()
+    session.durationMs = Date.now() - started
     log(`Irodori MQTT TTS skipped: ${err}`)
   }
 }
@@ -837,8 +1106,23 @@ function cachedLocalOtaResponse(req: Request) {
   return localOtaResponse({}, config.version)
 }
 
-async function emitChannel(text: string, meta: Record<string, string>) {
-  lastChannelEmit = { text, meta, ts: nowIso() }
+async function emitClaudeCodeChannel(text: string, meta: Record<string, string>) {
+  await mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: text,
+      meta: {
+        request_id: meta.request_id ?? randomUUID(),
+        session_id: meta.session_id ?? 'stackchan',
+        device_id: meta.device_id ?? 'stackchan',
+        user: meta.user ?? 'stackchan',
+        ts: nowIso(),
+      },
+    },
+  })
+}
+
+function emitEvictlChannel(text: string, meta: Record<string, string>) {
   const requestId = meta.request_id ?? randomUUID()
   const source = meta.source ?? 'stackchan'
   const sessionId = meta.session_id ?? 'stackchan'
@@ -859,6 +1143,15 @@ async function emitChannel(text: string, meta: Record<string, string>) {
   if (result.status !== 0) {
     throw new Error(`evictl send failed: ${result.stderr || result.stdout}`)
   }
+}
+
+async function emitChannel(text: string, meta: Record<string, string>) {
+  lastChannelEmit = { text, meta, transport: stackChanAgentTransport, ts: nowIso() }
+  if (stackChanAgentTransport === 'evictl') {
+    emitEvictlChannel(text, meta)
+    return
+  }
+  await emitClaudeCodeChannel(text, meta)
 }
 
 async function askClaude(text: string, socket: ServerWebSocket<StackChanConnection> | undefined, sessionId: string, deviceId: string): Promise<string> {
@@ -977,6 +1270,15 @@ class UpstreamConnection {
 
   private handleMessage(data: unknown) {
     if (typeof data !== 'string') {
+      const bytes = data instanceof ArrayBuffer ? data.byteLength : data instanceof Uint8Array ? data.byteLength : 0
+      xiaozhiAudioFramesOut += 1
+      xiaozhiAudioBytesOut += bytes
+      lastXiaozhiAudioOut = {
+        bytes,
+        ts: nowIso(),
+        sessionId: this.local.data.sessionId,
+        deviceId: this.local.data.deviceId,
+      }
       if (!this.suppressResponse) this.local.send(data as ArrayBuffer)
       return
     }
@@ -988,6 +1290,21 @@ class UpstreamConnection {
       if (!this.suppressResponse) this.local.send(data)
       return
     }
+
+    lastUpstreamTextMessage = {
+      type: message.type,
+      state: message.state,
+      textPreview: message.text ? normalizeText(message.text).slice(0, 120) : undefined,
+      hasText: Boolean(message.text),
+      ts: nowIso(),
+      sessionId: this.local.data.sessionId,
+      deviceId: this.local.data.deviceId,
+    }
+    recentUpstreamTextMessages.push(lastUpstreamTextMessage)
+    while (recentUpstreamTextMessages.length > 20) recentUpstreamTextMessages.shift()
+    log(
+      `upstream -> xiaozhi: type=${message.type ?? ''} state=${message.state ?? ''} text=${lastUpstreamTextMessage.textPreview ?? ''}`,
+    )
 
     if (message.type === 'hello') {
       if (message.session_id) this.local.data.sessionId = message.session_id
@@ -1002,9 +1319,20 @@ class UpstreamConnection {
       sendStackChanText(this.local, this.local.data.sessionId, transcript, 'user')
       if (!this.local.data.claudeAsked) {
         this.local.data.claudeAsked = true
+        lastDirectStackChanInput = {
+          text: transcript,
+          sessionId: this.local.data.sessionId,
+          deviceId: this.local.data.deviceId,
+          ts: Date.now(),
+        }
+        void askClaude(transcript, this.local, this.local.data.sessionId, this.local.data.deviceId)
+          .then(reply => sendStackChanAssistantSafe(this.local, reply))
+          .catch(err => {
+            log(`failed to deliver StackChan STT to Claude: ${err}`)
+          })
+          .finally(() => finishStackChanTurn(this.local))
         this.suppressResponse = true
         this.abortUpstream()
-        finishStackChanTurn(this.local)
       }
       return
     }
@@ -1087,7 +1415,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   })
   rememberLocalOutput(event)
   await publishMqttOutput(event)
-  void speakStackChanAssistant(text, false)
+  if (!entry.socket) {
+    void speakStackChanAssistant(text, false)
+  }
   entry.resolve(text)
   return { content: [{ type: 'text', text: 'sent' }] }
 })
@@ -1127,6 +1457,7 @@ Bun.serve<StackChanConnection>({
       return Response.json({
         status: 'ok',
         upstreamOtaUrl,
+        agentTransport: stackChanAgentTransport,
         mqtt: {
           enabled: mqttEnabled,
           embedded: mqttEmbedded,
@@ -1136,8 +1467,18 @@ Bun.serve<StackChanConnection>({
           outputTopic: mqttOutputTopic,
           outputAudioTopic: mqttOutputAudioTopic,
           stateTopic: mqttStateTopic,
+          audioQos: mqttAudioQos,
+          brokerClients: Array.from(mqttBrokerClients),
+          brokerSubscriptions: Object.fromEntries(mqttBrokerSubscriptions),
+          recentBrokerEvents: recentMqttBrokerEvents,
+        },
+        irodoriTts: {
+          frameDelayMs: irodoriTtsFrameDelayMs,
+          mqttFrameDelayMs: irodoriTtsMqttFrameDelayMs,
+          audioWsWaitMs: stackChanAudioWsWaitMs,
         },
         stackChanClients: stackChanSockets.size,
+        stackChanAudioClients: stackChanAudioSockets.size,
         pendingRequests: pending.size,
         pendingAssistantSpeech: pendingAssistantSpeech.length,
         pendingMqttAssistantAudio: pendingMqttAssistantAudio.length,
@@ -1151,12 +1492,27 @@ Bun.serve<StackChanConnection>({
         mqttOutputCount,
         mqttOutputAudioCount,
         mqttStateCount,
+        xiaozhiAudio: {
+          framesIn: xiaozhiAudioFramesIn,
+          bytesIn: xiaozhiAudioBytesIn,
+          framesOut: xiaozhiAudioFramesOut,
+          bytesOut: xiaozhiAudioBytesOut,
+          lastIn: lastXiaozhiAudioIn,
+          lastOut: lastXiaozhiAudioOut,
+          lastUpstreamTextMessage,
+          recentUpstreamTextMessages,
+          listening: xiaozhiListening,
+          framesAfterLastStop: xiaozhiAudioFramesIn - xiaozhiFramesInAtLastStop,
+          bytesAfterLastStop: xiaozhiAudioBytesIn - xiaozhiBytesInAtLastStop,
+          recentEvents: recentXiaozhiEvents,
+        },
         lastMqttInput,
         lastMqttOutput,
         lastMqttOutputAudio,
         lastMqttState,
         lastAssistantSpeech,
         recentMqttStates,
+        recentMqttAudioPublishes,
         lastChannelEmit,
       })
     }
@@ -1187,6 +1543,18 @@ Bun.serve<StackChanConnection>({
     }
     if (url.pathname === '/xiaozhi' && server.upgrade(req, {
       data: {
+        kind: 'xiaozhi',
+        sessionId: randomUUID(),
+        deviceId: req.headers.get('device-id') ?? req.headers.get('Device-Id') ?? 'stackchan',
+        clientId: req.headers.get('client-id') ?? req.headers.get('Client-Id') ?? randomUUID(),
+        protocolVersion: req.headers.get('protocol-version') ?? req.headers.get('Protocol-Version') ?? '1',
+      },
+    })) {
+      return undefined
+    }
+    if (url.pathname === '/audio' && server.upgrade(req, {
+      data: {
+        kind: 'audio',
         sessionId: randomUUID(),
         deviceId: req.headers.get('device-id') ?? req.headers.get('Device-Id') ?? 'stackchan',
         clientId: req.headers.get('client-id') ?? req.headers.get('Client-Id') ?? randomUUID(),
@@ -1199,6 +1567,11 @@ Bun.serve<StackChanConnection>({
   },
   websocket: {
     open(ws) {
+      if (ws.data.kind === 'audio') {
+        stackChanAudioSockets.add(ws)
+        log(`audio connected ${ws.data.deviceId} session=${ws.data.sessionId}`)
+        return
+      }
       stackChanSockets.add(ws)
       log(`connected ${ws.data.deviceId} session=${ws.data.sessionId}`)
       void publishStackChanState('connected', {
@@ -1211,6 +1584,9 @@ Bun.serve<StackChanConnection>({
       }, 500)
     },
     async message(ws, message) {
+      if (ws.data.kind === 'audio') {
+        return
+      }
       const config = upstreamConfigs.get(ws.data.deviceId) ?? upstreamConfigs.get('stackchan')
       if (!config) {
         sendStackChanText(ws, ws.data.sessionId, '標準 AI Agent の接続情報がまだ取れてないの。もう一回起動してね。', 'assistant')
@@ -1230,6 +1606,13 @@ Bun.serve<StackChanConnection>({
           if (parsed.type === 'listen' && parsed.state === 'start') {
             ws.data.transcript = undefined
             ws.data.claudeAsked = false
+            xiaozhiListening = true
+            pushXiaozhiEvent({
+              type: parsed.type,
+              state: parsed.state,
+              sessionId: ws.data.sessionId,
+              deviceId: ws.data.deviceId,
+            })
             void warmIrodoriTts().catch(err => {
               log(`Irodori warmup skipped: ${err}`)
             })
@@ -1240,6 +1623,15 @@ Bun.serve<StackChanConnection>({
             })
           }
           if (parsed.type === 'listen' && parsed.state === 'stop') {
+            xiaozhiListening = false
+            xiaozhiFramesInAtLastStop = xiaozhiAudioFramesIn
+            xiaozhiBytesInAtLastStop = xiaozhiAudioBytesIn
+            pushXiaozhiEvent({
+              type: parsed.type,
+              state: parsed.state,
+              sessionId: ws.data.sessionId,
+              deviceId: ws.data.deviceId,
+            })
             void publishStackChanState('idle', {
               source: 'stackchan',
               session_id: ws.data.sessionId,
@@ -1251,6 +1643,14 @@ Bun.serve<StackChanConnection>({
           return
         }
         const payload = message instanceof ArrayBuffer ? message : message.slice().buffer
+        xiaozhiAudioFramesIn += 1
+        xiaozhiAudioBytesIn += payload.byteLength
+        lastXiaozhiAudioIn = {
+          bytes: payload.byteLength,
+          ts: nowIso(),
+          sessionId: ws.data.sessionId,
+          deviceId: ws.data.deviceId,
+        }
         await ws.data.upstream.send(payload)
       } catch (err) {
         log(`upstream send failed: ${err}`)
@@ -1258,6 +1658,11 @@ Bun.serve<StackChanConnection>({
       }
     },
     close(ws, code, reason) {
+      if (ws.data.kind === 'audio') {
+        stackChanAudioSockets.delete(ws)
+        log(`audio disconnected ${ws.data.deviceId} code=${code} reason=${reason}`)
+        return
+      }
       stackChanSockets.delete(ws)
       ws.data.upstream?.close()
       log(`disconnected ${ws.data.deviceId} code=${code} reason=${reason}`)
