@@ -42,6 +42,7 @@ const irodoriTtsEnabled = process.env.STACKCHAN_IRODORI_TTS_ENABLED !== '0'
 const irodoriTtsFrameDelayMs = Number(process.env.STACKCHAN_IRODORI_TTS_FRAME_DELAY_MS ?? '55')
 const irodoriTtsMqttFrameDelayMs = Number(process.env.STACKCHAN_IRODORI_TTS_MQTT_FRAME_DELAY_MS ?? '90')
 const stackChanAudioWsWaitMs = Number(process.env.STACKCHAN_AUDIO_WS_WAIT_MS ?? '1500')
+const xiaozhiListeningStaleMs = Number(process.env.STACKCHAN_XIAOZHI_LISTENING_STALE_MS ?? '120000')
 const irodoriTtsWarmupText = process.env.STACKCHAN_IRODORI_TTS_WARMUP_TEXT ?? 'あ'
 const irodoriTtsWarmupSteps = process.env.STACKCHAN_IRODORI_TTS_WARMUP_STEPS ?? '4'
 const irodoriTtsWarmupCooldownMs = Number(process.env.STACKCHAN_IRODORI_TTS_WARMUP_COOLDOWN_MS ?? '60000')
@@ -212,6 +213,9 @@ const recentUpstreamTextMessages: Array<{
   deviceId: string
 }> = []
 let xiaozhiListening = false
+let xiaozhiListeningStartedAt = 0
+let xiaozhiListeningSessionId = ''
+let xiaozhiListeningDeviceId = ''
 let xiaozhiFramesInAtLastStop = 0
 let xiaozhiBytesInAtLastStop = 0
 const recentMqttStates: NukoeviMqttEvent[] = []
@@ -222,6 +226,7 @@ const recentMqttBrokerEvents: MqttBrokerEvent[] = []
 const recentXiaozhiEvents: Array<{
   type: string
   state?: string
+  reason?: string
   framesIn: number
   bytesIn: number
   ts: string
@@ -233,6 +238,7 @@ let lastChannelEmit: { text: string; meta: Record<string, string>; transport: St
 function pushXiaozhiEvent(event: {
   type: string
   state?: string
+  reason?: string
   sessionId: string
   deviceId: string
 }) {
@@ -243,6 +249,42 @@ function pushXiaozhiEvent(event: {
     ts: nowIso(),
   })
   while (recentXiaozhiEvents.length > 20) recentXiaozhiEvents.shift()
+}
+
+function markXiaozhiListening(sessionId: string, deviceId: string) {
+  xiaozhiListening = true
+  xiaozhiListeningStartedAt = Date.now()
+  xiaozhiListeningSessionId = sessionId
+  xiaozhiListeningDeviceId = deviceId
+  pushXiaozhiEvent({
+    type: 'listen',
+    state: 'start',
+    sessionId,
+    deviceId,
+  })
+}
+
+function clearXiaozhiListening(reason: string, sessionId = xiaozhiListeningSessionId, deviceId = xiaozhiListeningDeviceId) {
+  if (!xiaozhiListening && xiaozhiListeningStartedAt === 0) return
+  xiaozhiListening = false
+  xiaozhiListeningStartedAt = 0
+  xiaozhiListeningSessionId = ''
+  xiaozhiListeningDeviceId = ''
+  xiaozhiFramesInAtLastStop = xiaozhiAudioFramesIn
+  xiaozhiBytesInAtLastStop = xiaozhiAudioBytesIn
+  pushXiaozhiEvent({
+    type: 'listen',
+    state: 'stop',
+    reason,
+    sessionId: sessionId || 'unknown',
+    deviceId: deviceId || 'unknown',
+  })
+}
+
+function refreshXiaozhiListeningState() {
+  if (!xiaozhiListening || xiaozhiListeningStartedAt === 0) return
+  if (Date.now() - xiaozhiListeningStartedAt < xiaozhiListeningStaleMs) return
+  clearXiaozhiListening('stale-timeout')
 }
 
 function pushMqttBrokerEvent(event: Omit<MqttBrokerEvent, 'ts'>) {
@@ -1456,6 +1498,8 @@ Bun.serve<StackChanConnection>({
   async fetch(req, server) {
     const url = new URL(req.url)
     if (url.pathname === '/health') {
+      refreshXiaozhiListeningState()
+      const xiaozhiListeningAgeMs = xiaozhiListeningStartedAt === 0 ? 0 : Date.now() - xiaozhiListeningStartedAt
       return Response.json({
         status: 'ok',
         upstreamOtaUrl,
@@ -1505,6 +1549,9 @@ Bun.serve<StackChanConnection>({
           lastUpstreamTextMessage,
           recentUpstreamTextMessages,
           listening: xiaozhiListening,
+          listeningStartedAt: xiaozhiListeningStartedAt === 0 ? undefined : new Date(xiaozhiListeningStartedAt).toISOString(),
+          listeningAgeMs: xiaozhiListeningAgeMs,
+          listeningStaleMs: xiaozhiListeningStaleMs,
           framesAfterLastStop: xiaozhiAudioFramesIn - xiaozhiFramesInAtLastStop,
           bytesAfterLastStop: xiaozhiAudioBytesIn - xiaozhiBytesInAtLastStop,
           recentEvents: recentXiaozhiEvents,
@@ -1609,13 +1656,7 @@ Bun.serve<StackChanConnection>({
           if (parsed.type === 'listen' && parsed.state === 'start') {
             ws.data.transcript = undefined
             ws.data.claudeAsked = false
-            xiaozhiListening = true
-            pushXiaozhiEvent({
-              type: parsed.type,
-              state: parsed.state,
-              sessionId: ws.data.sessionId,
-              deviceId: ws.data.deviceId,
-            })
+            markXiaozhiListening(ws.data.sessionId, ws.data.deviceId)
             void warmIrodoriTts().catch(err => {
               log(`Irodori warmup skipped: ${err}`)
             })
@@ -1626,15 +1667,7 @@ Bun.serve<StackChanConnection>({
             })
           }
           if (parsed.type === 'listen' && parsed.state === 'stop') {
-            xiaozhiListening = false
-            xiaozhiFramesInAtLastStop = xiaozhiAudioFramesIn
-            xiaozhiBytesInAtLastStop = xiaozhiAudioBytesIn
-            pushXiaozhiEvent({
-              type: parsed.type,
-              state: parsed.state,
-              sessionId: ws.data.sessionId,
-              deviceId: ws.data.deviceId,
-            })
+            clearXiaozhiListening('client-stop', ws.data.sessionId, ws.data.deviceId)
             void publishStackChanState('idle', {
               source: 'stackchan',
               session_id: ws.data.sessionId,
@@ -1668,6 +1701,7 @@ Bun.serve<StackChanConnection>({
       }
       stackChanSockets.delete(ws)
       ws.data.upstream?.close()
+      clearXiaozhiListening('socket-close', ws.data.sessionId, ws.data.deviceId)
       log(`disconnected ${ws.data.deviceId} code=${code} reason=${reason}`)
       void publishStackChanState('disconnected', {
         source: 'stackchan',
