@@ -214,6 +214,11 @@ static bool _xiaozhi_stop_listening_scheduled = false;
 static void _xiaozhi_start_listening_task(void*)
 {
     vTaskDelay(pdMS_TO_TICKS(200));
+    if (!_xiaozhi_start_listening_scheduled) {
+        vTaskDelete(nullptr);
+        return;
+    }
+
     Application::GetInstance().StartListening();
     _xiaozhi_start_listening_scheduled = false;
     vTaskDelete(nullptr);
@@ -279,6 +284,7 @@ void Hal::requestXiaozhiListening()
 void Hal::stopXiaozhiListening()
 {
     _xiaozhi_listen_requested = false;
+    _xiaozhi_start_listening_scheduled = false;
     if (!_xiaozhi_background_started) {
         return;
     }

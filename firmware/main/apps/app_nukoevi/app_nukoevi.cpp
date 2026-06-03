@@ -9,12 +9,14 @@
 #include <application.h>
 #include <lvgl.h>
 #include <mqtt.h>
+#include <web_socket.h>
 #include <mooncake.h>
 #include <mooncake_log.h>
 #include <stackchan/stackchan.h>
 #include <ArduinoJson.hpp>
 #include <algorithm>
 #include <array>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -110,6 +112,11 @@ static bool _listen_indicator_visible = false;
 static MicButtonState _mic_button_state_requested = MicButtonState::Idle;
 static MicButtonState _mic_button_state_visible = MicButtonState::Idle;
 static uint32_t _mic_button_event_at = 0;
+static bool _mic_press_active = false;
+static uint32_t _mic_pressed_at = 0;
+static bool _xiaozhi_listening_started = false;
+static bool _xiaozhi_text_waiting = false;
+static uint32_t _xiaozhi_text_waiting_at = 0;
 static bool _touch_point_active = false;
 static uint32_t _touch_point_published_at = 0;
 static int _last_touch_point_x = -1;
@@ -121,6 +128,8 @@ static bool _sleep_mode = false;
 static uint8_t _sleep_index = 0;
 static uint32_t _sleep_timecount = 0;
 static constexpr uint32_t _caption_auto_hide_ms = 15000;
+static constexpr uint32_t _xiaozhi_text_timeout_ms = 4000;
+static constexpr uint32_t _mic_min_hold_ms = 600;
 static constexpr int _caption_width       = 316;
 static constexpr int _caption_label_width = 300;
 static constexpr int _top_mark_size = 54;
@@ -150,8 +159,31 @@ static std::mutex _mqtt_output_mutex;
 static std::queue<std::string> _mqtt_output_messages;
 static bool _mqtt_output_connecting = false;
 static uint32_t _mqtt_output_last_connect_at = 0;
+static std::mutex _mqtt_audio_queue_mutex;
+static std::condition_variable _mqtt_audio_queue_cv;
+static std::queue<std::unique_ptr<AudioStreamPacket>> _mqtt_audio_packets;
+static TaskHandle_t _mqtt_audio_task_handle = nullptr;
+static constexpr size_t _mqtt_audio_queue_limit = 160;
+static std::string _mqtt_audio_id;
+static int _mqtt_audio_expected_sequence = 0;
+static int _mqtt_audio_total = 0;
+static int _mqtt_audio_received = 0;
+static int _mqtt_audio_gaps = 0;
+static std::mutex _audio_ws_mutex;
+static std::unique_ptr<WebSocket> _audio_ws_client;
+static bool _audio_ws_connecting = false;
+static bool _audio_ws_requested = false;
+static bool _audio_ws_close_requested = false;
+static uint32_t _audio_ws_last_connect_at = 0;
+static std::string _audio_ws_audio_id;
+static int _audio_ws_sample_rate = 16000;
+static int _audio_ws_frame_duration = 60;
+static int _audio_ws_total = 0;
+static int _audio_ws_received = 0;
 static constexpr const char* _mqtt_output_broker_host = "192.168.1.10";
 static constexpr int _mqtt_output_broker_port = 18883;
+static constexpr const char* _audio_ws_host = "192.168.1.10";
+static constexpr int _audio_ws_port = 18080;
 static constexpr const char* _mqtt_input_topic = "nukoevi/input/text";
 static constexpr const char* _mqtt_output_topic = "nukoevi/output/text";
 static constexpr const char* _mqtt_output_audio_topic = "nukoevi/output/audio/opus";
@@ -175,6 +207,7 @@ static const uint32_t _sleep_intervals[] = {
 static void begin_xiaozhi_voice_input();
 static void end_xiaozhi_voice_input();
 static void handle_mic_button_event(lv_event_t* event);
+static void request_xiaozhi_stop_listening(const char* reason);
 static void begin_evictl_camera_task();
 static void publish_mqtt_input(const std::string& text, const char* role = nullptr);
 static void publish_mqtt_state(const char* event_type, const std::string& text, const char* role = nullptr);
@@ -221,6 +254,8 @@ static void enqueue_mqtt_output_payload(const std::string& payload)
     }
     _mqtt_output_messages.emplace(text);
 
+    _audio_ws_requested = true;
+    _audio_ws_close_requested = false;
     GetHAL().startXiaozhiBackground();
 }
 
@@ -230,7 +265,8 @@ static void mark_audio_playback_active(int sequence, int total, int frame_durati
     uint32_t active_ms = 2500;
     if (sequence >= 0 && total > 0 && sequence < total && frame_duration > 0) {
         const uint32_t remaining = static_cast<uint32_t>(total - sequence);
-        active_ms = std::min<uint32_t>(remaining * static_cast<uint32_t>(frame_duration) + 1500, 120000);
+        const uint32_t frame_ms = std::max<uint32_t>(static_cast<uint32_t>(frame_duration), 100);
+        active_ms = std::min<uint32_t>(remaining * frame_ms + 4000, 120000);
     }
 
     std::lock_guard<std::mutex> lock(_audio_playback_mutex);
@@ -241,6 +277,107 @@ static bool is_audio_playback_active(uint32_t now)
 {
     std::lock_guard<std::mutex> lock(_audio_playback_mutex);
     return _audio_playback_until != 0 && static_cast<int32_t>(_audio_playback_until - now) > 0;
+}
+
+static void track_mqtt_audio_packet(const char* audio_id, int sequence, int total, size_t decoded_size)
+{
+    const bool new_stream = sequence == 0 || _mqtt_audio_id != audio_id;
+    if (new_stream) {
+        _mqtt_audio_id = audio_id;
+        _mqtt_audio_expected_sequence = 0;
+        _mqtt_audio_total = total;
+        _mqtt_audio_received = 0;
+        _mqtt_audio_gaps = 0;
+
+        char status[160];
+        std::snprintf(status, sizeof(status), "id=%s total=%d bytes=%u", audio_id, total,
+                      static_cast<unsigned>(decoded_size));
+        publish_mqtt_state("audio.opus.start", status);
+    }
+
+    if (sequence >= 0) {
+        if (sequence != _mqtt_audio_expected_sequence) {
+            _mqtt_audio_gaps++;
+            char status[160];
+            std::snprintf(status, sizeof(status), "id=%s expected=%d got=%d total=%d", audio_id,
+                          _mqtt_audio_expected_sequence, sequence, total);
+            publish_mqtt_state("audio.opus.gap", status);
+        }
+        _mqtt_audio_expected_sequence = sequence + 1;
+        _mqtt_audio_received++;
+    }
+
+    if (total > 0 && sequence == total - 1) {
+        char status[160];
+        std::snprintf(status, sizeof(status), "id=%s total=%d received=%d gaps=%d", audio_id, total,
+                      _mqtt_audio_received, _mqtt_audio_gaps);
+        publish_mqtt_state("audio.opus.done", status);
+    }
+}
+
+static void publish_mqtt_audio_interrupted()
+{
+    if (_mqtt_audio_id.empty() || _mqtt_audio_total <= 0 || _mqtt_audio_received >= _mqtt_audio_total) {
+        return;
+    }
+
+    char status[160];
+    std::snprintf(status, sizeof(status), "id=%s total=%d received=%d expected=%d gaps=%d",
+                  _mqtt_audio_id.c_str(), _mqtt_audio_total, _mqtt_audio_received, _mqtt_audio_expected_sequence,
+                  _mqtt_audio_gaps);
+    publish_mqtt_state("audio.opus.interrupted", status);
+    _mqtt_audio_total = _mqtt_audio_received;
+}
+
+static void mqtt_audio_decode_task(void*)
+{
+    while (true) {
+        std::unique_ptr<AudioStreamPacket> packet;
+        {
+            std::unique_lock<std::mutex> lock(_mqtt_audio_queue_mutex);
+            _mqtt_audio_queue_cv.wait(lock, []() { return !_mqtt_audio_packets.empty(); });
+            packet = std::move(_mqtt_audio_packets.front());
+            _mqtt_audio_packets.pop();
+        }
+
+        if (packet) {
+            Application::GetInstance().GetAudioService().PushPacketToDecodeQueue(std::move(packet), true);
+        }
+    }
+}
+
+static void start_mqtt_audio_decode_task()
+{
+    if (_mqtt_audio_task_handle) {
+        return;
+    }
+
+    if (xTaskCreate(mqtt_audio_decode_task, "nukoevi_audio", 8192, nullptr, 4, &_mqtt_audio_task_handle) != pdPASS) {
+        _mqtt_audio_task_handle = nullptr;
+        mclog::tagWarn("NUKOEVI", "MQTT audio decode task start failed");
+    }
+}
+
+static void enqueue_mqtt_audio_packet(std::unique_ptr<AudioStreamPacket> packet, const char* audio_id, int sequence,
+                                      int total)
+{
+    bool dropped = false;
+    {
+        std::lock_guard<std::mutex> lock(_mqtt_audio_queue_mutex);
+        if (_mqtt_audio_packets.size() >= _mqtt_audio_queue_limit) {
+            _mqtt_audio_packets.pop();
+            dropped = true;
+        }
+        _mqtt_audio_packets.push(std::move(packet));
+    }
+    _mqtt_audio_queue_cv.notify_one();
+
+    if (dropped) {
+        char status[160];
+        std::snprintf(status, sizeof(status), "id=%s seq=%d total=%d limit=%u", audio_id, sequence, total,
+                      static_cast<unsigned>(_mqtt_audio_queue_limit));
+        publish_mqtt_state("audio.opus.queue_drop", status);
+    }
 }
 
 static void handle_mqtt_audio_payload(const std::string& payload)
@@ -282,7 +419,9 @@ static void handle_mqtt_audio_payload(const std::string& payload)
     const int sequence = doc["sequence"] | -1;
     const int total = doc["total"] | 0;
     const int frame_duration = doc["frame_duration"] | 60;
+    const char* audio_id = doc["audio_id"] | "";
     mark_audio_playback_active(sequence, total, frame_duration);
+    track_mqtt_audio_packet(audio_id, sequence, total, decoded.size());
     if (sequence == 0 || (total > 0 && sequence == total - 1)) {
         char status[64];
         std::snprintf(status, sizeof(status), "seq=%d total=%d bytes=%u", sequence, total,
@@ -295,7 +434,63 @@ static void handle_mqtt_audio_payload(const std::string& payload)
     packet->frame_duration = frame_duration;
     packet->timestamp = doc["timestamp"] | 0;
     packet->payload = std::move(decoded);
-    Application::GetInstance().GetAudioService().PushPacketToDecodeQueue(std::move(packet), true);
+    enqueue_mqtt_audio_packet(std::move(packet), audio_id, sequence, total);
+}
+
+static void handle_audio_ws_text(const char* data, size_t len)
+{
+    ArduinoJson::JsonDocument doc;
+    auto error = ArduinoJson::deserializeJson(doc, data, len);
+    if (error) {
+        return;
+    }
+
+    const char* type = doc["type"] | "";
+    if (std::strcmp(type, "audio.start") == 0) {
+        _audio_ws_audio_id = doc["audio_id"] | "";
+        _audio_ws_sample_rate = doc["sample_rate"] | 16000;
+        _audio_ws_frame_duration = doc["frame_duration"] | 60;
+        _audio_ws_total = doc["total"] | 0;
+        _audio_ws_received = 0;
+
+        char status[160];
+        std::snprintf(status, sizeof(status), "id=%s total=%d", _audio_ws_audio_id.c_str(), _audio_ws_total);
+        publish_mqtt_state("audio.ws.start", status);
+        return;
+    }
+
+    if (std::strcmp(type, "audio.stop") == 0) {
+        char status[160];
+        std::snprintf(status, sizeof(status), "id=%s total=%d received=%d", _audio_ws_audio_id.c_str(),
+                      _audio_ws_total, _audio_ws_received);
+        publish_mqtt_state("audio.ws.done", status);
+        _audio_ws_requested = false;
+        _audio_ws_close_requested = true;
+        return;
+    }
+}
+
+static void handle_audio_ws_binary(const char* data, size_t len)
+{
+    if (!data || len == 0) {
+        return;
+    }
+
+    GetHAL().startXiaozhiBackground();
+
+    const int sequence = _audio_ws_received;
+    const int total = _audio_ws_total;
+    const char* audio_id = _audio_ws_audio_id.empty() ? "ws" : _audio_ws_audio_id.c_str();
+    mark_audio_playback_active(sequence, total, _audio_ws_frame_duration);
+    track_mqtt_audio_packet(audio_id, sequence, total, len);
+
+    auto packet = std::make_unique<AudioStreamPacket>();
+    packet->sample_rate = _audio_ws_sample_rate;
+    packet->frame_duration = _audio_ws_frame_duration;
+    packet->timestamp = 0;
+    packet->payload.assign(data, data + len);
+    enqueue_mqtt_audio_packet(std::move(packet), audio_id, sequence, total);
+    _audio_ws_received++;
 }
 
 static void publish_mqtt_state(const char* event_type, const std::string& text, const char* role)
@@ -316,7 +511,7 @@ static void publish_mqtt_state(const char* event_type, const std::string& text, 
 
     std::string payload;
     ArduinoJson::serializeJson(doc, payload);
-    _mqtt_output_client->Publish(_mqtt_state_topic, payload, 1);
+    _mqtt_output_client->Publish(_mqtt_state_topic, payload, 0);
 }
 
 static void publish_mqtt_input(const std::string& text, const char* role)
@@ -347,6 +542,108 @@ static void publish_mqtt_input(const std::string& text, const char* role)
     ArduinoJson::serializeJson(doc, payload);
     _mqtt_output_client->Publish(_mqtt_input_topic, payload, 1);
     publish_mqtt_state("mqtt.input.published", text, role);
+}
+
+static void close_audio_ws_receiver()
+{
+    std::lock_guard<std::mutex> lock(_audio_ws_mutex);
+    if (_audio_ws_client) {
+        _audio_ws_client->Close();
+        _audio_ws_client.reset();
+    }
+    _audio_ws_close_requested = false;
+}
+
+static void audio_ws_connect_task(void*)
+{
+    auto network = Board::GetInstance().GetNetwork();
+    if (!network) {
+        _audio_ws_connecting = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    auto ws = network->CreateWebSocket(3);
+    if (!ws) {
+        mclog::tagWarn("NUKOEVI", "audio websocket create failed");
+        _audio_ws_connecting = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    const auto device_id = GetHAL().getFactoryMacString();
+    ws->SetHeader("Device-Id", device_id.c_str());
+    ws->SetHeader("Client-Id", device_id.c_str());
+    ws->SetReceiveBufferSize(4096);
+    ws->OnConnected([]() { publish_mqtt_state("audio.ws.connected", "connected"); });
+    ws->OnDisconnected([]() { publish_mqtt_state("audio.ws.disconnected", "disconnected"); });
+    ws->OnError([](int error) {
+        char status[64];
+        std::snprintf(status, sizeof(status), "error=%d", error);
+        publish_mqtt_state("audio.ws.error", status);
+    });
+    ws->OnData([](const char* data, size_t len, bool binary) {
+        if (binary) {
+            handle_audio_ws_binary(data, len);
+            return;
+        }
+        handle_audio_ws_text(data, len);
+    });
+
+    if (!_audio_ws_requested) {
+        _audio_ws_connecting = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    const std::string url = fmt::format("ws://{}:{}/audio", _audio_ws_host, _audio_ws_port);
+    if (ws->Connect(url.c_str())) {
+        std::lock_guard<std::mutex> lock(_audio_ws_mutex);
+        if (_audio_ws_requested) {
+            _audio_ws_client = std::move(ws);
+        } else {
+            ws->Close();
+        }
+    } else {
+        mclog::tagWarn("NUKOEVI", "audio websocket connect failed");
+    }
+
+    _audio_ws_connecting = false;
+    vTaskDelete(nullptr);
+}
+
+static void ensure_audio_ws_receiver()
+{
+    if (_audio_ws_close_requested) {
+        close_audio_ws_receiver();
+    }
+    if (!_audio_ws_requested || _mic_press_active || _xiaozhi_interaction_requested || GetHAL().isXiaozhiListening()) {
+        return;
+    }
+    if (GetHAL().getWifiStatus() == WifiStatus::None) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(_audio_ws_mutex);
+        if (_audio_ws_client && _audio_ws_client->IsConnected()) {
+            return;
+        }
+    }
+    if (_audio_ws_connecting) {
+        return;
+    }
+
+    const auto now = GetHAL().millis();
+    if (_audio_ws_last_connect_at != 0 && now - _audio_ws_last_connect_at < 5000) {
+        return;
+    }
+    _audio_ws_last_connect_at = now;
+    _audio_ws_connecting = true;
+
+    if (xTaskCreate(audio_ws_connect_task, "nukoevi_audio_ws", 6144, nullptr, 3, nullptr) != pdPASS) {
+        _audio_ws_connecting = false;
+        mclog::tagWarn("NUKOEVI", "audio websocket task failed");
+    }
 }
 
 static void mqtt_output_connect_task(void*)
@@ -395,7 +692,8 @@ static void ensure_mqtt_output_receiver()
     _mqtt_output_client->OnConnected([]() {
         mclog::tagInfo("NUKOEVI", "MQTT output receiver connected");
         _mqtt_output_client->Subscribe(_mqtt_output_topic, 0);
-        _mqtt_output_client->Subscribe(_mqtt_output_audio_topic, 0);
+        _mqtt_output_client->Subscribe(_mqtt_output_audio_topic, 1);
+        publish_mqtt_audio_interrupted();
         publish_mqtt_state("mqtt.connected", "connected");
     });
     _mqtt_output_client->OnDisconnected([]() { mclog::tagInfo("NUKOEVI", "MQTT output receiver disconnected"); });
@@ -911,7 +1209,7 @@ static void begin_xiaozhi_voice_input()
     }
     _mic_button_event_at = now;
 
-    if (GetHAL().isXiaozhiListening() || _xiaozhi_interaction_requested) {
+    if (_mic_press_active || _xiaozhi_interaction_requested) {
         return;
     }
 
@@ -920,29 +1218,79 @@ static void begin_xiaozhi_voice_input()
         return;
     }
     _last_llm_request_at = now;
+    _audio_ws_requested = false;
+    _audio_ws_close_requested = true;
+    close_audio_ws_receiver();
+    _mic_press_active = true;
+    _mic_pressed_at = now;
     _xiaozhi_interaction_requested = true;
+    {
+        std::lock_guard<std::mutex> lock(_llm_mutex);
+        _xiaozhi_listening_started = false;
+        _xiaozhi_text_waiting = false;
+        _xiaozhi_text_waiting_at = 0;
+    }
     publish_mqtt_state("mic.pressed", "start");
     if (GetHAL().isXiaozhiSpeaking()) {
         set_mic_button_state_requested(MicButtonState::Starting);
         update_llm_status("キャンセル中");
     } else {
         set_mic_button_state_requested(MicButtonState::Starting);
-        update_llm_status("マイク準備中");
+        update_llm_status("マイク起動中");
     }
     GetHAL().requestXiaozhiListening();
 }
 
 static void end_xiaozhi_voice_input()
 {
-    if (!GetHAL().isXiaozhiListening() && !_xiaozhi_interaction_requested) {
+    if (!_mic_press_active) {
         return;
     }
 
+    const auto now = GetHAL().millis();
+    const bool too_short = _mic_pressed_at == 0 || now - _mic_pressed_at < _mic_min_hold_ms;
+    bool listening_started = false;
+    {
+        std::lock_guard<std::mutex> lock(_llm_mutex);
+        listening_started = _xiaozhi_listening_started;
+    }
+
+    _mic_press_active = false;
     publish_mqtt_state("mic.released", "stop");
+    if (too_short || !listening_started) {
+        set_listen_indicator_requested(false);
+        set_mic_button_state_requested(MicButtonState::Idle);
+        update_llm_status(too_short ? "もう少し長押ししてね" : "まだ起動中だよ");
+        {
+            std::lock_guard<std::mutex> lock(_llm_mutex);
+            _xiaozhi_listening_started = false;
+            _xiaozhi_text_waiting = false;
+            _xiaozhi_text_waiting_at = 0;
+        }
+        request_xiaozhi_stop_listening(too_short ? "short_press" : "not_listening");
+        publish_mqtt_state("mic.cancelled", too_short ? "short_press" : "not_listening");
+        _xiaozhi_interaction_requested = false;
+        _mic_pressed_at = 0;
+        return;
+    }
+
     set_mic_button_state_requested(MicButtonState::Starting);
     update_llm_status("送信中");
-    GetHAL().stopXiaozhiListening();
+    {
+        std::lock_guard<std::mutex> lock(_llm_mutex);
+        _xiaozhi_text_waiting = true;
+        _xiaozhi_text_waiting_at = GetHAL().millis();
+    }
+    request_xiaozhi_stop_listening("release");
     _xiaozhi_interaction_requested = false;
+    _mic_pressed_at = 0;
+}
+
+static void request_xiaozhi_stop_listening(const char* reason)
+{
+    publish_mqtt_state("xiaozhi.stop.requested", reason);
+    Application::GetInstance().StopListening();
+    GetHAL().stopXiaozhiListening();
 }
 
 static void handle_mic_button_event(lv_event_t* event)
@@ -985,6 +1333,7 @@ static void handle_xiaozhi_status(std::string_view status)
     publish_mqtt_state("xiaozhi.status", std::string(status));
     if (status == "Listening...") {
         std::lock_guard<std::mutex> lock(_llm_mutex);
+        _xiaozhi_listening_started = true;
         _listen_indicator_requested = true;
         _mic_button_state_requested = MicButtonState::Listening;
         _llm_status = "聞いてるよ〜";
@@ -997,7 +1346,7 @@ static void handle_xiaozhi_status(std::string_view status)
         set_listen_indicator_requested(false);
         if (_xiaozhi_interaction_requested) {
             set_mic_button_state_requested(MicButtonState::Starting);
-            update_llm_status("マイク準備中");
+            update_llm_status("マイク起動中");
         }
         return;
     }
@@ -1012,7 +1361,7 @@ static void handle_xiaozhi_status(std::string_view status)
         std::lock_guard<std::mutex> lock(_llm_mutex);
         _listen_indicator_requested = false;
         _mic_button_state_requested = MicButtonState::Idle;
-        if (_llm_status == "マイク準備中" || _llm_status == "キャンセル中" || _llm_status == "聞いてるよ〜") {
+        if (_llm_status == "マイク起動中" || _llm_status == "キャンセル中" || _llm_status == "聞いてるよ〜") {
             _caption_hide_requested = true;
         }
         _xiaozhi_interaction_requested = false;
@@ -1029,6 +1378,12 @@ static void handle_xiaozhi_text_message(const WsTextMessage_t& message)
 
     publish_mqtt_state("xiaozhi.text", text, role.c_str());
     if (role == "user") {
+        {
+            std::lock_guard<std::mutex> lock(_llm_mutex);
+            _xiaozhi_listening_started = false;
+            _xiaozhi_text_waiting = false;
+            _xiaozhi_text_waiting_at = 0;
+        }
         publish_mqtt_input(text, role.c_str());
     }
 
@@ -1411,6 +1766,38 @@ static void handle_llm_timeout(uint32_t now)
     mclog::tagWarn("NUKOEVI", "LLM request timed out");
 }
 
+static void handle_xiaozhi_text_timeout(uint32_t now)
+{
+    bool timed_out = false;
+    {
+        std::lock_guard<std::mutex> lock(_llm_mutex);
+        if (!_xiaozhi_text_waiting || _xiaozhi_text_waiting_at == 0 ||
+            now - _xiaozhi_text_waiting_at < _xiaozhi_text_timeout_ms) {
+            return;
+        }
+
+        _xiaozhi_text_waiting = false;
+        _xiaozhi_text_waiting_at = 0;
+        _xiaozhi_listening_started = false;
+        _mic_pressed_at = 0;
+        _mic_press_active = false;
+        _xiaozhi_interaction_requested = false;
+        _listen_indicator_requested = false;
+        _mic_button_state_requested = MicButtonState::Idle;
+        if (_llm_status == "送信中") {
+            _llm_status = "聞き取れなかったの";
+            _llm_status_changed = true;
+        }
+        timed_out = true;
+    }
+
+    if (timed_out) {
+        request_xiaozhi_stop_listening("timeout");
+        publish_mqtt_state("xiaozhi.text.timeout", "no transcript");
+        mclog::tagWarn("NUKOEVI", "Xiaozhi text timed out");
+    }
+}
+
 static std::string normalize_caption_text(const std::string& text)
 {
     std::string normalized;
@@ -1633,6 +2020,7 @@ void AppNukoevi::onOpen()
     }
     GetHAL().initExternalLedPwm();
     GetHAL().setExternalLedBrightness(_external_led_normal_brightness, _external_led_normal_brightness, false);
+    start_mqtt_audio_decode_task();
     start_network_once();
     GetHAL().startXiaozhiBackground();
     _espnow_receives = _enable_espnow_remote;
@@ -1858,12 +2246,14 @@ void AppNukoevi::onRunning()
     update_battery_indicator();
     ensure_mqtt_output_receiver();
     process_mqtt_output_messages();
+    ensure_audio_ws_receiver();
     publish_touch_point();
 
     constexpr uint32_t blink_interval_ms = 3200;
     constexpr uint32_t blink_frame_ms    = 85;
     const auto now                      = GetHAL().millis();
     handle_llm_timeout(now);
+    handle_xiaozhi_text_timeout(now);
     handle_caption_auto_hide(now);
 
     if (!_avatar) {
@@ -1996,6 +2386,14 @@ void AppNukoevi::onClose()
     _caption_panel = nullptr;
     _listen_indicator = nullptr;
     _listen_indicator_dot = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(_audio_ws_mutex);
+        if (_audio_ws_client) {
+            _audio_ws_client->Close();
+            _audio_ws_client.reset();
+        }
+    }
+    _audio_ws_connecting = false;
     _caption_visible = false;
     _caption_updated_at = 0;
     _listen_indicator_visible = false;
@@ -2003,7 +2401,12 @@ void AppNukoevi::onClose()
     _mic_button_state_visible = MicButtonState::Idle;
     _mic_button_state_requested = MicButtonState::Idle;
     _caption_hide_requested = false;
+    _mic_press_active = false;
+    _mic_pressed_at = 0;
     _xiaozhi_interaction_requested = false;
+    _xiaozhi_listening_started = false;
+    _xiaozhi_text_waiting = false;
+    _xiaozhi_text_waiting_at = 0;
     _open_home_requested = false;
     _avatar.reset();
     _panel.reset();
