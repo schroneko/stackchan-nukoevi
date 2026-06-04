@@ -513,6 +513,14 @@ async function handleMqttState(raw: string) {
   while (recentMqttStates.length > 80) {
     recentMqttStates.shift()
   }
+
+  if (event.type === 'xiaozhi.stop.requested' || event.type === 'mic.cancelled') {
+    clearXiaozhiListening(
+      event.type,
+      event.session_id ?? xiaozhiListeningSessionId,
+      event.device_id ?? xiaozhiListeningDeviceId,
+    )
+  }
 }
 
 async function handleMqttInput(raw: string) {

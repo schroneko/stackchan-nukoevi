@@ -1546,6 +1546,25 @@ static void handle_xiaozhi_status(std::string_view status)
         return;
     }
 
+    if (status == "Error") {
+        std::lock_guard<std::mutex> lock(_llm_mutex);
+        _listen_indicator_requested = false;
+        _mic_button_state_requested = MicButtonState::Idle;
+        if (_xiaozhi_interaction_requested || _mic_press_active || _xiaozhi_text_waiting) {
+            _llm_status = "起動に失敗したの";
+            _llm_status_changed = true;
+            _caption_hide_requested = false;
+        }
+        _mic_press_active = false;
+        _mic_pressed_at = 0;
+        _mic_touch_lost_at = 0;
+        _xiaozhi_interaction_requested = false;
+        _xiaozhi_listening_started = false;
+        _xiaozhi_text_waiting = false;
+        _xiaozhi_text_waiting_at = 0;
+        return;
+    }
+
     if (status == "Standby") {
         std::lock_guard<std::mutex> lock(_llm_mutex);
         _listen_indicator_requested = false;
