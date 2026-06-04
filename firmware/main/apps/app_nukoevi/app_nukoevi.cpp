@@ -366,6 +366,20 @@ static bool is_audio_playback_active(uint32_t now)
     return _audio_playback_until != 0 && static_cast<int32_t>(_audio_playback_until - now) > 0;
 }
 
+static void clear_pending_assistant_audio()
+{
+    {
+        std::lock_guard<std::mutex> lock(_mqtt_audio_queue_mutex);
+        while (!_mqtt_audio_packets.empty()) {
+            _mqtt_audio_packets.pop();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(_audio_playback_mutex);
+        _audio_playback_until = 0;
+    }
+}
+
 static bool is_caption_hold_active(uint32_t now)
 {
     std::lock_guard<std::mutex> lock(_audio_playback_mutex);
@@ -1397,6 +1411,8 @@ static void begin_xiaozhi_voice_input()
     _audio_ws_requested = false;
     _audio_ws_close_requested = true;
     close_audio_ws_receiver();
+    clear_pending_assistant_audio();
+    Application::GetInstance().StopListening();
     _mic_press_active = true;
     _mic_pressed_at = now;
     _mic_touch_lost_at = 0;
