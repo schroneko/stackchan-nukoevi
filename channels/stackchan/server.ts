@@ -38,9 +38,14 @@ const irodoriTtsSpeaker = process.env.STACKCHAN_IRODORI_TTS_SPEAKER ?? '3'
 const irodoriTtsSteps = process.env.STACKCHAN_IRODORI_TTS_STEPS ?? '18'
 const irodoriTtsSeconds = process.env.STACKCHAN_IRODORI_TTS_SECONDS ?? ''
 const irodoriTtsDurationScale = process.env.STACKCHAN_IRODORI_TTS_DURATION_SCALE ?? '0.95'
+const irodoriTtsProvider = irodoriTtsProviderFromEnv()
+const irodoriTtsHfToken = process.env.STACKCHAN_IRODORI_HF_TOKEN ?? process.env.HF_TOKEN ?? process.env.HUGGING_FACE_HUB_TOKEN ?? ''
+const irodoriTtsSeed = process.env.STACKCHAN_IRODORI_TTS_SEED ?? ''
+const irodoriTtsCaption = process.env.STACKCHAN_IRODORI_TTS_CAPTION ?? '若く元気な女性の声。近い距離感で、明るくやわらかく自然に話している。'
 const irodoriTtsEnabled = process.env.STACKCHAN_IRODORI_TTS_ENABLED !== '0'
 const irodoriTtsFrameDelayMs = Number(process.env.STACKCHAN_IRODORI_TTS_FRAME_DELAY_MS ?? '55')
 const irodoriTtsMqttFrameDelayMs = Number(process.env.STACKCHAN_IRODORI_TTS_MQTT_FRAME_DELAY_MS ?? '90')
+const irodoriTtsAudioTransport = irodoriTtsAudioTransportFromEnv()
 const stackChanAudioWsWaitMs = Number(process.env.STACKCHAN_AUDIO_WS_WAIT_MS ?? '1500')
 const xiaozhiListeningStaleMs = Number(process.env.STACKCHAN_XIAOZHI_LISTENING_STALE_MS ?? '120000')
 const irodoriTtsWarmupText = process.env.STACKCHAN_IRODORI_TTS_WARMUP_TEXT ?? 'あ'
@@ -53,6 +58,8 @@ const evictlBin = process.env.STACKCHAN_EVICTL_BIN ?? `${homedir()}/ghq/github.c
 const evictlIdentity = process.env.STACKCHAN_EVICTL_IDENTITY ?? 'nukoevi'
 
 type StackChanAgentTransport = 'mqtt' | 'claude-code-channels' | 'evictl'
+type IrodoriTtsProvider = 'stackchan-api' | 'zerogpu-direct'
+type IrodoriTtsAudioTransport = 'auto' | 'websocket' | 'mqtt'
 type MqttQos = 0 | 1 | 2
 
 function mqttQosFromEnv(value: string): MqttQos {
@@ -70,6 +77,21 @@ function stackChanAgentTransportFromEnv(): StackChanAgentTransport {
   return process.env.STACKCHAN_DIRECT_MCP_CHANNEL === '1' ? 'claude-code-channels' : 'mqtt'
 }
 
+function irodoriTtsProviderFromEnv(): IrodoriTtsProvider {
+  const value = (process.env.STACKCHAN_IRODORI_TTS_PROVIDER ?? '').toLowerCase()
+  if (value === 'zerogpu' || value === 'zerogpu-direct' || value === 'direct') return 'zerogpu-direct'
+  if (value === 'stackchan-api' || value === 'api') return 'stackchan-api'
+  if (irodoriTtsUrl.includes('/gradio_api/call/') || irodoriTtsUrl.includes('irodori-tts-zerogpu')) return 'zerogpu-direct'
+  return 'stackchan-api'
+}
+
+function irodoriTtsAudioTransportFromEnv(): IrodoriTtsAudioTransport {
+  const value = (process.env.STACKCHAN_IRODORI_TTS_AUDIO_TRANSPORT ?? 'auto').toLowerCase()
+  if (value === 'mqtt') return 'mqtt'
+  if (value === 'ws' || value === 'websocket') return 'websocket'
+  return 'auto'
+}
+
 const stackChanAgentTransport = stackChanAgentTransportFromEnv()
 const directMcpChannel = stackChanAgentTransport !== 'mqtt'
 
@@ -78,7 +100,7 @@ type StackChanRequest = {
   sessionId: string
   deviceId: string
   createdAt: number
-  resolve: (text: string) => void
+  resolve: (reply: ClaudeReply) => void
   socket?: ServerWebSocket<StackChanConnection>
 }
 
@@ -122,6 +144,11 @@ type NukoeviMqttEvent = {
   total?: number
   payload?: string
   ts?: string
+}
+
+type ClaudeReply = {
+  text: string
+  speechHandled: boolean
 }
 
 type MqttAudioPublishSession = {
@@ -169,6 +196,12 @@ type IrodoriSynthesisResponse = {
   mp3StreamingUrl?: string
   mp3DownloadUrl?: string
   error?: string
+}
+
+type GradioFileResult = {
+  url?: string
+  path?: string
+  name?: string
 }
 
 const pending = new Map<string, StackChanRequest>()
@@ -490,7 +523,8 @@ async function handleMqttOutput(raw: string) {
   const requestId = event.correlation_id ?? event.id ?? ''
   const entry = requestId ? pending.get(requestId) : undefined
   if (entry) {
-    entry.resolve(text)
+    void speakStackChanAssistant(text, false)
+    entry.resolve({ text, speechHandled: true })
     return
   }
 
@@ -756,6 +790,98 @@ function buildIrodoriSynthesisUrl(text: string, steps: string, seconds?: string)
   return url
 }
 
+function irodoriZeroGpuBaseUrl() {
+  const url = new URL(irodoriTtsUrl)
+  return url.origin
+}
+
+function irodoriZeroGpuHeaders(contentType = false) {
+  const headers: Record<string, string> = {}
+  if (contentType) headers['Content-Type'] = 'application/json'
+  if (irodoriTtsHfToken) headers.Authorization = `Bearer ${irodoriTtsHfToken}`
+  return headers
+}
+
+function irodoriZeroGpuPayload(text: string, steps: string, seconds?: string) {
+  return {
+    text,
+    speaker: irodoriTtsSpeaker,
+    seconds: seconds ?? '',
+    duration_scale: Number(irodoriTtsDurationScale || '1'),
+    steps: Number(steps),
+    seed: irodoriTtsSeed,
+    caption: irodoriTtsCaption,
+  }
+}
+
+function parseGradioSse(body: string, label: string) {
+  let eventName = ''
+  for (const rawLine of body.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line) continue
+    if (line.startsWith('event:')) {
+      eventName = line.slice('event:'.length).trim()
+      continue
+    }
+    if (!line.startsWith('data:')) continue
+    const data = line.slice('data:'.length).trim()
+    if (eventName === 'error') {
+      throw new Error(`Irodori ${label} failed: ${data}`)
+    }
+    const parsed = JSON.parse(data) as unknown
+    if (eventName === 'complete') return parsed
+  }
+  throw new Error(`Irodori ${label} failed: ZeroGPU stream ended before completion`)
+}
+
+function extractGradioAudioUrl(result: unknown) {
+  let source: unknown = result
+  if (Array.isArray(source)) source = source[0]
+  if (Array.isArray(source)) source = source[0]
+  if (source && typeof source === 'object') {
+    const file = source as GradioFileResult
+    source = file.url ?? file.path ?? file.name
+  }
+  if (typeof source !== 'string' || !source) {
+    throw new Error('Irodori response has no mp3 URL')
+  }
+  return source
+}
+
+async function requestIrodoriZeroGpuSynthesis(text: string, steps: string, seconds: string | undefined, label: string, signal?: AbortSignal) {
+  assertIrodoriNotRateLimited(label)
+  const baseUrl = irodoriZeroGpuBaseUrl()
+  const response = await fetch(`${baseUrl}/gradio_api/call/v2/synthesize`, {
+    method: 'POST',
+    headers: irodoriZeroGpuHeaders(true),
+    body: JSON.stringify(irodoriZeroGpuPayload(text, steps, seconds)),
+    signal,
+  })
+  const body = await response.text()
+  if (!response.ok) {
+    const reason = `${response.status} ${body}`
+    maybeMarkIrodoriRateLimited(reason)
+    throw new Error(`Irodori ${label} failed: ${reason}`)
+  }
+
+  const json = JSON.parse(body) as { event_id?: string }
+  if (!json.event_id) {
+    throw new Error(`Irodori ${label} failed: ZeroGPU did not return event_id`)
+  }
+
+  const resultResponse = await fetch(`${baseUrl}/gradio_api/call/synthesize/${json.event_id}`, {
+    headers: irodoriZeroGpuHeaders(),
+    signal,
+  })
+  const resultBody = await resultResponse.text()
+  if (!resultResponse.ok) {
+    const reason = `${resultResponse.status} ${resultBody}`
+    maybeMarkIrodoriRateLimited(reason)
+    throw new Error(`Irodori ${label} failed: ${reason}`)
+  }
+  return parseGradioSse(resultBody, label)
+}
+
 function markIrodoriRateLimited(reason: string) {
   irodoriTtsRateLimitedUntil = Date.now() + irodoriTtsRateLimitCooldownMs
   lastIrodoriTtsRateLimit = {
@@ -825,8 +951,12 @@ async function warmIrodoriTts() {
     lastIrodoriWarmup = { state: 'started', ts: nowIso() }
     const controller = new AbortController()
     irodoriWarmupAbortController = controller
-    const url = buildIrodoriSynthesisUrl(irodoriTtsWarmupText, irodoriTtsWarmupSteps, '')
-    await requestIrodoriSynthesis(url, 'warmup', controller.signal)
+    if (irodoriTtsProvider === 'zerogpu-direct') {
+      await requestIrodoriZeroGpuSynthesis(irodoriTtsWarmupText, irodoriTtsWarmupSteps, '', 'warmup', controller.signal)
+    } else {
+      const url = buildIrodoriSynthesisUrl(irodoriTtsWarmupText, irodoriTtsWarmupSteps, '')
+      await requestIrodoriSynthesis(url, 'warmup', controller.signal)
+    }
     lastIrodoriWarmup = {
       state: 'ok',
       durationMs: Date.now() - started,
@@ -852,15 +982,22 @@ async function warmIrodoriTts() {
 
 async function synthesizeIrodoriMp3(text: string) {
   cancelIrodoriWarmup('synthesis request started')
-  const url = buildIrodoriSynthesisUrl(text, irodoriTtsSteps, irodoriTtsSeconds || undefined)
-  const json = await requestIrodoriSynthesis(url, 'synthesis')
-
-  const audioUrl = json.mp3StreamingUrl ?? json.mp3DownloadUrl
-  if (!audioUrl) {
-    throw new Error('Irodori response has no mp3 URL')
+  let audioUrl: string
+  if (irodoriTtsProvider === 'zerogpu-direct') {
+    const result = await requestIrodoriZeroGpuSynthesis(text, irodoriTtsSteps, irodoriTtsSeconds || undefined, 'synthesis')
+    audioUrl = extractGradioAudioUrl(result)
+  } else {
+    const url = buildIrodoriSynthesisUrl(text, irodoriTtsSteps, irodoriTtsSeconds || undefined)
+    const json = await requestIrodoriSynthesis(url, 'synthesis')
+    audioUrl = json.mp3StreamingUrl ?? json.mp3DownloadUrl ?? ''
+    if (!audioUrl) {
+      throw new Error('Irodori response has no mp3 URL')
+    }
   }
 
-  const audioResponse = await fetch(audioUrl)
+  const audioResponse = await fetch(audioUrl, {
+    headers: irodoriTtsProvider === 'zerogpu-direct' ? irodoriZeroGpuHeaders() : undefined,
+  })
   if (!audioResponse.ok) {
     throw new Error(`Irodori audio download failed: ${audioResponse.status}`)
   }
@@ -923,7 +1060,7 @@ async function publishMqttAssistantAudio(text: string) {
   }
 
   try {
-    log(`Irodori MQTT TTS request: ${audioId} ${text}`)
+    log(`Irodori TTS request: ${audioId} transport=${irodoriTtsAudioTransport} ${text}`)
     const synthesisStarted = Date.now()
     session.synthesisStartedAt = nowIso()
     const mp3 = await synthesizeIrodoriMp3(text)
@@ -935,11 +1072,12 @@ async function publishMqttAssistantAudio(text: string) {
     session.total = packets.length
     session.publishStartedAt = nowIso()
     const publishStarted = Date.now()
-    if (stackChanAudioSockets.size === 0 && stackChanAudioWsWaitMs > 0) {
+    const allowWebSocketAudio = irodoriTtsAudioTransport !== 'mqtt'
+    if (allowWebSocketAudio && stackChanAudioSockets.size === 0 && stackChanAudioWsWaitMs > 0) {
       await waitForStackChanAudioSockets(stackChanAudioWsWaitMs)
     }
 
-    const audioSockets = Array.from(stackChanAudioSockets)
+    const audioSockets = allowWebSocketAudio ? Array.from(stackChanAudioSockets) : []
     if (audioSockets.length > 0) {
       session.transport = 'ws'
       session.frameDelayMs = irodoriTtsFrameDelayMs
@@ -976,6 +1114,8 @@ async function publishMqttAssistantAudio(text: string) {
       for (const ws of audioSockets) {
         ws.send(stopMessage)
       }
+    } else if (irodoriTtsAudioTransport === 'websocket') {
+      throw new Error('Irodori websocket TTS failed: no StackChan audio websocket clients')
     } else {
       session.transport = 'mqtt'
       log(`Irodori MQTT TTS packets: ${audioId} total=${packets.length} qos=${mqttAudioQos} delay=${irodoriTtsMqttFrameDelayMs} synthesis=${session.synthesisDurationMs} encode=${session.encodeDurationMs}`)
@@ -1009,7 +1149,7 @@ async function publishMqttAssistantAudio(text: string) {
     session.error = String(err)
     session.finishedAt = nowIso()
     session.durationMs = Date.now() - started
-    log(`Irodori MQTT TTS skipped: ${err}`)
+    log(`Irodori TTS skipped: ${err}`)
   }
 }
 
@@ -1111,7 +1251,8 @@ function finishStackChanTurn(ws: ServerWebSocket<StackChanConnection>) {
   ws.data.turnClosing = true
   setTimeout(() => {
     ws.data.upstream?.close()
-    ws.close(1000, 'turn complete')
+    ws.data.upstream = undefined
+    ws.data.turnClosing = false
   }, 300)
 }
 
@@ -1234,13 +1375,13 @@ async function emitChannel(text: string, meta: Record<string, string>) {
   await emitClaudeCodeChannel(text, meta)
 }
 
-async function askClaude(text: string, socket: ServerWebSocket<StackChanConnection> | undefined, sessionId: string, deviceId: string): Promise<string> {
+async function askClaude(text: string, socket: ServerWebSocket<StackChanConnection> | undefined, sessionId: string, deviceId: string): Promise<ClaudeReply> {
   const id = randomUUID()
   const started = Date.now()
-  return await new Promise<string>((resolve) => {
+  return await new Promise<ClaudeReply>((resolve) => {
     const timer = setTimeout(() => {
       pending.delete(id)
-      resolve('時間がかかりすぎちゃったの。もう一回話しかけてね。')
+      resolve({ text: '時間がかかりすぎちゃったの。もう一回話しかけてね。', speechHandled: false })
     }, assistantTimeoutMs)
 
     pending.set(id, {
@@ -1284,7 +1425,7 @@ async function askClaude(text: string, socket: ServerWebSocket<StackChanConnecti
       clearTimeout(timer)
       pending.delete(id)
       log(`failed to deliver inbound to Claude: ${err}`)
-      resolve('Claude Code Channels に送れなかったの。Mac 側を確認してね。')
+      resolve({ text: 'Claude Code Channels に送れなかったの。Mac 側を確認してね。', speechHandled: false })
     })
   })
 }
@@ -1406,7 +1547,9 @@ class UpstreamConnection {
           ts: Date.now(),
         }
         void askClaude(transcript, this.local, this.local.data.sessionId, this.local.data.deviceId)
-          .then(reply => sendStackChanAssistantSafe(this.local, reply))
+          .then(reply => {
+            if (!reply.speechHandled) void sendStackChanAssistantSafe(this.local, reply.text)
+          })
           .catch(err => {
             log(`failed to deliver StackChan STT to Claude: ${err}`)
           })
@@ -1495,10 +1638,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   })
   rememberLocalOutput(event)
   await publishMqttOutput(event)
-  if (!entry.socket) {
-    void speakStackChanAssistant(text, false)
-  }
-  entry.resolve(text)
+  void speakStackChanAssistant(text, false)
+  entry.resolve({ text, speechHandled: true })
   return { content: [{ type: 'text', text: 'sent' }] }
 })
 
@@ -1520,7 +1661,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
         index: 0,
         message: {
           role: 'assistant',
-          content: reply,
+          content: reply.text,
         },
         finish_reason: 'stop',
       },
@@ -1555,9 +1696,12 @@ Bun.serve<StackChanConnection>({
           recentBrokerEvents: recentMqttBrokerEvents,
         },
         irodoriTts: {
+          provider: irodoriTtsProvider,
           frameDelayMs: irodoriTtsFrameDelayMs,
           mqttFrameDelayMs: irodoriTtsMqttFrameDelayMs,
+          audioTransport: irodoriTtsAudioTransport,
           durationScale: irodoriTtsDurationScale,
+          hasHfToken: Boolean(irodoriTtsHfToken),
           audioWsWaitMs: stackChanAudioWsWaitMs,
           warmupOnListen: irodoriTtsWarmupOnListen,
           rateLimitCooldownMs: irodoriTtsRateLimitCooldownMs,
