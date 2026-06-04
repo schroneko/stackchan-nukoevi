@@ -15,15 +15,21 @@ The speech path is:
 Claude Code Channels
 -> StackChan MCP reply
 -> channels/stackchan/server.ts
--> Irodori TTS StackChan API /synthesis
 -> Irodori TTS ZeroGPU Space
 -> MP3 fetch
--> Opus frames over MQTT
+-> Opus frames over StackChan audio websocket
 -> StackChan speaker
 ```
 
-The StackChan API is a thin CPU Basic adapter. The actual model inference runs
-in the ZeroGPU Space.
+The StackChan API is a thin CPU Basic adapter for public HTTP access. The local
+StackChan server can also call the ZeroGPU Space directly with a Hugging Face
+token. The actual model inference runs in the ZeroGPU Space.
+
+MQTT audio is not part of the production speech path. It is kept only as a
+debug path because Opus frames over MQTT caused severe audible gaps and cut
+points on the physical StackChan. Production Irodori TTS audio should use the
+StackChan audio websocket, while MQTT remains for text output, device state,
+and debugging.
 
 ## Runtime settings
 
@@ -31,6 +37,7 @@ in the ZeroGPU Space.
 - Local runtime override file: `~/.config/stackchan/irodori.env`
 - A fast local override can set `STACKCHAN_IRODORI_TTS_STEPS=8`
 - Duration scale: `0.95`
+- Audio transport: `STACKCHAN_IRODORI_TTS_AUDIO_TRANSPORT=websocket`
 - ZeroGPU function budget: `@spaces.GPU(duration=30)`
 - ZeroGPU model precision: `bf16`
 - ZeroGPU codec precision: `fp32`
@@ -67,7 +74,10 @@ curl -s http://127.0.0.1:18080/health
 Useful fields:
 
 - `lastMqttOutput`: Claude reply text reached the StackChan server.
-- `recentMqttAudioPublishes`: Irodori audio was generated and published.
+- `recentMqttAudioPublishes`: Irodori audio was generated and published. Check
+  `transport`; production audio should be `ws`, not `mqtt`.
+- `irodoriTts.audioTransport`: should be `websocket` for the local Nukoevi
+  runtime.
 - `irodoriWarmup`: warmup state. Warmup can be canceled when synthesis starts.
 - `xiaozhiAudio.recentUpstreamTextMessages`: STT and local device events.
 
@@ -90,8 +100,11 @@ StackChan API response should include `metadata.success=true`,
 
 ## Known failure modes
 
-- If text appears but no Irodori audio is published, check for `502` from the
-  StackChan API.
+- If text appears but no Irodori audio is published, check
+  `irodoriTts.audioTransport`, `stackChanAudioClients`, and the latest
+  `recentMqttAudioPublishes` error.
+- Do not switch production audio back to MQTT to hide websocket connection
+  failures. MQTT audio is known to be too choppy for speech playback.
 - After changing ZeroGPU code, wait until the Hugging Face Space runtime `sha`
   matches the repo `sha`; the repo can update before the running app restarts.
 - Startup log messages like `Invalid file descriptor: -1` and missing

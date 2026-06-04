@@ -61,8 +61,10 @@ Useful startup log lines:
 - Shows StackChan Wi-Fi and battery status.
 - Keeps camera, microphone, Wi-Fi setup, home, and controls UI in the Nukoevi
   screen.
-- Receives text and Opus audio frames over MQTT for response display and TTS
-  playback.
+- Receives response text and device state over MQTT.
+- Plays Irodori TTS audio through the StackChan audio websocket. MQTT audio is
+  kept only for debugging because it causes severe audible gaps on the physical
+  StackChan.
 - Uses the standard StackChan/Xiaozhi microphone path as the basis for voice
   input.
 - Switches to a sleepy Nukoevi image between 22:00 and 07:00 JST.

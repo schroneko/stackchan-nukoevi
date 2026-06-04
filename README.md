@@ -5,8 +5,8 @@
 Nukoevi StackChan is a personal custom firmware and companion workspace for
 M5Stack StackChan. It keeps the StackChan hardware and much of the upstream
 application structure, then adds the Nukoevi home screen, character animation,
-microphone flow, MQTT text output, and Irodori TTS playback used by the local
-Claude Code Channels setup.
+microphone flow, MQTT text output, and websocket-based Irodori TTS playback used
+by the local Claude Code Channels setup.
 
 This repository is not an official M5Stack repository and is not a GitHub fork
 of `m5stack/StackChan`. It is an independently published repository that
@@ -17,7 +17,7 @@ patch files.
 
 - Firmware for M5Stack StackChan with the Nukoevi app as the startup screen.
 - StackChan UI integration for Wi-Fi, battery, camera, microphone, and controls.
-- MQTT output handling for text responses and TTS audio frames.
+- MQTT output handling for text responses and device status.
 - Irodori TTS output path for StackChan speech playback.
 - Patch-based integration with `78/xiaozhi-esp32` so upstream source can be
   fetched and customized reproducibly.
@@ -59,9 +59,10 @@ debug checklist.
 
 At a high level, the current firmware boots into Nukoevi, shows StackChan
 status indicators, accepts text output over MQTT, displays responses, and can
-play Irodori TTS audio through StackChan. The Wi-Fi timeout behavior has been
-changed so saved Wi-Fi credentials retry instead of dropping into Wi-Fi
-configuration mode.
+play Irodori TTS audio through StackChan over websocket. MQTT audio is kept only
+as a debug path because it produces severe audible gaps and is not usable for
+speech playback. The Wi-Fi timeout behavior has been changed so saved Wi-Fi
+credentials retry instead of dropping into Wi-Fi configuration mode.
 
 ## Repository notes
 

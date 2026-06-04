@@ -14,8 +14,9 @@ This page is a public status summary for the Nukoevi StackChan firmware.
   and the StackChan MCP path.
 - StackChan output receives text over MQTT and displays it on the bottom comment
   area.
-- Irodori TTS output is sent to StackChan as Opus audio frames over MQTT.
-- Irodori TTS uses the StackChan API adapter and ZeroGPU backend with
+- Irodori TTS output is sent to StackChan as Opus audio frames over the
+  StackChan audio websocket.
+- Irodori TTS uses the ZeroGPU backend with
   `duration_scale=0.95`, model `bf16`, codec `fp32`, and a 30 second ZeroGPU
   task budget.
 - The microphone icon starts the StackChan/Xiaozhi voice input path.
@@ -44,7 +45,11 @@ This page is a public status summary for the Nukoevi StackChan firmware.
 
 - `firmware/repos.json` lists fetched upstream repositories.
 - `firmware/patches/xiaozhi-esp32.patch` records the Xiaozhi customizations.
-- The StackChan output path expects an MQTT broker reachable from the device.
+- The StackChan output path expects an MQTT broker reachable from the device for
+  text and status.
+- MQTT audio is a debug path only. It caused severe audible gaps and cut points
+  on the physical StackChan, so production speech playback uses the audio
+  websocket instead.
 - The local Claude Code Channels setup may use the Telegram and StackChan
   plugins, including `mcp__stackchan__reply`.
 - `docs/irodori-tts-runtime-notes.md` records the speech output path, runtime
