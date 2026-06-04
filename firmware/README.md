@@ -67,6 +67,10 @@ Useful startup log lines:
   StackChan.
 - Uses the standard StackChan/Xiaozhi microphone path as the basis for voice
   input.
+- Blocks microphone start while the local relay is disconnected so the UI does
+  not enter a stale `マイク起動中` state.
+- Recreates stale MQTT clients after a sustained disconnect instead of relying
+  on a physical reboot.
 - Switches to a sleepy Nukoevi image between 22:00 and 07:00 JST.
 - Retries saved Wi-Fi credentials when connection startup times out instead of
   entering Wi-Fi configuration mode immediately.

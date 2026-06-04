@@ -20,6 +20,11 @@ This page is a public status summary for the Nukoevi StackChan firmware.
   `duration_scale=0.95`, model `bf16`, codec `fp32`, and a 30 second ZeroGPU
   task budget.
 - The microphone icon starts the StackChan/Xiaozhi voice input path.
+- The StackChan `/xiaozhi` websocket stays open across microphone turns. The
+  server closes only the upstream Xiaozhi websocket after an STT result so the
+  next microphone turn does not get stuck in reconnect startup.
+- The firmware blocks microphone start while the local MQTT relay is
+  disconnected and recreates stale MQTT clients.
 - Sleepy mode switches through sleepy Nukoevi frames from 22:00 to 07:00 JST.
 - Saved Wi-Fi credentials retry on startup timeout instead of automatically
   entering Wi-Fi configuration mode.
@@ -54,6 +59,8 @@ This page is a public status summary for the Nukoevi StackChan firmware.
   plugins, including `mcp__stackchan__reply`.
 - `docs/irodori-tts-runtime-notes.md` records the speech output path, runtime
   tuning, and debug checklist.
+- `docs/voice-input-runtime-notes.md` records the microphone input path,
+  reconnect behavior, and `マイク起動中` debug checklist.
 
 ## Open items
 
