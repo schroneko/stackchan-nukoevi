@@ -163,7 +163,9 @@ static std::unique_ptr<Mqtt> _mqtt_output_client;
 static std::mutex _mqtt_output_mutex;
 static std::queue<std::string> _mqtt_output_messages;
 static bool _mqtt_output_connecting = false;
+static bool _mqtt_output_connected = false;
 static uint32_t _mqtt_output_last_connect_at = 0;
+static uint32_t _mqtt_output_disconnected_at = 0;
 static std::mutex _mqtt_audio_queue_mutex;
 static std::condition_variable _mqtt_audio_queue_cv;
 static std::queue<std::unique_ptr<AudioStreamPacket>> _mqtt_audio_packets;
@@ -468,7 +470,7 @@ static bool start_mqtt_audio_decode_task()
         return true;
     }
 
-    if (xTaskCreate(mqtt_audio_decode_task, "nukoevi_audio", 6144, nullptr, 4, &_mqtt_audio_task_handle) != pdPASS) {
+    if (xTaskCreate(mqtt_audio_decode_task, "nukoevi_audio", 3072, nullptr, 4, &_mqtt_audio_task_handle) != pdPASS) {
         _mqtt_audio_task_handle = nullptr;
         mclog::tagWarn("NUKOEVI", "MQTT audio decode task start failed");
         return false;
@@ -481,6 +483,7 @@ static void enqueue_mqtt_audio_packet(std::unique_ptr<AudioStreamPacket> packet,
 {
     if (!start_mqtt_audio_decode_task()) {
         publish_mqtt_state("audio.opus.decode_task_failed", "start failed");
+        Application::GetInstance().GetAudioService().PushPacketToDecodeQueue(std::move(packet), true);
         return;
     }
 
@@ -777,18 +780,29 @@ static void mqtt_output_connect_task(void*)
         connected = _mqtt_output_client->Connect(_mqtt_output_broker_host, _mqtt_output_broker_port, client_id, "", "");
     }
     if (!connected) {
+        _mqtt_output_connected = false;
+        _mqtt_output_disconnected_at = GetHAL().millis();
         mclog::tagWarn("NUKOEVI", "MQTT output receiver connect failed");
     }
     _mqtt_output_connecting = false;
     vTaskDelete(nullptr);
 }
 
+static bool is_mqtt_output_connected()
+{
+    return _mqtt_output_client && _mqtt_output_client->IsConnected();
+}
+
 static void ensure_mqtt_output_receiver()
 {
     if (GetHAL().getWifiStatus() == WifiStatus::None) {
+        _mqtt_output_connected = false;
+        _mqtt_output_disconnected_at = GetHAL().millis();
         return;
     }
     if (_mqtt_output_client && _mqtt_output_client->IsConnected()) {
+        _mqtt_output_connected = true;
+        _mqtt_output_disconnected_at = 0;
         return;
     }
     if (_mqtt_output_connecting) {
@@ -814,12 +828,18 @@ static void ensure_mqtt_output_receiver()
 
     _mqtt_output_client->OnConnected([]() {
         mclog::tagInfo("NUKOEVI", "MQTT output receiver connected");
+        _mqtt_output_connected = true;
+        _mqtt_output_disconnected_at = 0;
         _mqtt_output_client->Subscribe(_mqtt_output_topic, 0);
         _mqtt_output_client->Subscribe(_mqtt_output_audio_topic, 1);
         publish_mqtt_audio_interrupted();
         publish_mqtt_state("mqtt.connected", "connected");
     });
-    _mqtt_output_client->OnDisconnected([]() { mclog::tagInfo("NUKOEVI", "MQTT output receiver disconnected"); });
+    _mqtt_output_client->OnDisconnected([]() {
+        _mqtt_output_connected = false;
+        _mqtt_output_disconnected_at = GetHAL().millis();
+        mclog::tagInfo("NUKOEVI", "MQTT output receiver disconnected");
+    });
     _mqtt_output_client->OnMessage([](const std::string& topic, const std::string& payload) {
         if (topic == _mqtt_output_audio_topic) {
             handle_mqtt_audio_payload(payload);
@@ -835,6 +855,31 @@ static void ensure_mqtt_output_receiver()
         _mqtt_output_connecting = false;
         mclog::tagWarn("NUKOEVI", "MQTT output receiver task failed");
     }
+}
+
+static void handle_mqtt_output_connection_watchdog(uint32_t now)
+{
+    if (GetHAL().getWifiStatus() == WifiStatus::None) {
+        _mqtt_output_connected = false;
+        _mqtt_output_disconnected_at = now;
+        return;
+    }
+    if (is_mqtt_output_connected()) {
+        _mqtt_output_connected = true;
+        _mqtt_output_disconnected_at = 0;
+        return;
+    }
+    _mqtt_output_connected = false;
+    if (_mqtt_output_disconnected_at == 0) {
+        _mqtt_output_disconnected_at = now;
+    }
+    if (!_mqtt_output_connecting && now - _mqtt_output_disconnected_at >= 15000) {
+        _mqtt_output_client.reset();
+        _mqtt_output_last_connect_at = 0;
+        _mqtt_output_disconnected_at = now;
+        mclog::tagWarn("NUKOEVI", "MQTT output receiver stale, recreating client");
+    }
+    ensure_mqtt_output_receiver();
 }
 
 static int32_t value_to_index(uint8_t value, const uint8_t* levels, size_t size)
@@ -1340,6 +1385,14 @@ static void begin_xiaozhi_voice_input()
         publish_mqtt_state("mic.debounced", "ignored");
         return;
     }
+    handle_mqtt_output_connection_watchdog(now);
+    if (!is_mqtt_output_connected()) {
+        set_listen_indicator_requested(false);
+        set_mic_button_state_requested(MicButtonState::Idle);
+        update_llm_status(GetHAL().getWifiStatus() == WifiStatus::None ? "Wi-Fiにつながってないの" : "Macに接続中だよ");
+        publish_mqtt_state("mic.blocked", "relay_disconnected");
+        return;
+    }
     _last_llm_request_at = now;
     _audio_ws_requested = false;
     _audio_ws_close_requested = true;
@@ -1514,6 +1567,38 @@ static void handle_mic_touch_release_fallback()
     if (now - _mic_touch_lost_at >= 120) {
         _mic_touch_lost_at = 0;
         end_xiaozhi_voice_input();
+    }
+}
+
+static void handle_xiaozhi_start_timeout(uint32_t now)
+{
+    bool timed_out = false;
+    {
+        std::lock_guard<std::mutex> lock(_llm_mutex);
+        if (!_xiaozhi_interaction_requested || _xiaozhi_listening_started || _mic_pressed_at == 0 ||
+            now - _mic_pressed_at < _xiaozhi_start_timeout_ms) {
+            return;
+        }
+
+        _listen_indicator_requested = false;
+        _mic_button_state_requested = MicButtonState::Idle;
+        _llm_status = "起動に失敗したの";
+        _llm_status_changed = true;
+        _caption_hide_requested = false;
+        _mic_press_active = false;
+        _mic_pressed_at = 0;
+        _mic_touch_lost_at = 0;
+        _xiaozhi_interaction_requested = false;
+        _xiaozhi_listening_started = false;
+        _xiaozhi_text_waiting = false;
+        _xiaozhi_text_waiting_at = 0;
+        timed_out = true;
+    }
+
+    if (timed_out) {
+        request_xiaozhi_stop_listening("start_timeout");
+        publish_mqtt_state("mic.cancelled", "start_timeout");
+        mclog::tagWarn("NUKOEVI", "Xiaozhi start timed out");
     }
 }
 
@@ -2470,7 +2555,8 @@ void AppNukoevi::onRunning()
     GetStackChan().update();
     update_wifi_button();
     update_battery_indicator();
-    ensure_mqtt_output_receiver();
+    const auto now                      = GetHAL().millis();
+    handle_mqtt_output_connection_watchdog(now);
     process_mqtt_output_messages();
     ensure_audio_ws_receiver();
     publish_touch_point();
@@ -2478,8 +2564,8 @@ void AppNukoevi::onRunning()
 
     constexpr uint32_t blink_interval_ms = 3200;
     constexpr uint32_t blink_frame_ms    = 85;
-    const auto now                      = GetHAL().millis();
     handle_llm_timeout(now);
+    handle_xiaozhi_start_timeout(now);
     handle_xiaozhi_text_timeout(now);
     handle_caption_auto_hide(now);
 
@@ -2621,6 +2707,8 @@ void AppNukoevi::onClose()
         }
     }
     _audio_ws_connecting = false;
+    _mqtt_output_connected = false;
+    _mqtt_output_disconnected_at = 0;
     _caption_visible = false;
     _caption_hide_after_audio = false;
     _caption_updated_at = 0;
