@@ -1412,7 +1412,6 @@ static void begin_xiaozhi_voice_input()
     _audio_ws_close_requested = true;
     close_audio_ws_receiver();
     clear_pending_assistant_audio();
-    Application::GetInstance().StopListening();
     _mic_press_active = true;
     _mic_pressed_at = now;
     _mic_touch_lost_at = 0;
@@ -1485,7 +1484,6 @@ static void end_xiaozhi_voice_input()
 static void request_xiaozhi_stop_listening(const char* reason)
 {
     publish_mqtt_state("xiaozhi.stop.requested", reason);
-    Application::GetInstance().StopListening();
     GetHAL().stopXiaozhiListening();
 }
 
@@ -1669,11 +1667,17 @@ static void handle_xiaozhi_status(std::string_view status)
     if (status == "Standby") {
         std::lock_guard<std::mutex> lock(_llm_mutex);
         _listen_indicator_requested = false;
-        _mic_button_state_requested = MicButtonState::Idle;
-        if (_llm_status == "マイク起動中" || _llm_status == "キャンセル中" || _llm_status == "聞いてるよ〜") {
+        const bool voice_turn_active = _mic_press_active || _xiaozhi_text_waiting;
+        if (!voice_turn_active) {
+            _mic_button_state_requested = MicButtonState::Idle;
+        }
+        if (!voice_turn_active &&
+            (_llm_status == "マイク起動中" || _llm_status == "キャンセル中" || _llm_status == "聞いてるよ〜")) {
             _caption_hide_requested = true;
         }
-        _xiaozhi_interaction_requested = false;
+        if (!voice_turn_active) {
+            _xiaozhi_interaction_requested = false;
+        }
     }
 }
 

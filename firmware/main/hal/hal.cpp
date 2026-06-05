@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hal.h"
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mooncake_log.h>
 #include <nvs_flash.h>
@@ -210,45 +212,71 @@ static void _xiaozhi_background_task(void*)
 
 static bool _xiaozhi_start_listening_scheduled = false;
 static bool _xiaozhi_stop_listening_scheduled = false;
+static std::atomic<uint32_t> _xiaozhi_listen_generation{0};
 
-static void _xiaozhi_start_listening_task(void*)
+static uint32_t _next_xiaozhi_listen_generation()
 {
+    return _xiaozhi_listen_generation.fetch_add(1) + 1;
+}
+
+static uint32_t _xiaozhi_task_generation(void* param)
+{
+    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(param));
+}
+
+static void _xiaozhi_start_listening_task_with_generation(void* param)
+{
+    const auto generation = _xiaozhi_task_generation(param);
     vTaskDelay(pdMS_TO_TICKS(200));
-    if (!_xiaozhi_start_listening_scheduled) {
+    if (!_xiaozhi_start_listening_scheduled || generation != _xiaozhi_listen_generation.load()) {
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    Application::GetInstance().StopListening();
+    vTaskDelay(pdMS_TO_TICKS(400));
+    if (!_xiaozhi_start_listening_scheduled || generation != _xiaozhi_listen_generation.load()) {
         vTaskDelete(nullptr);
         return;
     }
 
     Application::GetInstance().StartListening();
-    _xiaozhi_start_listening_scheduled = false;
+    if (generation == _xiaozhi_listen_generation.load()) {
+        _xiaozhi_start_listening_scheduled = false;
+    }
     vTaskDelete(nullptr);
 }
 
-static void _schedule_xiaozhi_start_listening()
+static void _schedule_xiaozhi_start_listening(uint32_t generation)
 {
-    if (_xiaozhi_start_listening_scheduled) {
-        return;
-    }
-
     _xiaozhi_start_listening_scheduled = true;
-    xTaskCreatePinnedToCore(_xiaozhi_start_listening_task, "xiaozhi-listen", 4096, nullptr, 5, nullptr, 0);
+    const auto param = reinterpret_cast<void*>(static_cast<uintptr_t>(generation));
+    if (xTaskCreatePinnedToCore(_xiaozhi_start_listening_task_with_generation, "xiaozhi-listen", 4096, param, 5,
+                                nullptr, 0) != pdPASS) {
+        _xiaozhi_start_listening_scheduled = false;
+        mclog::tagError(_tag, "failed to schedule xiaozhi listen start");
+    }
 }
 
-static void _xiaozhi_stop_listening_task(void*)
+static void _xiaozhi_stop_listening_task(void* param)
 {
-    Application::GetInstance().StopListening();
-    _xiaozhi_stop_listening_scheduled = false;
+    const auto generation = _xiaozhi_task_generation(param);
+    if (generation == _xiaozhi_listen_generation.load()) {
+        Application::GetInstance().StopListening();
+        _xiaozhi_stop_listening_scheduled = false;
+    }
     vTaskDelete(nullptr);
 }
 
-static void _schedule_xiaozhi_stop_listening()
+static void _schedule_xiaozhi_stop_listening(uint32_t generation)
 {
-    if (_xiaozhi_stop_listening_scheduled) {
-        return;
-    }
-
     _xiaozhi_stop_listening_scheduled = true;
-    xTaskCreatePinnedToCore(_xiaozhi_stop_listening_task, "xiaozhi-stop", 4096, nullptr, 5, nullptr, 0);
+    const auto param = reinterpret_cast<void*>(static_cast<uintptr_t>(generation));
+    if (xTaskCreatePinnedToCore(_xiaozhi_stop_listening_task, "xiaozhi-stop", 4096, param, 5, nullptr, 0) !=
+        pdPASS) {
+        _xiaozhi_stop_listening_scheduled = false;
+        mclog::tagError(_tag, "failed to schedule xiaozhi listen stop");
+    }
 }
 
 void Hal::startXiaozhiBackground()
@@ -277,19 +305,21 @@ void Hal::requestXiaozhiListening()
         return;
     }
 
+    const auto generation = _next_xiaozhi_listen_generation();
     _xiaozhi_listen_requested = false;
-    _schedule_xiaozhi_start_listening();
+    _schedule_xiaozhi_start_listening(generation);
 }
 
 void Hal::stopXiaozhiListening()
 {
+    const auto generation = _next_xiaozhi_listen_generation();
     _xiaozhi_listen_requested = false;
     _xiaozhi_start_listening_scheduled = false;
     if (!_xiaozhi_background_started) {
         return;
     }
 
-    _schedule_xiaozhi_stop_listening();
+    _schedule_xiaozhi_stop_listening(generation);
 }
 
 void Hal::notifyXiaozhiReady()
@@ -299,7 +329,8 @@ void Hal::notifyXiaozhiReady()
     }
 
     _xiaozhi_listen_requested = false;
-    _schedule_xiaozhi_start_listening();
+    const auto generation = _next_xiaozhi_listen_generation();
+    _schedule_xiaozhi_start_listening(generation);
 }
 
 bool Hal::isXiaozhiListening()
