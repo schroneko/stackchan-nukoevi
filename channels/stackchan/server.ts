@@ -17,6 +17,7 @@ import mqtt from 'mqtt'
 const host = process.env.STACKCHAN_CHANNEL_HOST ?? '0.0.0.0'
 const publicHost = process.env.STACKCHAN_PUBLIC_HOST ?? '192.168.1.10'
 const port = Number(process.env.STACKCHAN_CHANNEL_PORT ?? '18080')
+const httpServerEnabled = process.env.STACKCHAN_HTTP_SERVER_ENABLED !== '0'
 const assistantTimeoutMs = Number(process.env.STACKCHAN_REPLY_TIMEOUT_MS ?? '120000')
 const upstreamOtaUrl = process.env.STACKCHAN_UPSTREAM_OTA_URL ?? 'https://api.tenclass.net/xiaozhi/ota/'
 const statePath = process.env.STACKCHAN_RELAY_STATE_PATH ?? `${homedir()}/.local/state/stackchan-xiaozhi-relay/upstream.json`
@@ -1669,7 +1670,8 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   })
 }
 
-Bun.serve<StackChanConnection>({
+if (httpServerEnabled) {
+  Bun.serve<StackChanConnection>({
   hostname: host,
   port,
   async fetch(req, server) {
@@ -1896,7 +1898,8 @@ Bun.serve<StackChanConnection>({
       })
     },
   },
-})
+  })
+}
 
 const transport = new StdioServerTransport()
 loadUpstreamConfigs()
