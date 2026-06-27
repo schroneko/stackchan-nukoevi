@@ -434,7 +434,9 @@ async function ensureMqtt() {
   mqttReady = new Promise(resolve => {
     mqttClient?.once('connect', () => {
       log(`MQTT connected: ${mqttUrl}`)
-      const topics = directMcpChannel ? [mqttOutputTopic, mqttInputTopic, mqttStateTopic] : [mqttOutputTopic, mqttStateTopic]
+      const topics = mqttEmbedded || stackChanAgentTransport === 'claude-code-channels'
+        ? [mqttOutputTopic, mqttInputTopic, mqttStateTopic]
+        : [mqttOutputTopic, mqttStateTopic]
       mqttClient?.subscribe(topics, err => {
         if (err) log(`MQTT subscribe failed: ${err}`)
         else log(`MQTT subscribed: ${topics.join(', ')}`)
@@ -526,6 +528,11 @@ async function handleMqttOutput(raw: string) {
   if (entry) {
     void speakStackChanAssistant(text, false)
     entry.resolve({ text, speechHandled: true })
+    return
+  }
+
+  if (requestId && event.session_id !== 'broadcast') {
+    log(`MQTT output ignored: unknown request_id=${requestId}`)
     return
   }
 
@@ -1350,15 +1357,10 @@ function emitEvictlChannel(text: string, meta: Record<string, string>) {
   const sessionId = meta.session_id ?? 'stackchan'
   const deviceId = meta.device_id ?? 'stackchan'
   const prompt = [
-    `StackChan voice input arrived from ${source}.`,
-    `request_id: ${requestId}`,
-    `session_id: ${sessionId}`,
-    `device_id: ${deviceId}`,
-    `text: ${text}`,
-    '',
+    `StackChan voice input arrived from ${source}. request_id: ${requestId}; session_id: ${sessionId}; device_id: ${deviceId}; text: ${text}`,
     'Reply by calling mcp__stackchan__reply with this exact request_id and a concise Japanese text.',
     'Do not call Telegram tools for this StackChan voice input.',
-  ].join('\n')
+  ].join(' ')
   const result = spawnSync(evictlBin, ['send', evictlIdentity, '--text', prompt, '--source', 'stackchan-relay'], {
     encoding: 'utf8',
   })
@@ -1617,11 +1619,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const text = String(args.text ?? '').trim()
   const entry = pending.get(requestId)
   if (!entry) {
+    if (requestId && mqttEmbedded) {
+      log(`StackChan reply ignored: unknown request_id=${requestId}`)
+      return { content: [{ type: 'text', text: 'ignored unknown request_id' }] }
+    }
     const event = mqttEvent('output.text', text, {
       correlation_id: requestId || randomUUID(),
       source: 'claude',
       target: 'all',
-      session_id: 'broadcast',
+      session_id: requestId ? 'stackchan-reply' : 'broadcast',
       device_id: 'stackchan',
     })
     rememberLocalOutput(event)

@@ -135,6 +135,7 @@ static constexpr uint32_t _caption_audio_end_grace_ms = 0;
 static constexpr uint32_t _xiaozhi_text_timeout_ms = 4000;
 static constexpr uint32_t _xiaozhi_start_timeout_ms = 10000;
 static constexpr uint32_t _mic_min_hold_ms = 600;
+static constexpr uint32_t _xiaozhi_stop_drain_ms = 900;
 static constexpr int _caption_width       = 316;
 static constexpr int _caption_label_width = 300;
 static constexpr int _top_mark_size = 54;
@@ -159,6 +160,9 @@ static int32_t _volume_index = 0;
 static int32_t _external_led_index = 0;
 static bool _controls_syncing = false;
 static bool _xiaozhi_interaction_requested = false;
+static bool _xiaozhi_stop_pending = false;
+static uint32_t _xiaozhi_stop_pending_at = 0;
+static const char* _xiaozhi_stop_pending_reason = "release";
 static std::unique_ptr<Mqtt> _mqtt_output_client;
 static std::mutex _mqtt_output_mutex;
 static std::queue<std::string> _mqtt_output_messages;
@@ -232,6 +236,8 @@ static void begin_xiaozhi_voice_input();
 static void end_xiaozhi_voice_input();
 static void handle_mic_button_event(lv_event_t* event);
 static void request_xiaozhi_stop_listening(const char* reason);
+static void request_xiaozhi_stop_listening_after_drain(const char* reason);
+static void handle_pending_xiaozhi_stop(uint32_t now);
 static void begin_evictl_camera_task();
 static void publish_mqtt_input(const std::string& text, const char* role = nullptr);
 static void publish_mqtt_state(const char* event_type, const std::string& text, const char* role = nullptr);
@@ -1336,17 +1342,16 @@ static void show_controls_modal()
 static bool is_night_time()
 {
     const time_t now_t = time(nullptr);
-    const time_t jst_t = now_t + 9 * 60 * 60;
-    struct tm jst_tm;
-    if (gmtime_r(&jst_t, &jst_tm) == nullptr) {
+    struct tm local_tm;
+    if (localtime_r(&now_t, &local_tm) == nullptr) {
         return false;
     }
 
-    if (jst_tm.tm_year < 124) {
+    if (local_tm.tm_year < 124) {
         return false;
     }
 
-    return jst_tm.tm_hour >= 22 || jst_tm.tm_hour < 7;
+    return local_tm.tm_hour >= 22 || local_tm.tm_hour < 7;
 }
 
 static void start_local_llm_request()
@@ -1475,7 +1480,7 @@ static void end_xiaozhi_voice_input()
         _xiaozhi_text_waiting = true;
         _xiaozhi_text_waiting_at = GetHAL().millis();
     }
-    request_xiaozhi_stop_listening("release");
+    request_xiaozhi_stop_listening_after_drain("release");
     _xiaozhi_interaction_requested = false;
     _mic_pressed_at = 0;
     _mic_touch_lost_at = 0;
@@ -1483,8 +1488,26 @@ static void end_xiaozhi_voice_input()
 
 static void request_xiaozhi_stop_listening(const char* reason)
 {
+    _xiaozhi_stop_pending = false;
+    _xiaozhi_stop_pending_at = 0;
     publish_mqtt_state("xiaozhi.stop.requested", reason);
     GetHAL().stopXiaozhiListening();
+}
+
+static void request_xiaozhi_stop_listening_after_drain(const char* reason)
+{
+    _xiaozhi_stop_pending = true;
+    _xiaozhi_stop_pending_at = GetHAL().millis() + _xiaozhi_stop_drain_ms;
+    _xiaozhi_stop_pending_reason = reason;
+    publish_mqtt_state("xiaozhi.stop.pending", reason);
+}
+
+static void handle_pending_xiaozhi_stop(uint32_t now)
+{
+    if (!_xiaozhi_stop_pending || static_cast<int32_t>(now - _xiaozhi_stop_pending_at) < 0) {
+        return;
+    }
+    request_xiaozhi_stop_listening(_xiaozhi_stop_pending_reason);
 }
 
 static void handle_mic_button_event(lv_event_t* event)
@@ -2579,6 +2602,7 @@ void AppNukoevi::onRunning()
     handle_mqtt_output_connection_watchdog(now);
     process_mqtt_output_messages();
     ensure_audio_ws_receiver();
+    handle_pending_xiaozhi_stop(now);
     publish_touch_point();
     handle_mic_touch_release_fallback();
 
