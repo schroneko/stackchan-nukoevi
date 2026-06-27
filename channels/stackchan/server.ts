@@ -8,9 +8,9 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { spawnSync } from 'child_process'
 import { randomUUID } from 'crypto'
-import { mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { createServer } from 'net'
-import { homedir } from 'os'
+import { homedir, tmpdir } from 'os'
 import { Aedes } from 'aedes'
 import mqtt from 'mqtt'
 
@@ -55,6 +55,12 @@ const irodoriTtsWarmupCooldownMs = Number(process.env.STACKCHAN_IRODORI_TTS_WARM
 const irodoriTtsWarmupOnListen = process.env.STACKCHAN_IRODORI_TTS_WARMUP_ON_LISTEN === '1'
 const irodoriTtsRateLimitCooldownMs = Number(process.env.STACKCHAN_IRODORI_TTS_RATE_LIMIT_COOLDOWN_MS ?? '180000')
 const assistantSpeechQueueMs = Number(process.env.STACKCHAN_ASSISTANT_SPEECH_QUEUE_MS ?? '30000')
+const assistantSpeechQueueLimit = Number(process.env.STACKCHAN_ASSISTANT_SPEECH_QUEUE_LIMIT ?? '8')
+const fastFirstAudioEnabled = process.env.STACKCHAN_FAST_FIRST_AUDIO !== '0'
+const fastFirstAudioMaxChars = Number(process.env.STACKCHAN_FAST_FIRST_AUDIO_MAX_CHARS ?? '28')
+const fastLocalTtsEnabled = process.env.STACKCHAN_FAST_LOCAL_TTS !== '0'
+const fastLocalTtsVoice = process.env.STACKCHAN_FAST_LOCAL_TTS_VOICE ?? 'Kyoko'
+const fastLocalTtsFirstChunkOnly = process.env.STACKCHAN_FAST_LOCAL_TTS_FIRST_CHUNK_ONLY === '1'
 const evictlBin = process.env.STACKCHAN_EVICTL_BIN ?? `${homedir()}/ghq/github.com/schroneko/evictl/bin/evictl`
 const evictlIdentity = process.env.STACKCHAN_EVICTL_IDENTITY ?? 'nukoevi'
 
@@ -155,6 +161,11 @@ type ClaudeReply = {
 type MqttAudioPublishSession = {
   id: string
   text: string
+  ttsProvider?: 'irodori' | 'macos-say'
+  requestId?: string
+  chunkIndex?: number
+  chunkCount?: number
+  originalText?: string
   transport?: 'mqtt' | 'ws'
   qos: MqttQos
   frameDelayMs: number
@@ -190,6 +201,46 @@ type PendingAssistantSpeech = {
 type PendingMqttAssistantAudio = {
   text: string
   createdAt: number
+  requestId?: string
+  chunkIndex?: number
+  chunkCount?: number
+  originalText?: string
+}
+
+type TurnTrace = {
+  requestId: string
+  source: string
+  sessionId: string
+  deviceId: string
+  text: string
+  replyText?: string
+  status: 'pending' | 'replied' | 'audio_started' | 'audio_done' | 'error' | 'timeout'
+  listenStartedAt?: string
+  listenStoppedAt?: string
+  sttAt?: string
+  channelEmitAt?: string
+  channelEmitDoneAt?: string
+  replyToolAt?: string
+  assistantSpeechAt?: string
+  firstAudioRequestAt?: string
+  firstAudioFrameAt?: string
+  firstAudioDoneAt?: string
+  finalAudioDoneAt?: string
+  audioChunks: Array<{
+    id: string
+    index?: number
+    count?: number
+    text: string
+    startedAt: string
+    firstFrameAt?: string
+    finishedAt?: string
+    synthesisDurationMs?: number
+    publishDurationMs?: number
+    durationMs?: number
+    ttsProvider?: 'irodori' | 'macos-say'
+    error?: string
+  }>
+  error?: string
 }
 
 type IrodoriSynthesisResponse = {
@@ -272,6 +323,87 @@ const recentXiaozhiEvents: Array<{
   deviceId: string
 }> = []
 let lastChannelEmit: { text: string; meta: Record<string, string>; transport: StackChanAgentTransport; ts: string } | undefined
+const recentTurnTraces: TurnTrace[] = []
+const turnTracesByRequest = new Map<string, TurnTrace>()
+
+function latestXiaozhiEvent(sessionId: string, type: string, state?: string) {
+  for (let index = recentXiaozhiEvents.length - 1; index >= 0; index--) {
+    const event = recentXiaozhiEvents[index]
+    if (event.sessionId !== sessionId || event.type !== type) continue
+    if (state && event.state !== state) continue
+    return event
+  }
+  return undefined
+}
+
+function latestUpstreamMessage(sessionId: string, type: string, state?: string) {
+  for (let index = recentUpstreamTextMessages.length - 1; index >= 0; index--) {
+    const message = recentUpstreamTextMessages[index]
+    if (message.sessionId !== sessionId || message.type !== type) continue
+    if (state && message.state !== state) continue
+    return message
+  }
+  return undefined
+}
+
+function rememberTurnTrace(trace: TurnTrace) {
+  turnTracesByRequest.set(trace.requestId, trace)
+  recentTurnTraces.push(trace)
+  while (recentTurnTraces.length > 20) {
+    const removed = recentTurnTraces.shift()
+    if (removed) turnTracesByRequest.delete(removed.requestId)
+  }
+}
+
+function durationBetween(start?: string, end?: string) {
+  if (!start || !end) return undefined
+  const ms = Date.parse(end) - Date.parse(start)
+  return Number.isFinite(ms) ? ms : undefined
+}
+
+function turnTraceView(trace: TurnTrace) {
+  const latency = {
+    listenMs: durationBetween(trace.listenStartedAt, trace.listenStoppedAt),
+    stopToSttMs: durationBetween(trace.listenStoppedAt, trace.sttAt),
+    sttToChannelEmitMs: durationBetween(trace.sttAt, trace.channelEmitAt),
+    channelEmitMs: durationBetween(trace.channelEmitAt, trace.channelEmitDoneAt),
+    sttToReplyToolMs: durationBetween(trace.sttAt, trace.replyToolAt),
+    replyToolToFirstAudioRequestMs: durationBetween(trace.replyToolAt, trace.firstAudioRequestAt),
+    firstAudioRequestToFirstFrameMs: durationBetween(trace.firstAudioRequestAt, trace.firstAudioFrameAt),
+    sttToFirstAudioFrameMs: durationBetween(trace.sttAt, trace.firstAudioFrameAt),
+    stopToFirstAudioFrameMs: durationBetween(trace.listenStoppedAt, trace.firstAudioFrameAt),
+    sttToFinalAudioDoneMs: durationBetween(trace.sttAt, trace.finalAudioDoneAt),
+    stopToFinalAudioDoneMs: durationBetween(trace.listenStoppedAt, trace.finalAudioDoneAt),
+  }
+  return { ...trace, latency }
+}
+
+function latencySummary() {
+  const traces = recentTurnTraces.map(turnTraceView)
+  const latest = traces.at(-1)
+  const stopToFirstValues = traces
+    .map(trace => trace.latency.stopToFirstAudioFrameMs)
+    .filter((value): value is number => value !== undefined)
+  const sttToFirstValues = traces
+    .map(trace => trace.latency.sttToFirstAudioFrameMs)
+    .filter((value): value is number => value !== undefined)
+  const averageStopToFirstAudioFrameMs = stopToFirstValues.length === 0
+    ? undefined
+    : Math.round(stopToFirstValues.reduce((sum, value) => sum + value, 0) / stopToFirstValues.length)
+  const averageSttToFirstAudioFrameMs = sttToFirstValues.length === 0
+    ? undefined
+    : Math.round(sttToFirstValues.reduce((sum, value) => sum + value, 0) / sttToFirstValues.length)
+  return {
+    latest,
+    sampleCount: traces.length,
+    stopToFirstAudioFrameSampleCount: stopToFirstValues.length,
+    sttToFirstAudioFrameSampleCount: sttToFirstValues.length,
+    averageStopToFirstAudioFrameMs,
+    averageSttToFirstAudioFrameMs,
+    targetStopToFirstAudioFrameMs: 8000,
+    targetSttToFirstAudioFrameMs: 8000,
+  }
+}
 
 function pushXiaozhiEvent(event: {
   type: string
@@ -526,7 +658,13 @@ async function handleMqttOutput(raw: string) {
   const requestId = event.correlation_id ?? event.id ?? ''
   const entry = requestId ? pending.get(requestId) : undefined
   if (entry) {
-    void speakStackChanAssistant(text, false)
+    const trace = turnTracesByRequest.get(requestId)
+    if (trace) {
+      trace.replyToolAt = nowIso()
+      trace.replyText = text
+      trace.status = 'replied'
+    }
+    void speakStackChanAssistant(text, false, { requestId })
     entry.resolve({ text, speechHandled: true })
     return
   }
@@ -537,7 +675,7 @@ async function handleMqttOutput(raw: string) {
   }
 
   if (event.target && event.target !== 'stackchan' && event.target !== 'all') return
-  void speakStackChanAssistant(text, true)
+  void speakStackChanAssistant(text, true, { requestId })
 }
 
 async function handleMqttState(raw: string) {
@@ -663,6 +801,30 @@ function normalizeText(text: string) {
   return text.replace(/\s+/g, ' ').trim()
 }
 
+function splitAssistantAudioText(text: string) {
+  const normalized = normalizeText(text)
+  if (!fastFirstAudioEnabled || normalized.length <= fastFirstAudioMaxChars) return [normalized]
+
+  const parts = normalized.match(/[^。！？!?]+[。！？!?〜ー]*|.+$/g)?.map(part => part.trim()).filter(Boolean) ?? [normalized]
+  if (parts.length > 1) return parts
+
+  const softBreaks = ['、', ',', '，', ' ']
+  for (const mark of softBreaks) {
+    const index = normalized.indexOf(mark)
+    if (index > 0 && index + 1 <= fastFirstAudioMaxChars) {
+      return [
+        normalized.slice(0, index + 1).trim(),
+        normalized.slice(index + 1).trim(),
+      ].filter(Boolean)
+    }
+  }
+
+  return [
+    normalized.slice(0, fastFirstAudioMaxChars).trim(),
+    normalized.slice(fastFirstAudioMaxChars).trim(),
+  ].filter(Boolean)
+}
+
 function normalizeDeviceId(value: string) {
   return value.replace(/[^0-9a-f]/gi, '').toLowerCase()
 }
@@ -753,7 +915,7 @@ function oggOpusPackets(ogg: Uint8Array) {
   return packets
 }
 
-function encodeMp3ToOpusPackets(mp3: Uint8Array) {
+function encodeAudioToOpusPackets(audio: Uint8Array) {
   const result = spawnSync('ffmpeg', [
     '-hide_banner',
     '-loglevel',
@@ -776,7 +938,7 @@ function encodeMp3ToOpusPackets(mp3: Uint8Array) {
     'opus',
     'pipe:1',
   ], {
-    input: Buffer.from(mp3),
+    input: Buffer.from(audio),
     maxBuffer: 16 * 1024 * 1024,
   })
 
@@ -785,6 +947,26 @@ function encodeMp3ToOpusPackets(mp3: Uint8Array) {
   }
 
   return oggOpusPackets(new Uint8Array(result.stdout))
+}
+
+function encodeMp3ToOpusPackets(mp3: Uint8Array) {
+  return encodeAudioToOpusPackets(mp3)
+}
+
+function synthesizeMacOsSpeech(text: string) {
+  const audioPath = `${tmpdir()}/stackchan-say-${randomUUID()}.aiff`
+  const result = spawnSync('say', ['-v', fastLocalTtsVoice, '-o', audioPath, text], {
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+  })
+  try {
+    if (result.status !== 0) {
+      throw new Error(`say failed: ${result.stderr || result.stdout}`)
+    }
+    return new Uint8Array(readFileSync(audioPath))
+  } finally {
+    rmSync(audioPath, { force: true })
+  }
 }
 
 function buildIrodoriSynthesisUrl(text: string, steps: string, seconds?: string) {
@@ -1048,7 +1230,12 @@ async function sendStackChanAssistantSafe(ws: ServerWebSocket<StackChanConnectio
   }
 }
 
-async function publishMqttAssistantAudio(text: string) {
+async function publishMqttAssistantAudio(text: string, options: {
+  requestId?: string
+  chunkIndex?: number
+  chunkCount?: number
+  originalText?: string
+} = {}) {
   if (!mqttEnabled || !irodoriTtsEnabled) return
 
   const audioId = randomUUID()
@@ -1056,6 +1243,10 @@ async function publishMqttAssistantAudio(text: string) {
   const session: MqttAudioPublishSession = {
     id: audioId,
     text,
+    requestId: options.requestId,
+    chunkIndex: options.chunkIndex,
+    chunkCount: options.chunkCount,
+    originalText: options.originalText,
     qos: mqttAudioQos,
     frameDelayMs: irodoriTtsMqttFrameDelayMs,
     total: 0,
@@ -1066,16 +1257,29 @@ async function publishMqttAssistantAudio(text: string) {
   while (recentMqttAudioPublishes.length > 12) {
     recentMqttAudioPublishes.shift()
   }
+  const trace = options.requestId ? turnTracesByRequest.get(options.requestId) : undefined
+  if (trace) {
+    trace.audioChunks.push({
+      id: audioId,
+      index: options.chunkIndex,
+      count: options.chunkCount,
+      text,
+      startedAt: session.startedAt,
+    })
+    if (!trace.firstAudioRequestAt) trace.firstAudioRequestAt = session.startedAt
+  }
 
   try {
-    log(`Irodori TTS request: ${audioId} transport=${irodoriTtsAudioTransport} ${text}`)
+    const useLocalTts = fastLocalTtsEnabled && (!fastLocalTtsFirstChunkOnly || options.chunkIndex === undefined || options.chunkIndex === 0)
+    session.ttsProvider = useLocalTts ? 'macos-say' : 'irodori'
+    log(`${session.ttsProvider} TTS request: ${audioId} transport=${irodoriTtsAudioTransport} ${text}`)
     const synthesisStarted = Date.now()
     session.synthesisStartedAt = nowIso()
-    const mp3 = await synthesizeIrodoriMp3(text)
+    const audio = useLocalTts ? synthesizeMacOsSpeech(text) : await synthesizeIrodoriMp3(text)
     session.synthesisFinishedAt = nowIso()
     session.synthesisDurationMs = Date.now() - synthesisStarted
     const encodeStarted = Date.now()
-    const packets = encodeMp3ToOpusPackets(mp3)
+    const packets = encodeAudioToOpusPackets(audio)
     session.encodeDurationMs = Date.now() - encodeStarted
     session.total = packets.length
     session.publishStartedAt = nowIso()
@@ -1102,13 +1306,17 @@ async function publishMqttAssistantAudio(text: string) {
         audio_id: audioId,
         total: packets.length,
       })
-      log(`Irodori WS TTS packets: ${audioId} total=${packets.length} clients=${audioSockets.length} delay=${irodoriTtsFrameDelayMs} synthesis=${session.synthesisDurationMs} encode=${session.encodeDurationMs}`)
+      log(`${session.ttsProvider} WS audio packets: ${audioId} total=${packets.length} clients=${audioSockets.length} delay=${irodoriTtsFrameDelayMs} synthesis=${session.synthesisDurationMs} encode=${session.encodeDurationMs}`)
       for (const ws of audioSockets) {
         ws.send(startMessage)
       }
       for (let i = 0; i < packets.length; i++) {
         if (i === 0) {
           session.firstFrameAt = nowIso()
+          if (trace && !trace.firstAudioFrameAt) {
+            trace.firstAudioFrameAt = session.firstFrameAt
+            trace.status = 'audio_started'
+          }
         }
         for (const ws of audioSockets) {
           ws.send(packets[i])
@@ -1126,10 +1334,14 @@ async function publishMqttAssistantAudio(text: string) {
       throw new Error('Irodori websocket TTS failed: no StackChan audio websocket clients')
     } else {
       session.transport = 'mqtt'
-      log(`Irodori MQTT TTS packets: ${audioId} total=${packets.length} qos=${mqttAudioQos} delay=${irodoriTtsMqttFrameDelayMs} synthesis=${session.synthesisDurationMs} encode=${session.encodeDurationMs}`)
+      log(`${session.ttsProvider} MQTT audio packets: ${audioId} total=${packets.length} qos=${mqttAudioQos} delay=${irodoriTtsMqttFrameDelayMs} synthesis=${session.synthesisDurationMs} encode=${session.encodeDurationMs}`)
       for (let i = 0; i < packets.length; i++) {
         if (i === 0) {
           session.firstFrameAt = nowIso()
+          if (trace && !trace.firstAudioFrameAt) {
+            trace.firstAudioFrameAt = session.firstFrameAt
+            trace.status = 'audio_started'
+          }
         }
         await publishMqttOutputAudio(mqttEvent('output.audio.opus', text, {
           source: 'stackchan-relay',
@@ -1152,11 +1364,37 @@ async function publishMqttAssistantAudio(text: string) {
     session.publishDurationMs = Date.now() - publishStarted
     session.finishedAt = nowIso()
     session.durationMs = Date.now() - started
-    log(`Irodori ${session.transport?.toUpperCase() ?? 'AUDIO'} TTS published: ${audioId} total=${session.total} duration=${session.durationMs} synthesis=${session.synthesisDurationMs} publish=${session.publishDurationMs}`)
+    if (trace) {
+      const chunk = trace.audioChunks.find(item => item.id === audioId)
+      if (chunk) {
+        chunk.firstFrameAt = session.firstFrameAt
+        chunk.finishedAt = session.finishedAt
+        chunk.synthesisDurationMs = session.synthesisDurationMs
+        chunk.publishDurationMs = session.publishDurationMs
+        chunk.durationMs = session.durationMs
+        chunk.ttsProvider = session.ttsProvider
+      }
+      if (options.chunkIndex === 0) trace.firstAudioDoneAt = session.finishedAt
+      if (options.chunkIndex === undefined || options.chunkIndex === (options.chunkCount ?? 1) - 1) {
+        trace.finalAudioDoneAt = session.finishedAt
+        trace.status = 'audio_done'
+      }
+    }
+    log(`${session.ttsProvider} ${session.transport?.toUpperCase() ?? 'AUDIO'} audio published: ${audioId} total=${session.total} duration=${session.durationMs} synthesis=${session.synthesisDurationMs} publish=${session.publishDurationMs}`)
   } catch (err) {
     session.error = String(err)
     session.finishedAt = nowIso()
     session.durationMs = Date.now() - started
+    if (trace) {
+      const chunk = trace.audioChunks.find(item => item.id === audioId)
+      if (chunk) {
+        chunk.error = session.error
+        chunk.finishedAt = session.finishedAt
+        chunk.durationMs = session.durationMs
+      }
+      trace.error = session.error
+      trace.status = 'error'
+    }
     log(`Irodori TTS skipped: ${err}`)
   }
 }
@@ -1166,7 +1404,7 @@ function trimPendingMqttAssistantAudio() {
   while (pendingMqttAssistantAudio.length > 0 && pendingMqttAssistantAudio[0].createdAt < expiresAt) {
     pendingMqttAssistantAudio.shift()
   }
-  while (pendingMqttAssistantAudio.length > 4) {
+  while (pendingMqttAssistantAudio.length > assistantSpeechQueueLimit) {
     pendingMqttAssistantAudio.shift()
   }
 }
@@ -1181,19 +1419,36 @@ async function flushPendingMqttAssistantAudio() {
     while (pendingMqttAssistantAudio.length > 0) {
       const item = pendingMqttAssistantAudio.shift()
       if (!item) continue
-      await publishMqttAssistantAudio(item.text)
+      await publishMqttAssistantAudio(item.text, {
+        requestId: item.requestId,
+        chunkIndex: item.chunkIndex,
+        chunkCount: item.chunkCount,
+        originalText: item.originalText,
+      })
     }
   } finally {
     mqttAssistantAudioSending = false
   }
 }
 
-function queueMqttAssistantAudio(text: string) {
+function queueMqttAssistantAudio(text: string, options: { requestId?: string } = {}) {
   const normalized = normalizeText(text)
   if (!normalized || !mqttEnabled || !irodoriTtsEnabled) return
-  pendingMqttAssistantAudio.push({ text: normalized, createdAt: Date.now() })
+  const chunks = splitAssistantAudioText(normalized)
+  chunks.forEach((chunk, index) => {
+    pendingMqttAssistantAudio.push({
+      text: chunk,
+      createdAt: Date.now(),
+      requestId: options.requestId,
+      chunkIndex: index,
+      chunkCount: chunks.length,
+      originalText: normalized,
+    })
+  })
   trimPendingMqttAssistantAudio()
-  void flushPendingMqttAssistantAudio()
+  setTimeout(() => {
+    void flushPendingMqttAssistantAudio()
+  }, 0)
 }
 
 function trimPendingAssistantSpeech() {
@@ -1201,7 +1456,7 @@ function trimPendingAssistantSpeech() {
   while (pendingAssistantSpeech.length > 0 && pendingAssistantSpeech[0].createdAt < expiresAt) {
     pendingAssistantSpeech.shift()
   }
-  while (pendingAssistantSpeech.length > 4) {
+  while (pendingAssistantSpeech.length > assistantSpeechQueueLimit) {
     pendingAssistantSpeech.shift()
   }
 }
@@ -1225,21 +1480,26 @@ async function flushPendingAssistantSpeech() {
   }
 }
 
-async function speakStackChanAssistant(text: string, queueWhenDisconnected: boolean) {
+async function speakStackChanAssistant(text: string, queueWhenDisconnected: boolean, options: { requestId?: string } = {}) {
   const normalized = normalizeText(text)
   if (!normalized) return
 
   trimPendingAssistantSpeech()
   if (mqttEnabled && irodoriTtsEnabled) {
     lastAssistantSpeech = { text: normalized, queued: false, ts: nowIso() }
-    queueMqttAssistantAudio(normalized)
+    const trace = options.requestId ? turnTracesByRequest.get(options.requestId) : undefined
+    if (trace) {
+      trace.assistantSpeechAt = lastAssistantSpeech.ts
+      trace.status = 'replied'
+    }
+    queueMqttAssistantAudio(normalized, { requestId: options.requestId })
     return
   }
 
   if (stackChanSockets.size === 0) {
     if (mqttEnabled) {
       lastAssistantSpeech = { text: normalized, queued: false, ts: nowIso() }
-      queueMqttAssistantAudio(normalized)
+      queueMqttAssistantAudio(normalized, { requestId: options.requestId })
     } else if (queueWhenDisconnected) {
       pendingAssistantSpeech.push({ text: normalized, createdAt: Date.now() })
       lastAssistantSpeech = { text: normalized, queued: true, ts: nowIso() }
@@ -1370,20 +1630,45 @@ function emitEvictlChannel(text: string, meta: Record<string, string>) {
 }
 
 async function emitChannel(text: string, meta: Record<string, string>) {
+  const requestId = meta.request_id
+  const trace = requestId ? turnTracesByRequest.get(requestId) : undefined
   lastChannelEmit = { text, meta, transport: stackChanAgentTransport, ts: nowIso() }
+  if (trace) trace.channelEmitAt = lastChannelEmit.ts
   if (stackChanAgentTransport === 'evictl') {
     emitEvictlChannel(text, meta)
+    if (trace) trace.channelEmitDoneAt = nowIso()
     return
   }
   await emitClaudeCodeChannel(text, meta)
+  if (trace) trace.channelEmitDoneAt = nowIso()
 }
 
 async function askClaude(text: string, socket: ServerWebSocket<StackChanConnection> | undefined, sessionId: string, deviceId: string): Promise<ClaudeReply> {
   const id = randomUUID()
   const started = Date.now()
+  const listenStart = latestXiaozhiEvent(sessionId, 'listen', 'start')
+  const listenStop = latestXiaozhiEvent(sessionId, 'listen', 'stop')
+  const stt = latestUpstreamMessage(sessionId, 'stt')
+  rememberTurnTrace({
+    requestId: id,
+    source: socket ? 'stackchan' : 'http',
+    sessionId,
+    deviceId,
+    text,
+    status: 'pending',
+    listenStartedAt: listenStart?.ts,
+    listenStoppedAt: listenStop?.ts,
+    sttAt: stt?.ts ?? nowIso(),
+    audioChunks: [],
+  })
   return await new Promise<ClaudeReply>((resolve) => {
     const timer = setTimeout(() => {
       pending.delete(id)
+      const trace = turnTracesByRequest.get(id)
+      if (trace) {
+        trace.status = 'timeout'
+        trace.error = 'assistant timeout'
+      }
       resolve({ text: '時間がかかりすぎちゃったの。もう一回話しかけてね。', speechHandled: false })
     }, assistantTimeoutMs)
 
@@ -1396,6 +1681,12 @@ async function askClaude(text: string, socket: ServerWebSocket<StackChanConnecti
       resolve: value => {
         clearTimeout(timer)
         pending.delete(id)
+        const trace = turnTracesByRequest.get(id)
+        if (trace) {
+          trace.replyText = value.text
+          if (!trace.replyToolAt) trace.replyToolAt = nowIso()
+          if (value.speechHandled) trace.status = 'replied'
+        }
         resolve(value)
       },
     })
@@ -1427,6 +1718,11 @@ async function askClaude(text: string, socket: ServerWebSocket<StackChanConnecti
     }).catch(err => {
       clearTimeout(timer)
       pending.delete(id)
+      const trace = turnTracesByRequest.get(id)
+      if (trace) {
+        trace.status = 'error'
+        trace.error = String(err)
+      }
       log(`failed to deliver inbound to Claude: ${err}`)
       resolve({ text: 'Claude Code Channels に送れなかったの。Mac 側を確認してね。', speechHandled: false })
     })
@@ -1632,8 +1928,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     })
     rememberLocalOutput(event)
     await publishMqttOutput(event)
-    void speakStackChanAssistant(text, false)
+    void speakStackChanAssistant(text, false, { requestId })
     return { content: [{ type: 'text', text: 'sent' }] }
+  }
+  const trace = turnTracesByRequest.get(requestId)
+  if (trace) {
+    trace.replyToolAt = nowIso()
+    trace.replyText = text
+    trace.status = 'replied'
   }
 
   const event = mqttEvent('output.text', text, {
@@ -1645,7 +1947,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   })
   rememberLocalOutput(event)
   await publishMqttOutput(event)
-  void speakStackChanAssistant(text, false)
+  void speakStackChanAssistant(text, false, { requestId })
   entry.resolve({ text, speechHandled: true })
   return { content: [{ type: 'text', text: 'sent' }] }
 })
@@ -1715,12 +2017,22 @@ if (httpServerEnabled) {
           rateLimitCooldownMs: irodoriTtsRateLimitCooldownMs,
           rateLimitedUntil: irodoriTtsRateLimitedUntil > Date.now() ? new Date(irodoriTtsRateLimitedUntil).toISOString() : undefined,
           lastRateLimit: lastIrodoriTtsRateLimit,
+          fastFirstAudio: {
+            enabled: fastFirstAudioEnabled,
+            maxChars: fastFirstAudioMaxChars,
+          },
+          fastLocalTts: {
+            enabled: fastLocalTtsEnabled,
+            voice: fastLocalTtsVoice,
+            firstChunkOnly: fastLocalTtsFirstChunkOnly,
+          },
         },
         stackChanClients: stackChanSockets.size,
         stackChanAudioClients: stackChanAudioSockets.size,
         pendingRequests: pending.size,
         pendingAssistantSpeech: pendingAssistantSpeech.length,
         pendingMqttAssistantAudio: pendingMqttAssistantAudio.length,
+        assistantSpeechQueueLimit,
         mqttAssistantAudioSending,
         irodoriWarmup: {
           inFlight: Boolean(irodoriWarmupInFlight),
@@ -1756,6 +2068,8 @@ if (httpServerEnabled) {
         recentMqttStates,
         recentMqttAudioPublishes,
         lastChannelEmit,
+        latencySummary: latencySummary(),
+        turnTraces: recentTurnTraces.map(turnTraceView),
       })
     }
     if (url.pathname.startsWith('/ota')) {
