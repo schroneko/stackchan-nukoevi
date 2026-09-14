@@ -136,6 +136,9 @@ static constexpr uint32_t _xiaozhi_text_timeout_ms = 4000;
 static constexpr uint32_t _xiaozhi_start_timeout_ms = 10000;
 static constexpr uint32_t _mic_min_hold_ms = 600;
 static constexpr uint32_t _xiaozhi_stop_drain_ms = 900;
+static constexpr uint32_t _mqtt_output_connect_retry_ms = 1000;
+static constexpr uint32_t _mqtt_output_stale_recreate_ms = 5000;
+static constexpr uint32_t _mqtt_output_healthcheck_ms = 5000;
 static constexpr int _caption_width       = 316;
 static constexpr int _caption_label_width = 300;
 static constexpr int _top_mark_size = 54;
@@ -160,9 +163,11 @@ static int32_t _volume_index = 0;
 static int32_t _external_led_index = 0;
 static bool _controls_syncing = false;
 static bool _xiaozhi_interaction_requested = false;
+static uint16_t _xiaozhi_start_retry_count = 0;
 static bool _xiaozhi_stop_pending = false;
 static uint32_t _xiaozhi_stop_pending_at = 0;
 static const char* _xiaozhi_stop_pending_reason = "release";
+static bool _xiaozhi_release_pending_after_start = false;
 static std::unique_ptr<Mqtt> _mqtt_output_client;
 static std::mutex _mqtt_output_mutex;
 static std::queue<std::string> _mqtt_output_messages;
@@ -170,6 +175,7 @@ static bool _mqtt_output_connecting = false;
 static bool _mqtt_output_connected = false;
 static uint32_t _mqtt_output_last_connect_at = 0;
 static uint32_t _mqtt_output_disconnected_at = 0;
+static uint32_t _mqtt_output_last_healthcheck_at = 0;
 static std::mutex _mqtt_audio_queue_mutex;
 static std::condition_variable _mqtt_audio_queue_cv;
 static std::queue<std::unique_ptr<AudioStreamPacket>> _mqtt_audio_packets;
@@ -191,13 +197,14 @@ static int _audio_ws_sample_rate = 16000;
 static int _audio_ws_frame_duration = 60;
 static int _audio_ws_total = 0;
 static int _audio_ws_received = 0;
-static constexpr const char* _mqtt_output_broker_host = "192.168.1.10";
+static constexpr const char* _mqtt_output_broker_host = "192.168.1.5";
 static constexpr int _mqtt_output_broker_port = 18883;
-static constexpr const char* _audio_ws_host = "192.168.1.10";
+static constexpr const char* _audio_ws_host = "192.168.1.5";
 static constexpr int _audio_ws_port = 18080;
 static constexpr const char* _mqtt_input_topic = "nukoevi/input/text";
 static constexpr const char* _mqtt_output_topic = "nukoevi/output/text";
 static constexpr const char* _mqtt_output_audio_topic = "nukoevi/output/audio/opus";
+static constexpr const char* _mqtt_debug_topic = "nukoevi/debug/command";
 static constexpr const char* _mqtt_state_topic = "nukoevi/device/stackchan/state";
 static constexpr const char* _blink_asset_names[] = {
     "nukoevi-screen-open.bin",
@@ -234,13 +241,15 @@ static const uint32_t _sleep_intervals[] = {
 
 static void begin_xiaozhi_voice_input();
 static void end_xiaozhi_voice_input();
+static void schedule_debug_voice_turn(uint32_t hold_ms);
 static void handle_mic_button_event(lv_event_t* event);
 static void request_xiaozhi_stop_listening(const char* reason);
 static void request_xiaozhi_stop_listening_after_drain(const char* reason);
 static void handle_pending_xiaozhi_stop(uint32_t now);
 static void begin_evictl_camera_task();
+static bool is_mqtt_output_connected();
 static void publish_mqtt_input(const std::string& text, const char* role = nullptr);
-static void publish_mqtt_state(const char* event_type, const std::string& text, const char* role = nullptr);
+static bool publish_mqtt_state(const char* event_type, const std::string& text, const char* role = nullptr);
 
 static bool is_valid_nukoevi_image(const lv_image_dsc_t* image)
 {
@@ -384,6 +393,27 @@ static void clear_pending_assistant_audio()
         std::lock_guard<std::mutex> lock(_audio_playback_mutex);
         _audio_playback_until = 0;
     }
+}
+
+static bool is_voice_input_blocking_assistant_audio()
+{
+    if (_mic_press_active || GetHAL().isXiaozhiListening()) {
+        return true;
+    }
+    const bool xiaozhi_idle = GetHAL().getXiaozhiDeviceState() == static_cast<int>(kDeviceStateIdle);
+    std::lock_guard<std::mutex> lock(_llm_mutex);
+    if (_xiaozhi_release_pending_after_start) {
+        return true;
+    }
+    if (_xiaozhi_interaction_requested && !xiaozhi_idle) {
+        return true;
+    }
+    return _xiaozhi_text_waiting && !xiaozhi_idle;
+}
+
+static bool should_ignore_assistant_audio()
+{
+    return is_voice_input_blocking_assistant_audio();
 }
 
 static bool is_caption_hold_active(uint32_t now)
@@ -539,6 +569,14 @@ static void handle_mqtt_audio_payload(const std::string& payload)
         return;
     }
 
+    if (should_ignore_assistant_audio()) {
+        const int sequence = doc["sequence"] | -1;
+        if (sequence == 0) {
+            publish_mqtt_state("audio.opus.ignored", "voice_input_active");
+        }
+        return;
+    }
+
     const char* encoded = doc["payload"] | "";
     const auto encoded_size = std::strlen(encoded);
     if (encoded_size == 0) {
@@ -622,6 +660,13 @@ static void handle_audio_ws_binary(const char* data, size_t len)
         return;
     }
 
+    if (should_ignore_assistant_audio()) {
+        if (_audio_ws_received == 0) {
+            publish_mqtt_state("audio.ws.ignored", "voice_input_active");
+        }
+        return;
+    }
+
     GetHAL().startXiaozhiBackground();
 
     const int sequence = _audio_ws_received;
@@ -639,10 +684,10 @@ static void handle_audio_ws_binary(const char* data, size_t len)
     _audio_ws_received++;
 }
 
-static void publish_mqtt_state(const char* event_type, const std::string& text, const char* role)
+static bool publish_mqtt_state(const char* event_type, const std::string& text, const char* role)
 {
     if (!_mqtt_output_client || !_mqtt_output_client->IsConnected()) {
-        return;
+        return false;
     }
 
     ArduinoJson::JsonDocument doc;
@@ -657,7 +702,39 @@ static void publish_mqtt_state(const char* event_type, const std::string& text, 
 
     std::string payload;
     ArduinoJson::serializeJson(doc, payload);
-    _mqtt_output_client->Publish(_mqtt_state_topic, payload, 0);
+    return _mqtt_output_client->Publish(_mqtt_state_topic, payload, 0);
+}
+
+static std::string xiaozhi_debug_snapshot(const char* reason)
+{
+    bool listening_started = false;
+    bool text_waiting = false;
+    bool release_pending = false;
+    {
+        std::lock_guard<std::mutex> lock(_llm_mutex);
+        listening_started = _xiaozhi_listening_started;
+        text_waiting = _xiaozhi_text_waiting;
+        release_pending = _xiaozhi_release_pending_after_start;
+    }
+
+    char text[256];
+    std::snprintf(text, sizeof(text),
+                  "reason=%s wifi=%d mqtt=%d bg=%d ready=%d listen_req=%d state=%d listening=%d speaking=%d mic=%d interaction=%d started=%d waiting=%d release_pending=%d retry=%u",
+                  reason ? reason : "", static_cast<int>(GetHAL().getWifiStatus()), is_mqtt_output_connected() ? 1 : 0,
+                  GetHAL().isXiaozhiBackgroundStarted() ? 1 : 0, GetHAL().isXiaozhiReady() ? 1 : 0,
+                  GetHAL().isXiaozhiListenRequested() ? 1 : 0, GetHAL().getXiaozhiDeviceState(),
+                  GetHAL().isXiaozhiListening() ? 1 : 0, GetHAL().isXiaozhiSpeaking() ? 1 : 0,
+                  _mic_press_active ? 1 : 0, _xiaozhi_interaction_requested ? 1 : 0,
+                  listening_started ? 1 : 0, text_waiting ? 1 : 0, release_pending ? 1 : 0,
+                  static_cast<unsigned int>(_xiaozhi_start_retry_count));
+    return text;
+}
+
+static void publish_xiaozhi_debug_state(const char* event_type, const char* reason)
+{
+    const auto snapshot = xiaozhi_debug_snapshot(reason);
+    publish_mqtt_state(event_type, snapshot);
+    mclog::tagInfo("NUKOEVI", "{} {}", event_type, snapshot.c_str());
 }
 
 static void publish_mqtt_input(const std::string& text, const char* role)
@@ -688,6 +765,55 @@ static void publish_mqtt_input(const std::string& text, const char* role)
     ArduinoJson::serializeJson(doc, payload);
     _mqtt_output_client->Publish(_mqtt_input_topic, payload, 1);
     publish_mqtt_state("mqtt.input.published", text, role);
+}
+
+static void debug_voice_turn_task(void* param)
+{
+    auto hold_ms = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(param));
+    if (hold_ms < 700) {
+        hold_ms = 700;
+    }
+    if (hold_ms > 30000) {
+        hold_ms = 30000;
+    }
+
+    publish_mqtt_state("debug.voice_turn.start", std::to_string(hold_ms));
+    mclog::tagInfo("NUKOEVI", "debug voice turn start hold_ms={}", static_cast<unsigned long>(hold_ms));
+    begin_xiaozhi_voice_input();
+    vTaskDelay(pdMS_TO_TICKS(hold_ms));
+    end_xiaozhi_voice_input();
+    publish_mqtt_state("debug.voice_turn.done", std::to_string(hold_ms));
+    mclog::tagInfo("NUKOEVI", "debug voice turn done hold_ms={}", static_cast<unsigned long>(hold_ms));
+    vTaskDelete(nullptr);
+}
+
+static void schedule_debug_voice_turn(uint32_t hold_ms)
+{
+    if (xTaskCreate(debug_voice_turn_task, "nukoevi_dbg_voice", 4096, reinterpret_cast<void*>(static_cast<uintptr_t>(hold_ms)),
+                    3, nullptr) != pdPASS) {
+        publish_mqtt_state("debug.voice_turn.failed", "task_start_failed");
+        mclog::tagWarn("NUKOEVI", "debug voice turn task failed");
+    }
+}
+
+static void handle_mqtt_debug_command(const std::string& payload)
+{
+    ArduinoJson::JsonDocument doc;
+    auto error = ArduinoJson::deserializeJson(doc, payload);
+    if (error) {
+        publish_mqtt_state("debug.command.ignored", "invalid_json");
+        return;
+    }
+
+    const char* type = doc["type"] | "";
+    if (std::strcmp(type, "debug.voice_turn") == 0) {
+        const uint32_t hold_ms = doc["hold_ms"] | 2500;
+        publish_xiaozhi_debug_state("debug.command.voice_turn", "mqtt_debug");
+        schedule_debug_voice_turn(hold_ms);
+        return;
+    }
+
+    publish_mqtt_state("debug.command.ignored", type);
 }
 
 static void close_audio_ws_receiver()
@@ -763,7 +889,7 @@ static void ensure_audio_ws_receiver()
     if (_audio_ws_close_requested) {
         close_audio_ws_receiver();
     }
-    if (!_audio_ws_requested || _mic_press_active || _xiaozhi_interaction_requested || GetHAL().isXiaozhiListening()) {
+    if (!_audio_ws_requested || is_voice_input_blocking_assistant_audio()) {
         return;
     }
     if (GetHAL().getWifiStatus() == WifiStatus::None) {
@@ -830,7 +956,7 @@ static void ensure_mqtt_output_receiver()
     }
 
     const auto now = GetHAL().millis();
-    if (_mqtt_output_last_connect_at != 0 && now - _mqtt_output_last_connect_at < 5000) {
+    if (_mqtt_output_last_connect_at != 0 && now - _mqtt_output_last_connect_at < _mqtt_output_connect_retry_ms) {
         return;
     }
     _mqtt_output_last_connect_at = now;
@@ -850,8 +976,10 @@ static void ensure_mqtt_output_receiver()
         mclog::tagInfo("NUKOEVI", "MQTT output receiver connected");
         _mqtt_output_connected = true;
         _mqtt_output_disconnected_at = 0;
+        _mqtt_output_last_healthcheck_at = GetHAL().millis();
         _mqtt_output_client->Subscribe(_mqtt_output_topic, 0);
         _mqtt_output_client->Subscribe(_mqtt_output_audio_topic, 1);
+        _mqtt_output_client->Subscribe(_mqtt_debug_topic, 0);
         publish_mqtt_audio_interrupted();
         publish_mqtt_state("mqtt.connected", "connected");
     });
@@ -867,6 +995,10 @@ static void ensure_mqtt_output_receiver()
         }
         if (topic == _mqtt_output_topic) {
             enqueue_mqtt_output_payload(payload);
+            return;
+        }
+        if (topic == _mqtt_debug_topic) {
+            handle_mqtt_debug_command(payload);
         }
     });
 
@@ -887,15 +1019,29 @@ static void handle_mqtt_output_connection_watchdog(uint32_t now)
     if (is_mqtt_output_connected()) {
         _mqtt_output_connected = true;
         _mqtt_output_disconnected_at = 0;
+        if (_mqtt_output_last_healthcheck_at == 0 ||
+            static_cast<int32_t>(now - _mqtt_output_last_healthcheck_at) >=
+                static_cast<int32_t>(_mqtt_output_healthcheck_ms)) {
+            _mqtt_output_last_healthcheck_at = now;
+            if (!publish_mqtt_state("mqtt.heartbeat", "connected")) {
+                _mqtt_output_connected = false;
+                _mqtt_output_disconnected_at = now;
+                _mqtt_output_client.reset();
+                _mqtt_output_last_connect_at = 0;
+                mclog::tagWarn("NUKOEVI", "MQTT output receiver heartbeat failed, recreating client");
+                ensure_mqtt_output_receiver();
+            }
+        }
         return;
     }
     _mqtt_output_connected = false;
     if (_mqtt_output_disconnected_at == 0) {
         _mqtt_output_disconnected_at = now;
     }
-    if (!_mqtt_output_connecting && now - _mqtt_output_disconnected_at >= 15000) {
+    if (!_mqtt_output_connecting && now - _mqtt_output_disconnected_at >= _mqtt_output_stale_recreate_ms) {
         _mqtt_output_client.reset();
         _mqtt_output_last_connect_at = 0;
+        _mqtt_output_last_healthcheck_at = 0;
         _mqtt_output_disconnected_at = now;
         mclog::tagWarn("NUKOEVI", "MQTT output receiver stale, recreating client");
     }
@@ -1405,11 +1551,11 @@ static void begin_xiaozhi_voice_input()
         return;
     }
     handle_mqtt_output_connection_watchdog(now);
-    if (!is_mqtt_output_connected()) {
+    if (GetHAL().getWifiStatus() == WifiStatus::None) {
         set_listen_indicator_requested(false);
         set_mic_button_state_requested(MicButtonState::Idle);
-        update_llm_status(GetHAL().getWifiStatus() == WifiStatus::None ? "Wi-Fiにつながってないの" : "Macに接続中だよ");
-        publish_mqtt_state("mic.blocked", "relay_disconnected");
+        update_llm_status("Wi-Fiにつながってないの");
+        publish_mqtt_state("mic.blocked", "wifi_disconnected");
         return;
     }
     _last_llm_request_at = now;
@@ -1421,13 +1567,16 @@ static void begin_xiaozhi_voice_input()
     _mic_pressed_at = now;
     _mic_touch_lost_at = 0;
     _xiaozhi_interaction_requested = true;
+    _xiaozhi_start_retry_count = 0;
     {
         std::lock_guard<std::mutex> lock(_llm_mutex);
         _xiaozhi_listening_started = false;
         _xiaozhi_text_waiting = false;
         _xiaozhi_text_waiting_at = 0;
+        _xiaozhi_release_pending_after_start = false;
     }
     publish_mqtt_state("mic.pressed", "start");
+    publish_xiaozhi_debug_state("mic.start.requested", "pressed");
     if (GetHAL().isXiaozhiSpeaking()) {
         set_mic_button_state_requested(MicButtonState::Starting);
         update_llm_status("キャンセル中");
@@ -1455,20 +1604,36 @@ static void end_xiaozhi_voice_input()
     _mic_press_active = false;
     _mic_touch_lost_at = 0;
     publish_mqtt_state("mic.released", "stop");
-    if (too_short || !listening_started) {
+    if (too_short) {
         set_listen_indicator_requested(false);
         set_mic_button_state_requested(MicButtonState::Idle);
-        update_llm_status(too_short ? "もう少し長押ししてね" : "準備できなかったの");
+        update_llm_status("もう少し長押ししてね");
         {
             std::lock_guard<std::mutex> lock(_llm_mutex);
             _xiaozhi_listening_started = false;
             _xiaozhi_text_waiting = false;
             _xiaozhi_text_waiting_at = 0;
+            _xiaozhi_release_pending_after_start = false;
         }
-        request_xiaozhi_stop_listening(too_short ? "short_press" : "not_listening");
-        publish_mqtt_state("mic.cancelled", too_short ? "short_press" : "not_listening");
+        request_xiaozhi_stop_listening("short_press");
+        publish_mqtt_state("mic.cancelled", "short_press");
         _xiaozhi_interaction_requested = false;
         _mic_pressed_at = 0;
+        _mic_touch_lost_at = 0;
+        return;
+    }
+
+    if (!listening_started) {
+        set_listen_indicator_requested(false);
+        set_mic_button_state_requested(MicButtonState::Starting);
+        update_llm_status("準備中");
+        {
+            std::lock_guard<std::mutex> lock(_llm_mutex);
+            _xiaozhi_release_pending_after_start = true;
+        }
+        publish_mqtt_state("mic.release.pending", "waiting_for_listening");
+        publish_xiaozhi_debug_state("mic.release.pending.snapshot", "waiting_for_listening");
+        _mic_press_active = false;
         _mic_touch_lost_at = 0;
         return;
     }
@@ -1479,6 +1644,7 @@ static void end_xiaozhi_voice_input()
         std::lock_guard<std::mutex> lock(_llm_mutex);
         _xiaozhi_text_waiting = true;
         _xiaozhi_text_waiting_at = GetHAL().millis();
+        _xiaozhi_release_pending_after_start = false;
     }
     request_xiaozhi_stop_listening_after_drain("release");
     _xiaozhi_interaction_requested = false;
@@ -1574,16 +1740,6 @@ static void handle_mic_touch_release_fallback()
 
     if (!listening_started) {
         _mic_touch_lost_at = 0;
-        if (_mic_pressed_at != 0 && now - _mic_pressed_at >= _xiaozhi_start_timeout_ms) {
-            _mic_press_active = false;
-            _mic_pressed_at = 0;
-            _xiaozhi_interaction_requested = false;
-            set_listen_indicator_requested(false);
-            set_mic_button_state_requested(MicButtonState::Idle);
-            update_llm_status("起動に失敗したの");
-            request_xiaozhi_stop_listening("start_timeout");
-            publish_mqtt_state("mic.cancelled", "start_timeout");
-        }
         return;
     }
 
@@ -1609,46 +1765,81 @@ static void handle_mic_touch_release_fallback()
 
 static void handle_xiaozhi_start_timeout(uint32_t now)
 {
-    bool timed_out = false;
+    bool waiting_for_ready = false;
+    bool retrying = false;
+    const auto snapshot = xiaozhi_debug_snapshot("start_timeout");
     {
         std::lock_guard<std::mutex> lock(_llm_mutex);
         if (!_xiaozhi_interaction_requested || _xiaozhi_listening_started || _mic_pressed_at == 0 ||
-            now - _mic_pressed_at < _xiaozhi_start_timeout_ms) {
+            static_cast<int32_t>(now - _mic_pressed_at) < static_cast<int32_t>(_xiaozhi_start_timeout_ms)) {
             return;
         }
 
+        _xiaozhi_start_retry_count += 1;
+        _mic_pressed_at = now;
         _listen_indicator_requested = false;
-        _mic_button_state_requested = MicButtonState::Idle;
-        _llm_status = "起動に失敗したの";
+        _mic_button_state_requested = MicButtonState::Starting;
+        _llm_status = "準備中";
         _llm_status_changed = true;
         _caption_hide_requested = false;
-        _mic_press_active = false;
-        _mic_pressed_at = 0;
-        _mic_touch_lost_at = 0;
-        _xiaozhi_interaction_requested = false;
-        _xiaozhi_listening_started = false;
-        _xiaozhi_text_waiting = false;
-        _xiaozhi_text_waiting_at = 0;
-        timed_out = true;
+        if (GetHAL().isXiaozhiReady()) {
+            retrying = true;
+        } else {
+            waiting_for_ready = true;
+        }
     }
 
-    if (timed_out) {
-        request_xiaozhi_stop_listening("start_timeout");
-        publish_mqtt_state("mic.cancelled", "start_timeout");
-        mclog::tagWarn("NUKOEVI", "Xiaozhi start timed out");
+    if (waiting_for_ready) {
+        publish_mqtt_state("mic.start.waiting_ready", snapshot);
+        mclog::tagWarn("NUKOEVI", "Xiaozhi start waiting for ready {} {}", _xiaozhi_start_retry_count,
+                       snapshot.c_str());
+        GetHAL().requestXiaozhiListening();
+        return;
+    }
+
+    if (retrying) {
+        publish_mqtt_state("mic.start.retry", snapshot);
+        mclog::tagWarn("NUKOEVI", "Xiaozhi start retry {} {}",
+                       static_cast<unsigned int>(_xiaozhi_start_retry_count), snapshot.c_str());
+        GetHAL().requestXiaozhiListening();
+        return;
     }
 }
 
 static void handle_xiaozhi_status(std::string_view status)
 {
     publish_mqtt_state("xiaozhi.status", std::string(status));
+    mclog::tagInfo("NUKOEVI", "xiaozhi.status {}", std::string(status));
     if (status == "Listening...") {
-        std::lock_guard<std::mutex> lock(_llm_mutex);
-        _xiaozhi_listening_started = true;
-        _listen_indicator_requested = true;
-        _mic_button_state_requested = MicButtonState::Listening;
-        _llm_status = "聞いてるよ〜";
-        _llm_status_changed = true;
+        bool should_stop_after_pending_release = false;
+        {
+            std::lock_guard<std::mutex> lock(_llm_mutex);
+            _xiaozhi_start_retry_count = 0;
+            _xiaozhi_listening_started = true;
+            if (_xiaozhi_release_pending_after_start) {
+                _xiaozhi_release_pending_after_start = false;
+                _xiaozhi_text_waiting = true;
+                _xiaozhi_text_waiting_at = GetHAL().millis();
+                _xiaozhi_interaction_requested = false;
+                _mic_press_active = false;
+                _mic_pressed_at = 0;
+                _mic_touch_lost_at = 0;
+                _listen_indicator_requested = false;
+                _mic_button_state_requested = MicButtonState::Starting;
+                _llm_status = "送信中";
+                _llm_status_changed = true;
+                should_stop_after_pending_release = true;
+            } else {
+                _listen_indicator_requested = true;
+                _mic_button_state_requested = MicButtonState::Listening;
+                _llm_status = "聞いてるよ〜";
+                _llm_status_changed = true;
+            }
+        }
+        if (should_stop_after_pending_release) {
+            publish_mqtt_state("mic.release.resumed", "listening_started");
+            request_xiaozhi_stop_listening_after_drain("release");
+        }
         return;
     }
 
@@ -1669,28 +1860,54 @@ static void handle_xiaozhi_status(std::string_view status)
     }
 
     if (status == "Error") {
-        std::lock_guard<std::mutex> lock(_llm_mutex);
-        _listen_indicator_requested = false;
-        _mic_button_state_requested = MicButtonState::Idle;
-        if (_xiaozhi_interaction_requested || _mic_press_active || _xiaozhi_text_waiting) {
-            _llm_status = "起動に失敗したの";
-            _llm_status_changed = true;
-            _caption_hide_requested = false;
+        bool recoverable_start_error = false;
+        {
+            std::lock_guard<std::mutex> lock(_llm_mutex);
+            recoverable_start_error = (_xiaozhi_interaction_requested || _mic_press_active ||
+                                       _xiaozhi_release_pending_after_start) &&
+                                      !_xiaozhi_listening_started && !_xiaozhi_text_waiting;
+            if (recoverable_start_error) {
+                _listen_indicator_requested = false;
+                _mic_button_state_requested = MicButtonState::Starting;
+                _llm_status = "準備中";
+                _llm_status_changed = true;
+                _caption_hide_requested = false;
+                _mic_pressed_at = GetHAL().millis();
+                _xiaozhi_start_retry_count += 1;
+            } else {
+                _listen_indicator_requested = false;
+                _mic_button_state_requested = MicButtonState::Idle;
+                _xiaozhi_start_retry_count = 0;
+                if (_xiaozhi_interaction_requested || _mic_press_active || _xiaozhi_text_waiting) {
+                    _llm_status = "準備中";
+                    _llm_status_changed = true;
+                    _caption_hide_requested = false;
+                }
+                _mic_press_active = false;
+                _mic_pressed_at = 0;
+                _mic_touch_lost_at = 0;
+                _xiaozhi_interaction_requested = false;
+                _xiaozhi_listening_started = false;
+                _xiaozhi_text_waiting = false;
+                _xiaozhi_text_waiting_at = 0;
+                _xiaozhi_release_pending_after_start = false;
+            }
         }
-        _mic_press_active = false;
-        _mic_pressed_at = 0;
-        _mic_touch_lost_at = 0;
-        _xiaozhi_interaction_requested = false;
-        _xiaozhi_listening_started = false;
-        _xiaozhi_text_waiting = false;
-        _xiaozhi_text_waiting_at = 0;
+        if (recoverable_start_error) {
+            const auto snapshot = xiaozhi_debug_snapshot("status_error");
+            publish_mqtt_state("xiaozhi.error.recoverable", snapshot);
+            mclog::tagWarn("NUKOEVI", "Xiaozhi recoverable start error {} {}", _xiaozhi_start_retry_count,
+                           snapshot.c_str());
+            GetHAL().requestXiaozhiListening();
+            return;
+        }
         return;
     }
 
     if (status == "Standby") {
         std::lock_guard<std::mutex> lock(_llm_mutex);
         _listen_indicator_requested = false;
-        const bool voice_turn_active = _mic_press_active || _xiaozhi_text_waiting;
+        const bool voice_turn_active = _mic_press_active || _xiaozhi_text_waiting || _xiaozhi_release_pending_after_start;
         if (!voice_turn_active) {
             _mic_button_state_requested = MicButtonState::Idle;
         }
@@ -1700,6 +1917,7 @@ static void handle_xiaozhi_status(std::string_view status)
         }
         if (!voice_turn_active) {
             _xiaozhi_interaction_requested = false;
+            _xiaozhi_start_retry_count = 0;
         }
     }
 }
@@ -1719,6 +1937,8 @@ static void handle_xiaozhi_text_message(const WsTextMessage_t& message)
             _xiaozhi_listening_started = false;
             _xiaozhi_text_waiting = false;
             _xiaozhi_text_waiting_at = 0;
+            _xiaozhi_release_pending_after_start = false;
+            _xiaozhi_interaction_requested = false;
         }
         publish_mqtt_input(text, role.c_str());
     }
@@ -2108,16 +2328,18 @@ static void handle_xiaozhi_text_timeout(uint32_t now)
     {
         std::lock_guard<std::mutex> lock(_llm_mutex);
         if (!_xiaozhi_text_waiting || _xiaozhi_text_waiting_at == 0 ||
-            now - _xiaozhi_text_waiting_at < _xiaozhi_text_timeout_ms) {
+            static_cast<int32_t>(now - _xiaozhi_text_waiting_at) < static_cast<int32_t>(_xiaozhi_text_timeout_ms)) {
             return;
         }
 
         _xiaozhi_text_waiting = false;
         _xiaozhi_text_waiting_at = 0;
         _xiaozhi_listening_started = false;
+        _xiaozhi_release_pending_after_start = false;
         _mic_pressed_at = 0;
         _mic_press_active = false;
         _xiaozhi_interaction_requested = false;
+        _xiaozhi_start_retry_count = 0;
         _listen_indicator_requested = false;
         _mic_button_state_requested = MicButtonState::Idle;
         if (_llm_status == "送信中") {
@@ -2769,6 +2991,7 @@ void AppNukoevi::onClose()
     _xiaozhi_listening_started = false;
     _xiaozhi_text_waiting = false;
     _xiaozhi_text_waiting_at = 0;
+    _xiaozhi_release_pending_after_start = false;
     _open_home_requested = false;
     _avatar.reset();
     _panel.reset();

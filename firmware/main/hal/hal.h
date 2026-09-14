@@ -204,6 +204,11 @@ public:
     void requestXiaozhiListening();
     void stopXiaozhiListening();
     void notifyXiaozhiReady();
+    bool isXiaozhiReady();
+    bool isXiaozhiBackgroundStarted();
+    bool isXiaozhiListenRequested();
+    int getXiaozhiDeviceState();
+    void resetXiaozhiListeningRequest();
     bool isXiaozhiListening();
     bool isXiaozhiSpeaking();
     XiaozhiConfig_t getXiaozhiConfig();
@@ -307,6 +312,7 @@ private:
     TaskHandle_t _xiaozhi_background_task_handle = nullptr;
 
     void xiaozhi_board_init();
+    void startXiaozhiListeningWhenReady();
     void lvgl_init();
     void xiaozhi_mcp_init();
     void ble_init(bool useAltUuid);

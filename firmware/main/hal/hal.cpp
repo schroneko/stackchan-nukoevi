@@ -229,17 +229,27 @@ static void _xiaozhi_start_listening_task_with_generation(void* param)
     const auto generation = _xiaozhi_task_generation(param);
     vTaskDelay(pdMS_TO_TICKS(200));
     if (!_xiaozhi_start_listening_scheduled || generation != _xiaozhi_listen_generation.load()) {
+        mclog::tagWarn(_tag, "xiaozhi listen start skipped: stale generation={} current={}",
+                       static_cast<unsigned long>(generation),
+                       static_cast<unsigned long>(_xiaozhi_listen_generation.load()));
         vTaskDelete(nullptr);
         return;
     }
 
+    mclog::tagInfo(_tag, "xiaozhi listen start: stop current channel generation={}",
+                   static_cast<unsigned long>(generation));
     Application::GetInstance().StopListening();
     vTaskDelay(pdMS_TO_TICKS(400));
     if (!_xiaozhi_start_listening_scheduled || generation != _xiaozhi_listen_generation.load()) {
+        mclog::tagWarn(_tag, "xiaozhi listen start skipped after stop: stale generation={} current={}",
+                       static_cast<unsigned long>(generation),
+                       static_cast<unsigned long>(_xiaozhi_listen_generation.load()));
         vTaskDelete(nullptr);
         return;
     }
 
+    mclog::tagInfo(_tag, "xiaozhi listen start: start listening generation={}",
+                   static_cast<unsigned long>(generation));
     Application::GetInstance().StartListening();
     if (generation == _xiaozhi_listen_generation.load()) {
         _xiaozhi_start_listening_scheduled = false;
@@ -251,11 +261,28 @@ static void _schedule_xiaozhi_start_listening(uint32_t generation)
 {
     _xiaozhi_start_listening_scheduled = true;
     const auto param = reinterpret_cast<void*>(static_cast<uintptr_t>(generation));
+    mclog::tagInfo(_tag, "schedule xiaozhi listen start generation={}", static_cast<unsigned long>(generation));
     if (xTaskCreatePinnedToCore(_xiaozhi_start_listening_task_with_generation, "xiaozhi-listen", 4096, param, 5,
                                 nullptr, 0) != pdPASS) {
         _xiaozhi_start_listening_scheduled = false;
         mclog::tagError(_tag, "failed to schedule xiaozhi listen start");
+        if (generation == _xiaozhi_listen_generation.load()) {
+            Application::GetInstance().StartListening();
+        }
     }
+}
+
+void Hal::startXiaozhiListeningWhenReady()
+{
+    const auto generation = _next_xiaozhi_listen_generation();
+    _xiaozhi_listen_requested = false;
+    if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+        _xiaozhi_start_listening_scheduled = false;
+        mclog::tagInfo(_tag, "start xiaozhi listening directly generation={}", static_cast<unsigned long>(generation));
+        Application::GetInstance().StartListening();
+        return;
+    }
+    _schedule_xiaozhi_start_listening(generation);
 }
 
 static void _xiaozhi_stop_listening_task(void* param)
@@ -282,6 +309,9 @@ static void _schedule_xiaozhi_stop_listening(uint32_t generation)
 void Hal::startXiaozhiBackground()
 {
     if (_xiaozhi_background_started) {
+        mclog::tagInfo(_tag, "xiaozhi background already started ready={} state={} listen_requested={}",
+                       hal_bridge::is_xiaozhi_ready() ? 1 : 0, getXiaozhiDeviceState(),
+                       _xiaozhi_listen_requested ? 1 : 0);
         return;
     }
 
@@ -299,15 +329,18 @@ void Hal::startXiaozhiBackground()
 void Hal::requestXiaozhiListening()
 {
     _xiaozhi_listen_requested = true;
+    mclog::tagInfo(_tag, "request xiaozhi listening background={} ready={} state={}",
+                   _xiaozhi_background_started ? 1 : 0, hal_bridge::is_xiaozhi_ready() ? 1 : 0,
+                   getXiaozhiDeviceState());
     startXiaozhiBackground();
 
     if (!hal_bridge::is_xiaozhi_ready()) {
+        mclog::tagWarn(_tag, "xiaozhi listen waiting for ready background={} state={}",
+                       _xiaozhi_background_started ? 1 : 0, getXiaozhiDeviceState());
         return;
     }
 
-    const auto generation = _next_xiaozhi_listen_generation();
-    _xiaozhi_listen_requested = false;
-    _schedule_xiaozhi_start_listening(generation);
+    startXiaozhiListeningWhenReady();
 }
 
 void Hal::stopXiaozhiListening()
@@ -315,6 +348,9 @@ void Hal::stopXiaozhiListening()
     const auto generation = _next_xiaozhi_listen_generation();
     _xiaozhi_listen_requested = false;
     _xiaozhi_start_listening_scheduled = false;
+    mclog::tagInfo(_tag, "request xiaozhi stop background={} ready={} state={} generation={}",
+                   _xiaozhi_background_started ? 1 : 0, hal_bridge::is_xiaozhi_ready() ? 1 : 0,
+                   getXiaozhiDeviceState(), static_cast<unsigned long>(generation));
     if (!_xiaozhi_background_started) {
         return;
     }
@@ -324,13 +360,46 @@ void Hal::stopXiaozhiListening()
 
 void Hal::notifyXiaozhiReady()
 {
+    mclog::tagInfo(_tag, "xiaozhi ready notified listen_requested={} state={}",
+                   _xiaozhi_listen_requested ? 1 : 0, getXiaozhiDeviceState());
     if (!_xiaozhi_listen_requested) {
         return;
     }
 
+    startXiaozhiListeningWhenReady();
+}
+
+bool Hal::isXiaozhiReady()
+{
+    return hal_bridge::is_xiaozhi_ready();
+}
+
+bool Hal::isXiaozhiBackgroundStarted()
+{
+    return _xiaozhi_background_started;
+}
+
+bool Hal::isXiaozhiListenRequested()
+{
+    return _xiaozhi_listen_requested;
+}
+
+int Hal::getXiaozhiDeviceState()
+{
+    if (!_xiaozhi_background_started) {
+        return -1;
+    }
+    return static_cast<int>(Application::GetInstance().GetDeviceState());
+}
+
+void Hal::resetXiaozhiListeningRequest()
+{
+    _next_xiaozhi_listen_generation();
     _xiaozhi_listen_requested = false;
-    const auto generation = _next_xiaozhi_listen_generation();
-    _schedule_xiaozhi_start_listening(generation);
+    _xiaozhi_start_listening_scheduled = false;
+    mclog::tagWarn(_tag, "reset xiaozhi listening request background={} ready={} state={} generation={}",
+                   _xiaozhi_background_started ? 1 : 0, hal_bridge::is_xiaozhi_ready() ? 1 : 0,
+                   getXiaozhiDeviceState(), static_cast<unsigned long>(_xiaozhi_listen_generation.load()));
 }
 
 bool Hal::isXiaozhiListening()

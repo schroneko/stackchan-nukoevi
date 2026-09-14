@@ -1,398 +1,480 @@
 #!/usr/bin/env bun
 
-import { Server } from '@modelcontextprotocol/sdk/server/index.js'
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js'
-import { spawnSync } from 'child_process'
-import { randomUUID } from 'crypto'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
-import { createServer } from 'net'
-import { homedir, tmpdir } from 'os'
-import { Aedes } from 'aedes'
-import mqtt from 'mqtt'
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { spawnSync } from "child_process";
+import { randomUUID } from "crypto";
+import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { createServer } from "net";
+import { homedir, tmpdir } from "os";
+import { Aedes } from "aedes";
+import mqtt from "mqtt";
 
-const host = process.env.STACKCHAN_CHANNEL_HOST ?? '0.0.0.0'
-const publicHost = process.env.STACKCHAN_PUBLIC_HOST ?? '192.168.1.10'
-const port = Number(process.env.STACKCHAN_CHANNEL_PORT ?? '18080')
-const httpServerEnabled = process.env.STACKCHAN_HTTP_SERVER_ENABLED !== '0'
-const assistantTimeoutMs = Number(process.env.STACKCHAN_REPLY_TIMEOUT_MS ?? '120000')
-const upstreamOtaUrl = process.env.STACKCHAN_UPSTREAM_OTA_URL ?? 'https://api.tenclass.net/xiaozhi/ota/'
-const statePath = process.env.STACKCHAN_RELAY_STATE_PATH ?? `${homedir()}/.local/state/stackchan-xiaozhi-relay/upstream.json`
-const mqttEnabled = process.env.NUKOEVI_MQTT_ENABLED !== '0'
-const mqttEmbedded = process.env.NUKOEVI_MQTT_EMBEDDED !== '0'
-const mqttBrokerHost = process.env.NUKOEVI_MQTT_BROKER_HOST ?? '0.0.0.0'
-const mqttHost = process.env.NUKOEVI_MQTT_HOST ?? '127.0.0.1'
-const mqttPort = Number(process.env.NUKOEVI_MQTT_PORT ?? '18883')
-const mqttUrl = process.env.NUKOEVI_MQTT_URL ?? `mqtt://${mqttHost}:${mqttPort}`
-const mqttTopicPrefix = process.env.NUKOEVI_MQTT_TOPIC_PREFIX ?? 'nukoevi'
-const mqttInputTopic = `${mqttTopicPrefix}/input/text`
-const mqttOutputTopic = `${mqttTopicPrefix}/output/text`
-const mqttOutputAudioTopic = `${mqttTopicPrefix}/output/audio/opus`
-const mqttStateTopic = `${mqttTopicPrefix}/device/stackchan/state`
-const mqttAudioQos = mqttQosFromEnv(process.env.NUKOEVI_MQTT_AUDIO_QOS ?? '1')
-const irodoriTtsUrl = process.env.STACKCHAN_IRODORI_TTS_URL ?? 'https://schroneko-irodori-tts-stackchan-api.hf.space/synthesis'
-const irodoriTtsKey = process.env.STACKCHAN_IRODORI_TTS_KEY ?? ''
-const irodoriTtsSpeaker = process.env.STACKCHAN_IRODORI_TTS_SPEAKER ?? '3'
-const irodoriTtsSteps = process.env.STACKCHAN_IRODORI_TTS_STEPS ?? '18'
-const irodoriTtsSeconds = process.env.STACKCHAN_IRODORI_TTS_SECONDS ?? ''
-const irodoriTtsDurationScale = process.env.STACKCHAN_IRODORI_TTS_DURATION_SCALE ?? '0.95'
-const irodoriTtsProvider = irodoriTtsProviderFromEnv()
-const irodoriTtsHfToken = process.env.STACKCHAN_IRODORI_HF_TOKEN ?? process.env.HF_TOKEN ?? process.env.HUGGING_FACE_HUB_TOKEN ?? ''
-const irodoriTtsSeed = process.env.STACKCHAN_IRODORI_TTS_SEED ?? ''
-const irodoriTtsCaption = process.env.STACKCHAN_IRODORI_TTS_CAPTION ?? '若く元気な女性の声。近い距離感で、明るくやわらかく自然に話している。'
-const irodoriTtsEnabled = process.env.STACKCHAN_IRODORI_TTS_ENABLED !== '0'
-const irodoriTtsFrameDelayMs = Number(process.env.STACKCHAN_IRODORI_TTS_FRAME_DELAY_MS ?? '55')
-const irodoriTtsMqttFrameDelayMs = Number(process.env.STACKCHAN_IRODORI_TTS_MQTT_FRAME_DELAY_MS ?? '90')
-const irodoriTtsAudioTransport = irodoriTtsAudioTransportFromEnv()
-const stackChanAudioWsWaitMs = Number(process.env.STACKCHAN_AUDIO_WS_WAIT_MS ?? '1500')
-const xiaozhiListeningStaleMs = Number(process.env.STACKCHAN_XIAOZHI_LISTENING_STALE_MS ?? '120000')
-const irodoriTtsWarmupText = process.env.STACKCHAN_IRODORI_TTS_WARMUP_TEXT ?? 'あ'
-const irodoriTtsWarmupSteps = process.env.STACKCHAN_IRODORI_TTS_WARMUP_STEPS ?? '4'
-const irodoriTtsWarmupCooldownMs = Number(process.env.STACKCHAN_IRODORI_TTS_WARMUP_COOLDOWN_MS ?? '60000')
-const irodoriTtsWarmupOnListen = process.env.STACKCHAN_IRODORI_TTS_WARMUP_ON_LISTEN === '1'
-const irodoriTtsRateLimitCooldownMs = Number(process.env.STACKCHAN_IRODORI_TTS_RATE_LIMIT_COOLDOWN_MS ?? '180000')
-const assistantSpeechQueueMs = Number(process.env.STACKCHAN_ASSISTANT_SPEECH_QUEUE_MS ?? '30000')
-const assistantSpeechQueueLimit = Number(process.env.STACKCHAN_ASSISTANT_SPEECH_QUEUE_LIMIT ?? '8')
-const fastFirstAudioEnabled = process.env.STACKCHAN_FAST_FIRST_AUDIO !== '0'
-const fastFirstAudioMaxChars = Number(process.env.STACKCHAN_FAST_FIRST_AUDIO_MAX_CHARS ?? '28')
-const fastLocalTtsEnabled = process.env.STACKCHAN_FAST_LOCAL_TTS !== '0'
-const fastLocalTtsVoice = process.env.STACKCHAN_FAST_LOCAL_TTS_VOICE ?? 'Kyoko'
-const fastLocalTtsFirstChunkOnly = process.env.STACKCHAN_FAST_LOCAL_TTS_FIRST_CHUNK_ONLY === '1'
-const evictlBin = process.env.STACKCHAN_EVICTL_BIN ?? `${homedir()}/ghq/github.com/schroneko/evictl/bin/evictl`
-const evictlIdentity = process.env.STACKCHAN_EVICTL_IDENTITY ?? 'nukoevi'
+const host = process.env.STACKCHAN_CHANNEL_HOST ?? "0.0.0.0";
+const publicHost = process.env.STACKCHAN_PUBLIC_HOST ?? "192.168.1.10";
+const port = Number(process.env.STACKCHAN_CHANNEL_PORT ?? "18080");
+const httpServerEnabled = process.env.STACKCHAN_HTTP_SERVER_ENABLED !== "0";
+const assistantTimeoutMs = Number(process.env.STACKCHAN_REPLY_TIMEOUT_MS ?? "120000");
+const upstreamOtaUrl =
+  process.env.STACKCHAN_UPSTREAM_OTA_URL ?? "https://api.tenclass.net/xiaozhi/ota/";
+const statePath =
+  process.env.STACKCHAN_RELAY_STATE_PATH ??
+  `${homedir()}/.local/state/stackchan-xiaozhi-relay/upstream.json`;
+const logPath = process.env.STACKCHAN_LOG_FILE ?? "";
+const mqttEnabled = process.env.NUKOEVI_MQTT_ENABLED !== "0";
+const mqttEmbedded = process.env.NUKOEVI_MQTT_EMBEDDED !== "0";
+const mqttBrokerHost = process.env.NUKOEVI_MQTT_BROKER_HOST ?? "0.0.0.0";
+const mqttHost = process.env.NUKOEVI_MQTT_HOST ?? "127.0.0.1";
+const mqttPort = Number(process.env.NUKOEVI_MQTT_PORT ?? "18883");
+const mqttUrl = process.env.NUKOEVI_MQTT_URL ?? `mqtt://${mqttHost}:${mqttPort}`;
+const mqttTopicPrefix = process.env.NUKOEVI_MQTT_TOPIC_PREFIX ?? "nukoevi";
+const mqttInputTopic = `${mqttTopicPrefix}/input/text`;
+const mqttOutputTopic = `${mqttTopicPrefix}/output/text`;
+const mqttOutputAudioTopic = `${mqttTopicPrefix}/output/audio/opus`;
+const mqttDebugTopic = `${mqttTopicPrefix}/debug/command`;
+const mqttStateTopic = `${mqttTopicPrefix}/device/stackchan/state`;
+const mqttInputHandlerEnabled = process.env.STACKCHAN_MQTT_INPUT_HANDLER !== "0";
+const mqttAudioQos = mqttQosFromEnv(process.env.NUKOEVI_MQTT_AUDIO_QOS ?? "1");
+const irodoriTtsUrl =
+  process.env.STACKCHAN_IRODORI_TTS_URL ??
+  "https://schroneko-irodori-tts-stackchan-api.hf.space/synthesis";
+const irodoriTtsKey = process.env.STACKCHAN_IRODORI_TTS_KEY ?? "";
+const irodoriTtsSpeaker = process.env.STACKCHAN_IRODORI_TTS_SPEAKER ?? "3";
+const irodoriTtsSteps = process.env.STACKCHAN_IRODORI_TTS_STEPS ?? "18";
+const irodoriTtsSeconds = process.env.STACKCHAN_IRODORI_TTS_SECONDS ?? "";
+const irodoriTtsDurationScale = process.env.STACKCHAN_IRODORI_TTS_DURATION_SCALE ?? "0.95";
+const irodoriTtsProvider = irodoriTtsProviderFromEnv();
+const irodoriTtsHfToken =
+  process.env.STACKCHAN_IRODORI_HF_TOKEN ??
+  process.env.HF_TOKEN ??
+  process.env.HUGGING_FACE_HUB_TOKEN ??
+  "";
+const irodoriTtsSeed = process.env.STACKCHAN_IRODORI_TTS_SEED ?? "";
+const irodoriTtsCaption =
+  process.env.STACKCHAN_IRODORI_TTS_CAPTION ??
+  "若く元気な女性の声。近い距離感で、明るくやわらかく自然に話している。";
+const irodoriTtsEnabled = process.env.STACKCHAN_IRODORI_TTS_ENABLED !== "0";
+const irodoriTtsFrameDelayMs = Number(process.env.STACKCHAN_IRODORI_TTS_FRAME_DELAY_MS ?? "55");
+const irodoriTtsMqttFrameDelayMs = Number(
+  process.env.STACKCHAN_IRODORI_TTS_MQTT_FRAME_DELAY_MS ?? "55",
+);
+const irodoriTtsParallelChunks = Math.max(
+  1,
+  Number(process.env.STACKCHAN_IRODORI_TTS_PARALLEL_CHUNKS ?? "2") || 2,
+);
+const irodoriTtsAudioTransport = irodoriTtsAudioTransportFromEnv();
+const stackChanAudioWsWaitMs = Number(process.env.STACKCHAN_AUDIO_WS_WAIT_MS ?? "0");
+const stackChanAudioMqttFallback = process.env.STACKCHAN_AUDIO_MQTT_FALLBACK !== "0";
+const xiaozhiListeningStaleMs = Number(
+  process.env.STACKCHAN_XIAOZHI_LISTENING_STALE_MS ?? "120000",
+);
+const irodoriTtsWarmupText = process.env.STACKCHAN_IRODORI_TTS_WARMUP_TEXT ?? "あ";
+const irodoriTtsWarmupSteps = process.env.STACKCHAN_IRODORI_TTS_WARMUP_STEPS ?? "4";
+const irodoriTtsWarmupCooldownMs = Number(
+  process.env.STACKCHAN_IRODORI_TTS_WARMUP_COOLDOWN_MS ?? "60000",
+);
+const irodoriTtsWarmupOnListen = process.env.STACKCHAN_IRODORI_TTS_WARMUP_ON_LISTEN === "1";
+const irodoriTtsRateLimitCooldownMs = Number(
+  process.env.STACKCHAN_IRODORI_TTS_RATE_LIMIT_COOLDOWN_MS ?? "180000",
+);
+const assistantSpeechQueueMs = Number(process.env.STACKCHAN_ASSISTANT_SPEECH_QUEUE_MS ?? "30000");
+const assistantSpeechQueueLimit = Number(process.env.STACKCHAN_ASSISTANT_SPEECH_QUEUE_LIMIT ?? "8");
+const fastFirstAudioEnabled = process.env.STACKCHAN_FAST_FIRST_AUDIO !== "0";
+const fastFirstAudioMaxChars = Number(process.env.STACKCHAN_FAST_FIRST_AUDIO_MAX_CHARS ?? "28");
+const irodoriTtsRequired = process.env.STACKCHAN_IRODORI_TTS_REQUIRED !== "0";
+const fastLocalTtsEnabled = !irodoriTtsRequired && process.env.STACKCHAN_FAST_LOCAL_TTS === "1";
+const fastLocalTtsVoice = process.env.STACKCHAN_FAST_LOCAL_TTS_VOICE ?? "Kyoko";
+const fastLocalTtsFirstChunkOnly = process.env.STACKCHAN_FAST_LOCAL_TTS_FIRST_CHUNK_ONLY === "1";
+const fastProvisionalReplyEnabled = process.env.STACKCHAN_FAST_PROVISIONAL_REPLY !== "0";
+const fastProvisionalReplyText = normalizeText(
+  process.env.STACKCHAN_FAST_PROVISIONAL_REPLY_TEXT ?? "うーんとね",
+);
+const fastProvisionalAudioWsWaitMs = Number(
+  process.env.STACKCHAN_FAST_PROVISIONAL_AUDIO_WS_WAIT_MS ?? "0",
+);
+const fastProvisionalMqttFallback = process.env.STACKCHAN_FAST_PROVISIONAL_MQTT_FALLBACK !== "0";
+const evictlBin =
+  process.env.STACKCHAN_EVICTL_BIN ?? `${homedir()}/ghq/github.com/schroneko/evictl/bin/evictl`;
+const evictlIdentity = process.env.STACKCHAN_EVICTL_IDENTITY ?? "nukoevi";
 
-type StackChanAgentTransport = 'mqtt' | 'claude-code-channels' | 'evictl'
-type IrodoriTtsProvider = 'stackchan-api' | 'zerogpu-direct'
-type IrodoriTtsAudioTransport = 'auto' | 'websocket' | 'mqtt'
-type MqttQos = 0 | 1 | 2
+type StackChanAgentTransport = "mqtt" | "claude-code-channels" | "evictl";
+type IrodoriTtsProvider = "stackchan-api" | "zerogpu-direct";
+type IrodoriTtsAudioTransport = "auto" | "websocket" | "mqtt";
+type MqttQos = 0 | 1 | 2;
 
 function mqttQosFromEnv(value: string): MqttQos {
-  const qos = Number(value)
-  if (qos === 1) return 1
-  if (qos === 2) return 2
-  return 0
+  const qos = Number(value);
+  if (qos === 1) return 1;
+  if (qos === 2) return 2;
+  return 0;
 }
 
 function stackChanAgentTransportFromEnv(): StackChanAgentTransport {
-  const value = (process.env.STACKCHAN_AGENT_TRANSPORT ?? '').toLowerCase()
-  if (value === 'evictl') return 'evictl'
-  if (value === 'mqtt') return 'mqtt'
-  if (value === 'direct' || value === 'claude' || value === 'claude-code-channels') return 'claude-code-channels'
-  return process.env.STACKCHAN_DIRECT_MCP_CHANNEL === '1' ? 'claude-code-channels' : 'mqtt'
+  const value = (process.env.STACKCHAN_AGENT_TRANSPORT ?? "").toLowerCase();
+  if (value === "evictl") return "evictl";
+  if (value === "mqtt") return "mqtt";
+  if (value === "direct" || value === "claude" || value === "claude-code-channels")
+    return "claude-code-channels";
+  return process.env.STACKCHAN_DIRECT_MCP_CHANNEL === "1" ? "claude-code-channels" : "mqtt";
 }
 
 function irodoriTtsProviderFromEnv(): IrodoriTtsProvider {
-  const value = (process.env.STACKCHAN_IRODORI_TTS_PROVIDER ?? '').toLowerCase()
-  if (value === 'zerogpu' || value === 'zerogpu-direct' || value === 'direct') return 'zerogpu-direct'
-  if (value === 'stackchan-api' || value === 'api') return 'stackchan-api'
-  if (irodoriTtsUrl.includes('/gradio_api/call/') || irodoriTtsUrl.includes('irodori-tts-zerogpu')) return 'zerogpu-direct'
-  return 'stackchan-api'
+  const value = (process.env.STACKCHAN_IRODORI_TTS_PROVIDER ?? "").toLowerCase();
+  if (value === "zerogpu" || value === "zerogpu-direct" || value === "direct")
+    return "zerogpu-direct";
+  if (value === "stackchan-api" || value === "api") return "stackchan-api";
+  if (irodoriTtsUrl.includes("/gradio_api/call/") || irodoriTtsUrl.includes("irodori-tts-zerogpu"))
+    return "zerogpu-direct";
+  return "stackchan-api";
 }
 
 function irodoriTtsAudioTransportFromEnv(): IrodoriTtsAudioTransport {
-  const value = (process.env.STACKCHAN_IRODORI_TTS_AUDIO_TRANSPORT ?? 'auto').toLowerCase()
-  if (value === 'mqtt') return 'mqtt'
-  if (value === 'ws' || value === 'websocket') return 'websocket'
-  return 'auto'
+  const value = (process.env.STACKCHAN_IRODORI_TTS_AUDIO_TRANSPORT ?? "auto").toLowerCase();
+  if (value === "mqtt") return "mqtt";
+  if (value === "ws" || value === "websocket") return "websocket";
+  return "auto";
 }
 
-const stackChanAgentTransport = stackChanAgentTransportFromEnv()
-const directMcpChannel = stackChanAgentTransport !== 'mqtt'
+const stackChanAgentTransport = stackChanAgentTransportFromEnv();
+const directMcpChannel = stackChanAgentTransport !== "mqtt";
 
 type StackChanRequest = {
-  id: string
-  sessionId: string
-  deviceId: string
-  createdAt: number
-  resolve: (reply: ClaudeReply) => void
-  socket?: ServerWebSocket<StackChanConnection>
-}
+  id: string;
+  sessionId: string;
+  deviceId: string;
+  createdAt: number;
+  resolve: (reply: ClaudeReply) => void;
+  socket?: ServerWebSocket<StackChanConnection>;
+};
 
 type StackChanConnection = {
-  kind: 'xiaozhi' | 'audio'
-  sessionId: string
-  deviceId: string
-  clientId: string
-  protocolVersion: string
-  upstream?: UpstreamConnection
-  transcript?: string
-  claudeAsked?: boolean
-  turnClosing?: boolean
-}
+  kind: "xiaozhi" | "audio";
+  sessionId: string;
+  deviceId: string;
+  clientId: string;
+  protocolVersion: string;
+  upstream?: UpstreamConnection;
+  transcript?: string;
+  claudeAsked?: boolean;
+  turnClosing?: boolean;
+  helloMessage?: string;
+};
 
 type UpstreamConfig = {
-  url: string
-  token: string
-  version: number
-}
+  url: string;
+  token: string;
+  version: number;
+};
 
 type OpenAIMessage = {
-  role?: string
-  content?: unknown
-}
+  role?: string;
+  content?: unknown;
+};
 
 type NukoeviMqttEvent = {
-  id?: string
-  correlation_id?: string
-  type?: string
-  source?: string
-  target?: string
-  channel?: string
-  text?: string
-  session_id?: string
-  device_id?: string
-  sample_rate?: number
-  frame_duration?: number
-  audio_id?: string
-  sequence?: number
-  total?: number
-  payload?: string
-  ts?: string
-}
+  id?: string;
+  correlation_id?: string;
+  type?: string;
+  source?: string;
+  target?: string;
+  channel?: string;
+  text?: string;
+  session_id?: string;
+  device_id?: string;
+  sample_rate?: number;
+  frame_duration?: number;
+  audio_id?: string;
+  sequence?: number;
+  total?: number;
+  payload?: string;
+  hold_ms?: number;
+  ts?: string;
+};
 
 type ClaudeReply = {
-  text: string
-  speechHandled: boolean
-}
+  text: string;
+  speechHandled: boolean;
+};
 
 type MqttAudioPublishSession = {
-  id: string
-  text: string
-  ttsProvider?: 'irodori' | 'macos-say'
-  requestId?: string
-  chunkIndex?: number
-  chunkCount?: number
-  originalText?: string
-  transport?: 'mqtt' | 'ws'
-  qos: MqttQos
-  frameDelayMs: number
-  total: number
-  published: number
-  startedAt: string
-  finishedAt?: string
-  durationMs?: number
-  synthesisStartedAt?: string
-  synthesisFinishedAt?: string
-  synthesisDurationMs?: number
-  encodeDurationMs?: number
-  publishStartedAt?: string
-  publishFinishedAt?: string
-  publishDurationMs?: number
-  firstFrameAt?: string
-  lastFrameAt?: string
-  error?: string
-}
+  id: string;
+  text: string;
+  ttsProvider?: "irodori" | "macos-say";
+  requestId?: string;
+  kind?: "provisional" | "reply";
+  chunkIndex?: number;
+  chunkCount?: number;
+  originalText?: string;
+  transport?: "mqtt" | "ws";
+  qos: MqttQos;
+  frameDelayMs: number;
+  total: number;
+  published: number;
+  startedAt: string;
+  finishedAt?: string;
+  durationMs?: number;
+  synthesisStartedAt?: string;
+  synthesisFinishedAt?: string;
+  synthesisDurationMs?: number;
+  encodeDurationMs?: number;
+  publishStartedAt?: string;
+  publishFinishedAt?: string;
+  publishDurationMs?: number;
+  firstFrameAt?: string;
+  lastFrameAt?: string;
+  error?: string;
+};
 
 type MqttBrokerEvent = {
-  type: string
-  clientId?: string
-  topics?: string[]
-  ts: string
-}
+  type: string;
+  clientId?: string;
+  topics?: string[];
+  ts: string;
+};
 
 type PendingAssistantSpeech = {
-  text: string
-  createdAt: number
-}
+  text: string;
+  createdAt: number;
+};
 
 type PendingMqttAssistantAudio = {
-  text: string
-  createdAt: number
-  requestId?: string
-  chunkIndex?: number
-  chunkCount?: number
-  originalText?: string
-}
+  text: string;
+  createdAt: number;
+  requestId?: string;
+  kind?: "provisional" | "reply";
+  chunkIndex?: number;
+  chunkCount?: number;
+  originalText?: string;
+};
 
 type TurnTrace = {
-  requestId: string
-  source: string
-  sessionId: string
-  deviceId: string
-  text: string
-  replyText?: string
-  status: 'pending' | 'replied' | 'audio_started' | 'audio_done' | 'error' | 'timeout'
-  listenStartedAt?: string
-  listenStoppedAt?: string
-  sttAt?: string
-  channelEmitAt?: string
-  channelEmitDoneAt?: string
-  replyToolAt?: string
-  assistantSpeechAt?: string
-  firstAudioRequestAt?: string
-  firstAudioFrameAt?: string
-  firstAudioDoneAt?: string
-  finalAudioDoneAt?: string
+  requestId: string;
+  source: string;
+  sessionId: string;
+  deviceId: string;
+  text: string;
+  replyText?: string;
+  status: "pending" | "replied" | "audio_started" | "audio_done" | "error" | "timeout";
+  listenStartedAt?: string;
+  listenStoppedAt?: string;
+  sttAt?: string;
+  channelEmitAt?: string;
+  channelEmitDoneAt?: string;
+  provisionalReplyAt?: string;
+  provisionalReplyText?: string;
+  replyToolAt?: string;
+  assistantSpeechAt?: string;
+  firstAudioRequestAt?: string;
+  firstAudioFrameAt?: string;
+  firstAudioDoneAt?: string;
+  finalAudioDoneAt?: string;
   audioChunks: Array<{
-    id: string
-    index?: number
-    count?: number
-    text: string
-    startedAt: string
-    firstFrameAt?: string
-    finishedAt?: string
-    synthesisDurationMs?: number
-    publishDurationMs?: number
-    durationMs?: number
-    ttsProvider?: 'irodori' | 'macos-say'
-    error?: string
-  }>
-  error?: string
-}
+    id: string;
+    index?: number;
+    count?: number;
+    kind?: "provisional" | "reply";
+    text: string;
+    startedAt: string;
+    firstFrameAt?: string;
+    finishedAt?: string;
+    synthesisDurationMs?: number;
+    publishDurationMs?: number;
+    durationMs?: number;
+    ttsProvider?: "irodori" | "macos-say";
+    error?: string;
+  }>;
+  error?: string;
+};
 
 type IrodoriSynthesisResponse = {
-  success?: boolean
-  mp3StreamingUrl?: string
-  mp3DownloadUrl?: string
-  error?: string
-}
+  success?: boolean;
+  mp3StreamingUrl?: string;
+  mp3DownloadUrl?: string;
+  error?: string;
+};
 
 type GradioFileResult = {
-  url?: string
-  path?: string
-  name?: string
-}
+  url?: string;
+  path?: string;
+  name?: string;
+};
 
-const pending = new Map<string, StackChanRequest>()
-const upstreamConfigs = new Map<string, UpstreamConfig>()
-const stackChanSockets = new Set<ServerWebSocket<StackChanConnection>>()
-const stackChanAudioSockets = new Set<ServerWebSocket<StackChanConnection>>()
-const pendingAssistantSpeech: PendingAssistantSpeech[] = []
-const pendingMqttAssistantAudio: PendingMqttAssistantAudio[] = []
-const localOutputKeys = new Set<string>()
-let mqttClient: ReturnType<typeof mqtt.connect> | undefined
-let mqttReady: Promise<void> | undefined
-let mqttInputCount = 0
-let mqttOutputCount = 0
-let mqttOutputAudioCount = 0
-let mqttStateCount = 0
-let assistantSpeechSending = false
-let mqttAssistantAudioSending = false
-let irodoriWarmupInFlight: Promise<void> | undefined
-let irodoriWarmupAbortController: AbortController | undefined
-let lastIrodoriWarmupAt = 0
-let lastMqttInput: NukoeviMqttEvent | undefined
-let lastMqttOutput: NukoeviMqttEvent | undefined
-let lastMqttOutputAudio: NukoeviMqttEvent | undefined
-let lastMqttState: NukoeviMqttEvent | undefined
-let lastAssistantSpeech: { text: string; queued: boolean; ts: string } | undefined
-let lastIrodoriWarmup: { state: string; reason?: string; durationMs?: number; ts: string } | undefined
-let irodoriTtsRateLimitedUntil = 0
-let lastIrodoriTtsRateLimit: { reason: string; until: string; ts: string } | undefined
-let xiaozhiAudioFramesIn = 0
-let xiaozhiAudioBytesIn = 0
-let xiaozhiAudioFramesOut = 0
-let xiaozhiAudioBytesOut = 0
-let lastXiaozhiAudioIn: { bytes: number; ts: string; sessionId: string; deviceId: string } | undefined
-let lastXiaozhiAudioOut: { bytes: number; ts: string; sessionId: string; deviceId: string } | undefined
+const pending = new Map<string, StackChanRequest>();
+const upstreamConfigs = new Map<string, UpstreamConfig>();
+const stackChanSockets = new Set<ServerWebSocket<StackChanConnection>>();
+const stackChanAudioSockets = new Set<ServerWebSocket<StackChanConnection>>();
+const pendingAssistantSpeech: PendingAssistantSpeech[] = [];
+const pendingMqttAssistantAudio: PendingMqttAssistantAudio[] = [];
+const localOutputKeys = new Set<string>();
+let mqttClient: ReturnType<typeof mqtt.connect> | undefined;
+let mqttReady: Promise<void> | undefined;
+let mqttInputCount = 0;
+let mqttOutputCount = 0;
+let mqttOutputAudioCount = 0;
+let mqttStateCount = 0;
+let assistantSpeechSending = false;
+let mqttAssistantAudioSending = false;
+let assistantAudioGeneration = 0;
+let lastAssistantAudioCancel: { reason: string; ts: string } | undefined;
+let irodoriWarmupInFlight: Promise<void> | undefined;
+let irodoriWarmupAbortController: AbortController | undefined;
+let lastIrodoriWarmupAt = 0;
+let fastProvisionalOpusPackets: Uint8Array[] | undefined;
+let fastProvisionalOpusWarmup: Promise<void> | undefined;
+const irodoriOpusCache = new Map<string, Uint8Array[]>();
+const irodoriOpusInFlight = new Map<string, Promise<Uint8Array[]>>();
+const irodoriOpusCacheMaxEntries = 32;
+let lastMqttInput: NukoeviMqttEvent | undefined;
+let lastMqttOutput: NukoeviMqttEvent | undefined;
+let lastMqttOutputAudio: NukoeviMqttEvent | undefined;
+let lastMqttState: NukoeviMqttEvent | undefined;
+let lastAssistantSpeech: { text: string; queued: boolean; ts: string } | undefined;
+let lastIrodoriWarmup:
+  | { state: string; reason?: string; durationMs?: number; ts: string }
+  | undefined;
+let irodoriTtsRateLimitedUntil = 0;
+let lastIrodoriTtsRateLimit: { reason: string; until: string; ts: string } | undefined;
+let xiaozhiAudioFramesIn = 0;
+let xiaozhiAudioBytesIn = 0;
+let xiaozhiAudioFramesOut = 0;
+let xiaozhiAudioBytesOut = 0;
+let lastXiaozhiAudioIn:
+  | { bytes: number; ts: string; sessionId: string; deviceId: string }
+  | undefined;
+let lastXiaozhiAudioOut:
+  | { bytes: number; ts: string; sessionId: string; deviceId: string }
+  | undefined;
 let lastUpstreamTextMessage:
-  | { type?: string; state?: string; textPreview?: string; hasText: boolean; ts: string; sessionId: string; deviceId: string }
-  | undefined
-let lastDirectStackChanInput: { text: string; sessionId: string; deviceId: string; ts: number } | undefined
+  | {
+      type?: string;
+      state?: string;
+      textPreview?: string;
+      hasText: boolean;
+      ts: string;
+      sessionId: string;
+      deviceId: string;
+    }
+  | undefined;
+let lastDirectStackChanInput:
+  | { text: string; sessionId: string; deviceId: string; ts: number }
+  | undefined;
 const recentUpstreamTextMessages: Array<{
-  type?: string
-  state?: string
-  textPreview?: string
-  hasText: boolean
-  ts: string
-  sessionId: string
-  deviceId: string
-}> = []
-let xiaozhiListening = false
-let xiaozhiListeningStartedAt = 0
-let xiaozhiListeningSessionId = ''
-let xiaozhiListeningDeviceId = ''
-let xiaozhiFramesInAtLastStop = 0
-let xiaozhiBytesInAtLastStop = 0
-const recentMqttStates: NukoeviMqttEvent[] = []
-const recentMqttAudioPublishes: MqttAudioPublishSession[] = []
-const mqttBrokerClients = new Set<string>()
-const mqttBrokerSubscriptions = new Map<string, string[]>()
-const recentMqttBrokerEvents: MqttBrokerEvent[] = []
+  type?: string;
+  state?: string;
+  textPreview?: string;
+  hasText: boolean;
+  ts: string;
+  sessionId: string;
+  deviceId: string;
+}> = [];
+let xiaozhiListening = false;
+let xiaozhiListeningStartedAt = 0;
+let xiaozhiListeningSessionId = "";
+let xiaozhiListeningDeviceId = "";
+let xiaozhiFramesInAtLastStop = 0;
+let xiaozhiBytesInAtLastStop = 0;
+let lastXiaozhiStopInjectionAt = 0;
+const recentMqttStates: NukoeviMqttEvent[] = [];
+const recentMqttAudioPublishes: MqttAudioPublishSession[] = [];
+const mqttBrokerClients = new Set<string>();
+const mqttBrokerSubscriptions = new Map<string, string[]>();
+const recentMqttBrokerEvents: MqttBrokerEvent[] = [];
 const recentXiaozhiEvents: Array<{
-  type: string
-  state?: string
-  reason?: string
-  framesIn: number
-  bytesIn: number
-  ts: string
-  sessionId: string
-  deviceId: string
-}> = []
-let lastChannelEmit: { text: string; meta: Record<string, string>; transport: StackChanAgentTransport; ts: string } | undefined
-const recentTurnTraces: TurnTrace[] = []
-const turnTracesByRequest = new Map<string, TurnTrace>()
+  type: string;
+  state?: string;
+  reason?: string;
+  framesIn: number;
+  bytesIn: number;
+  ts: string;
+  sessionId: string;
+  deviceId: string;
+}> = [];
+let lastChannelEmit:
+  | { text: string; meta: Record<string, string>; transport: StackChanAgentTransport; ts: string }
+  | undefined;
+const recentTurnTraces: TurnTrace[] = [];
+const turnTracesByRequest = new Map<string, TurnTrace>();
 
 function latestXiaozhiEvent(sessionId: string, type: string, state?: string) {
   for (let index = recentXiaozhiEvents.length - 1; index >= 0; index--) {
-    const event = recentXiaozhiEvents[index]
-    if (event.sessionId !== sessionId || event.type !== type) continue
-    if (state && event.state !== state) continue
-    return event
+    const event = recentXiaozhiEvents[index];
+    if (event.sessionId !== sessionId || event.type !== type) continue;
+    if (state && event.state !== state) continue;
+    return event;
   }
-  return undefined
+  return undefined;
 }
 
 function latestUpstreamMessage(sessionId: string, type: string, state?: string) {
   for (let index = recentUpstreamTextMessages.length - 1; index >= 0; index--) {
-    const message = recentUpstreamTextMessages[index]
-    if (message.sessionId !== sessionId || message.type !== type) continue
-    if (state && message.state !== state) continue
-    return message
+    const message = recentUpstreamTextMessages[index];
+    if (message.sessionId !== sessionId || message.type !== type) continue;
+    if (state && message.state !== state) continue;
+    return message;
   }
-  return undefined
+  return undefined;
 }
 
 function rememberTurnTrace(trace: TurnTrace) {
-  turnTracesByRequest.set(trace.requestId, trace)
-  recentTurnTraces.push(trace)
+  turnTracesByRequest.set(trace.requestId, trace);
+  recentTurnTraces.push(trace);
   while (recentTurnTraces.length > 20) {
-    const removed = recentTurnTraces.shift()
-    if (removed) turnTracesByRequest.delete(removed.requestId)
+    const removed = recentTurnTraces.shift();
+    if (removed) turnTracesByRequest.delete(removed.requestId);
   }
 }
 
 function durationBetween(start?: string, end?: string) {
-  if (!start || !end) return undefined
-  const ms = Date.parse(end) - Date.parse(start)
-  return Number.isFinite(ms) ? ms : undefined
+  if (!start || !end) return undefined;
+  const ms = Date.parse(end) - Date.parse(start);
+  return Number.isFinite(ms) ? ms : undefined;
 }
 
 function turnTraceView(trace: TurnTrace) {
+  const firstReplyAudio = trace.audioChunks.find((chunk) => chunk.kind !== "provisional");
   const latency = {
     listenMs: durationBetween(trace.listenStartedAt, trace.listenStoppedAt),
     stopToSttMs: durationBetween(trace.listenStoppedAt, trace.sttAt),
+    sttToProvisionalReplyMs: durationBetween(trace.sttAt, trace.provisionalReplyAt),
     sttToChannelEmitMs: durationBetween(trace.sttAt, trace.channelEmitAt),
     channelEmitMs: durationBetween(trace.channelEmitAt, trace.channelEmitDoneAt),
     sttToReplyToolMs: durationBetween(trace.sttAt, trace.replyToolAt),
-    replyToolToFirstAudioRequestMs: durationBetween(trace.replyToolAt, trace.firstAudioRequestAt),
-    firstAudioRequestToFirstFrameMs: durationBetween(trace.firstAudioRequestAt, trace.firstAudioFrameAt),
+    replyToolToReplyAudioRequestMs: durationBetween(trace.replyToolAt, firstReplyAudio?.startedAt),
+    replyToolToReplyAudioFrameMs: durationBetween(trace.replyToolAt, firstReplyAudio?.firstFrameAt),
+    firstAudioRequestToFirstFrameMs: durationBetween(
+      trace.firstAudioRequestAt,
+      trace.firstAudioFrameAt,
+    ),
     sttToFirstAudioFrameMs: durationBetween(trace.sttAt, trace.firstAudioFrameAt),
     stopToFirstAudioFrameMs: durationBetween(trace.listenStoppedAt, trace.firstAudioFrameAt),
     sttToFinalAudioDoneMs: durationBetween(trace.sttAt, trace.finalAudioDoneAt),
     stopToFinalAudioDoneMs: durationBetween(trace.listenStoppedAt, trace.finalAudioDoneAt),
-  }
-  return { ...trace, latency }
+  };
+  return { ...trace, latency };
 }
 
 function latencySummary() {
-  const traces = recentTurnTraces.map(turnTraceView)
-  const latest = traces.at(-1)
+  const traces = recentTurnTraces.map(turnTraceView);
+  const latest = traces.at(-1);
   const stopToFirstValues = traces
-    .map(trace => trace.latency.stopToFirstAudioFrameMs)
-    .filter((value): value is number => value !== undefined)
+    .map((trace) => trace.latency.stopToFirstAudioFrameMs)
+    .filter((value): value is number => value !== undefined);
   const sttToFirstValues = traces
-    .map(trace => trace.latency.sttToFirstAudioFrameMs)
-    .filter((value): value is number => value !== undefined)
-  const averageStopToFirstAudioFrameMs = stopToFirstValues.length === 0
-    ? undefined
-    : Math.round(stopToFirstValues.reduce((sum, value) => sum + value, 0) / stopToFirstValues.length)
-  const averageSttToFirstAudioFrameMs = sttToFirstValues.length === 0
-    ? undefined
-    : Math.round(sttToFirstValues.reduce((sum, value) => sum + value, 0) / sttToFirstValues.length)
+    .map((trace) => trace.latency.sttToFirstAudioFrameMs)
+    .filter((value): value is number => value !== undefined);
+  const averageStopToFirstAudioFrameMs =
+    stopToFirstValues.length === 0
+      ? undefined
+      : Math.round(
+          stopToFirstValues.reduce((sum, value) => sum + value, 0) / stopToFirstValues.length,
+        );
+  const averageSttToFirstAudioFrameMs =
+    sttToFirstValues.length === 0
+      ? undefined
+      : Math.round(
+          sttToFirstValues.reduce((sum, value) => sum + value, 0) / sttToFirstValues.length,
+        );
   return {
     latest,
     sampleCount: traces.length,
@@ -400,850 +482,1241 @@ function latencySummary() {
     sttToFirstAudioFrameSampleCount: sttToFirstValues.length,
     averageStopToFirstAudioFrameMs,
     averageSttToFirstAudioFrameMs,
-    targetStopToFirstAudioFrameMs: 8000,
-    targetSttToFirstAudioFrameMs: 8000,
-  }
+    targetStopToFirstAudioFrameMs: 5000,
+    targetSttToFirstAudioFrameMs: 5000,
+  };
 }
 
 function pushXiaozhiEvent(event: {
-  type: string
-  state?: string
-  reason?: string
-  sessionId: string
-  deviceId: string
+  type: string;
+  state?: string;
+  reason?: string;
+  sessionId: string;
+  deviceId: string;
 }) {
   recentXiaozhiEvents.push({
     ...event,
     framesIn: xiaozhiAudioFramesIn,
     bytesIn: xiaozhiAudioBytesIn,
     ts: nowIso(),
-  })
-  while (recentXiaozhiEvents.length > 20) recentXiaozhiEvents.shift()
+  });
+  while (recentXiaozhiEvents.length > 20) recentXiaozhiEvents.shift();
 }
 
 function markXiaozhiListening(sessionId: string, deviceId: string) {
-  xiaozhiListening = true
-  xiaozhiListeningStartedAt = Date.now()
-  xiaozhiListeningSessionId = sessionId
-  xiaozhiListeningDeviceId = deviceId
+  xiaozhiListening = true;
+  xiaozhiListeningStartedAt = Date.now();
+  xiaozhiListeningSessionId = sessionId;
+  xiaozhiListeningDeviceId = deviceId;
   pushXiaozhiEvent({
-    type: 'listen',
-    state: 'start',
+    type: "listen",
+    state: "start",
     sessionId,
     deviceId,
-  })
+  });
 }
 
-function clearXiaozhiListening(reason: string, sessionId = xiaozhiListeningSessionId, deviceId = xiaozhiListeningDeviceId) {
-  if (!xiaozhiListening && xiaozhiListeningStartedAt === 0) return
-  xiaozhiListening = false
-  xiaozhiListeningStartedAt = 0
-  xiaozhiListeningSessionId = ''
-  xiaozhiListeningDeviceId = ''
-  xiaozhiFramesInAtLastStop = xiaozhiAudioFramesIn
-  xiaozhiBytesInAtLastStop = xiaozhiAudioBytesIn
+function clearXiaozhiListening(
+  reason: string,
+  sessionId = xiaozhiListeningSessionId,
+  deviceId = xiaozhiListeningDeviceId,
+) {
+  if (!xiaozhiListening && xiaozhiListeningStartedAt === 0) return;
+  xiaozhiListening = false;
+  xiaozhiListeningStartedAt = 0;
+  xiaozhiListeningSessionId = "";
+  xiaozhiListeningDeviceId = "";
+  xiaozhiFramesInAtLastStop = xiaozhiAudioFramesIn;
+  xiaozhiBytesInAtLastStop = xiaozhiAudioBytesIn;
   pushXiaozhiEvent({
-    type: 'listen',
-    state: 'stop',
+    type: "listen",
+    state: "stop",
     reason,
-    sessionId: sessionId || 'unknown',
-    deviceId: deviceId || 'unknown',
-  })
+    sessionId: sessionId || "unknown",
+    deviceId: deviceId || "unknown",
+  });
+}
+
+async function injectXiaozhiStopFromState(
+  reason: string,
+  sessionId = xiaozhiListeningSessionId,
+  deviceId = xiaozhiListeningDeviceId,
+) {
+  if (!xiaozhiListening || xiaozhiListeningStartedAt === 0) return false;
+  if (Date.now() - lastXiaozhiStopInjectionAt < 500) return false;
+  const normalizedDeviceId = normalizeDeviceId(deviceId || xiaozhiListeningDeviceId);
+  const candidates = Array.from(stackChanSockets).filter((ws) => {
+    if (ws.data.kind !== "xiaozhi" || !ws.data.upstream) return false;
+    const sessionMatches = sessionId ? ws.data.sessionId === sessionId : true;
+    const deviceMatches = normalizedDeviceId
+      ? normalizeDeviceId(ws.data.deviceId) === normalizedDeviceId
+      : true;
+    return sessionMatches || deviceMatches;
+  });
+  if (candidates.length === 0) return false;
+
+  lastXiaozhiStopInjectionAt = Date.now();
+  const stoppedAt = nowIso();
+  await Promise.all(
+    candidates.map((ws) =>
+      ws.data.upstream?.send(
+        JSON.stringify({
+          session_id: ws.data.sessionId,
+          type: "listen",
+          state: "stop",
+        }),
+      ),
+    ),
+  );
+  pushXiaozhiEvent({
+    type: "listen",
+    state: "stop-injected",
+    reason,
+    sessionId: sessionId || xiaozhiListeningSessionId || "unknown",
+    deviceId: deviceId || xiaozhiListeningDeviceId || "unknown",
+  });
+  log(
+    `xiaozhi stop injected from MQTT state: reason=${reason} sessions=${candidates.map((ws) => ws.data.sessionId).join(",")} at=${stoppedAt}`,
+  );
+  return true;
 }
 
 function refreshXiaozhiListeningState() {
-  if (!xiaozhiListening || xiaozhiListeningStartedAt === 0) return
-  if (Date.now() - xiaozhiListeningStartedAt < xiaozhiListeningStaleMs) return
-  clearXiaozhiListening('stale-timeout')
+  if (!xiaozhiListening || xiaozhiListeningStartedAt === 0) return;
+  if (Date.now() - xiaozhiListeningStartedAt < xiaozhiListeningStaleMs) return;
+  clearXiaozhiListening("stale-timeout");
 }
 
-function pushMqttBrokerEvent(event: Omit<MqttBrokerEvent, 'ts'>) {
+function pushMqttBrokerEvent(event: Omit<MqttBrokerEvent, "ts">) {
   recentMqttBrokerEvents.push({
     ...event,
     ts: nowIso(),
-  })
-  while (recentMqttBrokerEvents.length > 40) recentMqttBrokerEvents.shift()
+  });
+  while (recentMqttBrokerEvents.length > 40) recentMqttBrokerEvents.shift();
 }
 
 function loadUpstreamConfigs() {
   try {
-    const data = JSON.parse(readFileSync(statePath, 'utf8')) as Record<string, UpstreamConfig>
+    const data = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, UpstreamConfig>;
     for (const [key, config] of Object.entries(data)) {
-      if (config?.url) upstreamConfigs.set(key, config)
+      if (config?.url) upstreamConfigs.set(key, config);
     }
-    log(`loaded upstream config cache: ${upstreamConfigs.size}`)
-  } catch {
-  }
+    log(`loaded upstream config cache: ${upstreamConfigs.size}`);
+  } catch {}
 }
 
 function saveUpstreamConfigs() {
-  const data: Record<string, UpstreamConfig> = {}
+  const data: Record<string, UpstreamConfig> = {};
   for (const [key, config] of upstreamConfigs) {
-    data[key] = config
+    data[key] = config;
   }
-  mkdirSync(statePath.replace(/\/[^/]+$/, ''), { recursive: true })
-  writeFileSync(statePath, JSON.stringify(data, null, 2))
+  mkdirSync(statePath.replace(/\/[^/]+$/, ""), { recursive: true });
+  writeFileSync(statePath, JSON.stringify(data, null, 2));
 }
 
 function nowIso() {
-  return new Date().toISOString()
+  return new Date().toISOString();
 }
 
 function log(message: string) {
-  process.stderr.write(`stackchan channel: ${message}\n`)
+  const line = `stackchan channel: ${message}\n`;
+  process.stderr.write(line);
+  if (!logPath) return;
+  try {
+    appendFileSync(logPath, `${nowIso()} ${line}`);
+  } catch {}
 }
 
 function startEmbeddedMqttBroker() {
-  if (!mqttEnabled || !mqttEmbedded) return
-  void Aedes.createBroker().then(broker => {
-    broker.on('client', client => {
-      const clientId = client?.id ?? 'unknown'
-      mqttBrokerClients.add(clientId)
-      pushMqttBrokerEvent({ type: 'client.connected', clientId })
-      log(`MQTT broker client connected: ${clientId}`)
+  if (!mqttEnabled || !mqttEmbedded) return;
+  void Aedes.createBroker()
+    .then((broker) => {
+      broker.on("client", (client) => {
+        const clientId = client?.id ?? "unknown";
+        mqttBrokerClients.add(clientId);
+        pushMqttBrokerEvent({ type: "client.connected", clientId });
+        log(`MQTT broker client connected: ${clientId}`);
+      });
+      broker.on("clientDisconnect", (client) => {
+        const clientId = client?.id ?? "unknown";
+        mqttBrokerClients.delete(clientId);
+        mqttBrokerSubscriptions.delete(clientId);
+        pushMqttBrokerEvent({ type: "client.disconnected", clientId });
+        log(`MQTT broker client disconnected: ${clientId}`);
+      });
+      broker.on("subscribe", (subscriptions, client) => {
+        const clientId = client?.id ?? "unknown";
+        const topics = subscriptions.map((sub) => sub.topic);
+        mqttBrokerSubscriptions.set(clientId, topics);
+        pushMqttBrokerEvent({ type: "client.subscribed", clientId, topics });
+        log(`MQTT broker client subscribed: ${clientId} ${topics.join(", ")}`);
+      });
+      broker.on("unsubscribe", (subscriptions, client) => {
+        const clientId = client?.id ?? "unknown";
+        const topics = subscriptions.map((sub) => sub.topic);
+        mqttBrokerSubscriptions.set(
+          clientId,
+          (mqttBrokerSubscriptions.get(clientId) ?? []).filter((topic) => !topics.includes(topic)),
+        );
+        pushMqttBrokerEvent({ type: "client.unsubscribed", clientId, topics });
+        log(`MQTT broker client unsubscribed: ${clientId} ${topics.join(", ")}`);
+      });
+      broker.on("publish", (packet, client) => {
+        const topic = packet?.topic ?? "";
+        if (topic !== mqttInputTopic && topic !== mqttOutputTopic && topic !== mqttOutputAudioTopic)
+          return;
+        const clientId = client?.id ?? "broker";
+        log(`MQTT broker publish: ${clientId} ${topic}`);
+      });
+      const server = createServer(broker.handle);
+      server.listen(mqttPort, mqttBrokerHost, () => {
+        log(`MQTT broker listening: mqtt://${mqttBrokerHost}:${mqttPort}`);
+      });
+      server.on("error", (err) => {
+        log(`MQTT broker skipped: ${err}`);
+      });
     })
-    broker.on('clientDisconnect', client => {
-      const clientId = client?.id ?? 'unknown'
-      mqttBrokerClients.delete(clientId)
-      mqttBrokerSubscriptions.delete(clientId)
-      pushMqttBrokerEvent({ type: 'client.disconnected', clientId })
-      log(`MQTT broker client disconnected: ${clientId}`)
-    })
-    broker.on('subscribe', (subscriptions, client) => {
-      const clientId = client?.id ?? 'unknown'
-      const topics = subscriptions.map(sub => sub.topic)
-      mqttBrokerSubscriptions.set(clientId, topics)
-      pushMqttBrokerEvent({ type: 'client.subscribed', clientId, topics })
-      log(`MQTT broker client subscribed: ${clientId} ${topics.join(', ')}`)
-    })
-    broker.on('unsubscribe', (subscriptions, client) => {
-      const clientId = client?.id ?? 'unknown'
-      const topics = subscriptions.map(sub => sub.topic)
-      mqttBrokerSubscriptions.set(
-        clientId,
-        (mqttBrokerSubscriptions.get(clientId) ?? []).filter(topic => !topics.includes(topic)),
-      )
-      pushMqttBrokerEvent({ type: 'client.unsubscribed', clientId, topics })
-      log(`MQTT broker client unsubscribed: ${clientId} ${topics.join(', ')}`)
-    })
-    const server = createServer(broker.handle)
-    server.listen(mqttPort, mqttBrokerHost, () => {
-      log(`MQTT broker listening: mqtt://${mqttBrokerHost}:${mqttPort}`)
-    })
-    server.on('error', err => {
-      log(`MQTT broker skipped: ${err}`)
-    })
-  }).catch(err => {
-    log(`MQTT broker skipped: ${err}`)
-  })
+    .catch((err) => {
+      log(`MQTT broker skipped: ${err}`);
+    });
 }
 
 async function ensureMqtt() {
-  if (!mqttEnabled) return undefined
-  if (mqttClient) return mqttClient
+  if (!mqttEnabled) return undefined;
+  if (mqttClient) return mqttClient;
   if (mqttReady) {
-    await mqttReady
-    return mqttClient
+    await mqttReady;
+    return mqttClient;
   }
 
   mqttClient = mqtt.connect(mqttUrl, {
     clientId: `stackchan-relay-${randomUUID()}`,
     reconnectPeriod: 1000,
-  })
+  });
 
-  mqttClient.on('message', (topic, payload) => {
-    if (topic === mqttOutputTopic) void handleMqttOutput(payload.toString())
-    if (topic === mqttInputTopic) void handleMqttInput(payload.toString())
-    if (topic === mqttStateTopic) void handleMqttState(payload.toString())
-  })
-  mqttClient.on('error', err => {
-    log(`MQTT error: ${err}`)
-  })
-  mqttClient.on('reconnect', () => {
-    log('MQTT reconnecting')
-  })
+  mqttClient.on("message", (topic, payload) => {
+    if (topic === mqttOutputTopic) void handleMqttOutput(payload.toString());
+    if (topic === mqttInputTopic) void handleMqttInput(payload.toString());
+    if (topic === mqttStateTopic) void handleMqttState(payload.toString());
+  });
+  mqttClient.on("error", (err) => {
+    log(`MQTT error: ${err}`);
+  });
+  mqttClient.on("reconnect", () => {
+    log("MQTT reconnecting");
+  });
 
-  mqttReady = new Promise(resolve => {
-    mqttClient?.once('connect', () => {
-      log(`MQTT connected: ${mqttUrl}`)
-      const topics = mqttEmbedded || stackChanAgentTransport === 'claude-code-channels'
+  mqttReady = new Promise((resolve) => {
+    mqttClient?.once("connect", () => {
+      log(`MQTT connected: ${mqttUrl}`);
+      const topics = mqttInputHandlerEnabled && directMcpChannel
         ? [mqttOutputTopic, mqttInputTopic, mqttStateTopic]
-        : [mqttOutputTopic, mqttStateTopic]
-      mqttClient?.subscribe(topics, err => {
-        if (err) log(`MQTT subscribe failed: ${err}`)
-        else log(`MQTT subscribed: ${topics.join(', ')}`)
-        resolve()
-      })
-    })
-  })
+        : [mqttOutputTopic, mqttStateTopic];
+      mqttClient?.subscribe(topics, (err) => {
+        if (err) log(`MQTT subscribe failed: ${err}`);
+        else log(`MQTT subscribed: ${topics.join(", ")}`);
+        resolve();
+      });
+    });
+  });
 
-  await mqttReady
-  return mqttClient
+  await mqttReady;
+  return mqttClient;
 }
 
-function mqttEvent(type: string, text: string, values: Partial<NukoeviMqttEvent> = {}): NukoeviMqttEvent {
+function mqttEvent(
+  type: string,
+  text: string,
+  values: Partial<NukoeviMqttEvent> = {},
+): NukoeviMqttEvent {
   return {
     id: values.id ?? randomUUID(),
     type,
-    source: values.source ?? 'stackchan',
+    source: values.source ?? "stackchan",
     text,
     ts: nowIso(),
     ...values,
-  }
+  };
 }
 
 async function publishMqtt(topic: string, event: NukoeviMqttEvent, qos: MqttQos = 0) {
-  const client = await ensureMqtt()
-  if (!client) return
-  await new Promise<void>(resolve => {
-    client.publish(topic, JSON.stringify(event), { qos }, err => {
-      if (err) log(`MQTT publish failed: ${topic} ${err}`)
-      resolve()
-    })
-  })
+  const client = await ensureMqtt();
+  if (!client) return;
+  await new Promise<void>((resolve) => {
+    client.publish(topic, JSON.stringify(event), { qos }, (err) => {
+      if (err) log(`MQTT publish failed: ${topic} ${err}`);
+      resolve();
+    });
+  });
 }
 
 async function publishMqttInput(event: NukoeviMqttEvent) {
-  await publishMqtt(mqttInputTopic, event)
+  await publishMqtt(mqttInputTopic, event);
 }
 
 async function publishMqttOutput(event: NukoeviMqttEvent) {
-  await publishMqtt(mqttOutputTopic, event)
+  await publishMqtt(mqttOutputTopic, event);
+}
+
+async function speakFastProvisionalReply(requestId: string, sessionId: string, deviceId: string) {
+  if (!fastProvisionalReplyEnabled || !fastProvisionalReplyText) return;
+  void speakStackChanAssistant(fastProvisionalReplyText, false, { requestId, kind: "provisional" });
 }
 
 function rememberLocalOutput(event: NukoeviMqttEvent) {
-  if (event.id) localOutputKeys.add(event.id)
-  if (event.correlation_id) localOutputKeys.add(event.correlation_id)
+  if (event.id) localOutputKeys.add(event.id);
+  if (event.correlation_id) localOutputKeys.add(event.correlation_id);
   while (localOutputKeys.size > 256) {
-    const first = localOutputKeys.values().next().value
-    if (!first) break
-    localOutputKeys.delete(first)
+    const first = localOutputKeys.values().next().value;
+    if (!first) break;
+    localOutputKeys.delete(first);
   }
 }
 
 function consumeLocalOutput(event: NukoeviMqttEvent) {
-  const keys = [event.id, event.correlation_id].filter((value): value is string => Boolean(value))
-  const local = keys.some(key => localOutputKeys.has(key))
+  const keys = [event.id, event.correlation_id].filter((value): value is string => Boolean(value));
+  const local = keys.some((key) => localOutputKeys.has(key));
   if (local) {
-    for (const key of keys) localOutputKeys.delete(key)
+    for (const key of keys) localOutputKeys.delete(key);
   }
-  return local
+  return local;
 }
 
 async function publishMqttOutputAudio(event: NukoeviMqttEvent) {
-  mqttOutputAudioCount += 1
-  lastMqttOutputAudio = event
-  await publishMqtt(mqttOutputAudioTopic, event, mqttAudioQos)
+  mqttOutputAudioCount += 1;
+  lastMqttOutputAudio = event;
+  await publishMqtt(mqttOutputAudioTopic, event, mqttAudioQos);
 }
 
 async function publishStackChanState(state: string, values: Partial<NukoeviMqttEvent> = {}) {
-  await publishMqtt(mqttStateTopic, mqttEvent('device.state', state, values))
+  await publishMqtt(mqttStateTopic, mqttEvent("device.state", state, values));
+}
+
+function cancelAssistantAudio(reason: string) {
+  assistantAudioGeneration += 1;
+  pendingMqttAssistantAudio.length = 0;
+  pendingAssistantSpeech.length = 0;
+  lastAssistantAudioCancel = { reason, ts: nowIso() };
+  log(`assistant audio canceled: ${reason}`);
+}
+
+function assistantAudioCanceled(generation: number) {
+  return generation !== assistantAudioGeneration;
+}
+
+function markAssistantAudioCanceled(
+  session: MqttAudioPublishSession,
+  trace: TurnTrace | undefined,
+  audioId: string,
+  started: number,
+) {
+  session.error = `canceled: ${lastAssistantAudioCancel?.reason ?? "unknown"}`;
+  session.finishedAt = nowIso();
+  session.durationMs = Date.now() - started;
+  if (trace) {
+    const chunk = trace.audioChunks.find((item) => item.id === audioId);
+    if (chunk) {
+      chunk.error = session.error;
+      chunk.finishedAt = session.finishedAt;
+      chunk.durationMs = session.durationMs;
+    }
+    trace.error = session.error;
+    trace.status = "error";
+  }
+  log(`assistant audio canceled before completion: ${audioId} ${session.error}`);
 }
 
 async function handleMqttOutput(raw: string) {
-  let event: NukoeviMqttEvent
+  let event: NukoeviMqttEvent;
   try {
-    event = JSON.parse(raw) as NukoeviMqttEvent
+    event = JSON.parse(raw) as NukoeviMqttEvent;
   } catch {
-    log(`MQTT output ignored: ${raw}`)
-    return
+    log(`MQTT output ignored: ${raw}`);
+    return;
   }
 
-  const text = normalizeText(String(event.text ?? ''))
-  if (!text) return
-  mqttOutputCount += 1
-  lastMqttOutput = event
-  if (consumeLocalOutput(event)) return
+  const text = normalizeText(String(event.text ?? ""));
+  if (!text) return;
+  mqttOutputCount += 1;
+  lastMqttOutput = event;
+  if (consumeLocalOutput(event)) return;
 
-  const requestId = event.correlation_id ?? event.id ?? ''
-  const entry = requestId ? pending.get(requestId) : undefined
+  const requestId = event.correlation_id ?? event.id ?? "";
+  const entry = requestId ? pending.get(requestId) : undefined;
   if (entry) {
-    const trace = turnTracesByRequest.get(requestId)
+    const trace = turnTracesByRequest.get(requestId);
     if (trace) {
-      trace.replyToolAt = nowIso()
-      trace.replyText = text
-      trace.status = 'replied'
+      trace.replyToolAt = nowIso();
+      trace.replyText = text;
+      trace.status = "replied";
     }
-    void speakStackChanAssistant(text, false, { requestId })
-    entry.resolve({ text, speechHandled: true })
-    return
+    void speakStackChanAssistant(text, false, { requestId });
+    entry.resolve({ text, speechHandled: true });
+    return;
   }
 
-  if (requestId && event.session_id !== 'broadcast') {
-    log(`MQTT output ignored: unknown request_id=${requestId}`)
-    return
+  if (requestId && event.session_id !== "broadcast") {
+    log(`MQTT output ignored: unknown request_id=${requestId}`);
+    return;
   }
 
-  if (event.target && event.target !== 'stackchan' && event.target !== 'all') return
-  void speakStackChanAssistant(text, true, { requestId })
+  if (event.target && event.target !== "stackchan" && event.target !== "all") return;
+  void speakStackChanAssistant(text, true, { requestId });
 }
 
 async function handleMqttState(raw: string) {
-  let event: NukoeviMqttEvent
+  let event: NukoeviMqttEvent;
   try {
-    event = JSON.parse(raw) as NukoeviMqttEvent
+    event = JSON.parse(raw) as NukoeviMqttEvent;
   } catch {
-    log(`MQTT state ignored: ${raw}`)
-    return
+    log(`MQTT state ignored: ${raw}`);
+    return;
   }
 
-  mqttStateCount += 1
-  lastMqttState = event
-  recentMqttStates.push(event)
+  if (!event.ts) event.ts = nowIso();
+  mqttStateCount += 1;
+  lastMqttState = event;
+  recentMqttStates.push(event);
   while (recentMqttStates.length > 80) {
-    recentMqttStates.shift()
+    recentMqttStates.shift();
   }
 
-  if (event.type === 'xiaozhi.stop.requested' || event.type === 'mic.cancelled') {
+  if (
+    event.type === "mic.pressed" ||
+    (event.type === "device.state" && event.text === "listening") ||
+    (event.type === "xiaozhi.status" && event.text === "Listening...")
+  ) {
+    cancelAssistantAudio(event.type ?? "voice-input-started");
+  }
+
+  if (event.type === "xiaozhi.stop.requested") {
+    void injectXiaozhiStopFromState(
+      normalizeText(String(event.text ?? event.type)),
+      event.session_id ?? xiaozhiListeningSessionId,
+      event.device_id ?? xiaozhiListeningDeviceId,
+    ).catch((err) => {
+      log(`failed to inject xiaozhi stop: ${err}`);
+    });
+  }
+
+  if (event.type === "xiaozhi.stop.requested" || event.type === "mic.cancelled") {
     clearXiaozhiListening(
       event.type,
       event.session_id ?? xiaozhiListeningSessionId,
       event.device_id ?? xiaozhiListeningDeviceId,
-    )
+    );
   }
 }
 
 async function handleMqttInput(raw: string) {
-  if (!directMcpChannel) return
+  log(`MQTT input received: direct=${directMcpChannel ? 1 : 0} handler=${mqttInputHandlerEnabled ? 1 : 0}`);
+  if (!directMcpChannel || !mqttInputHandlerEnabled) return;
 
-  let event: NukoeviMqttEvent
+  let event: NukoeviMqttEvent;
   try {
-    event = JSON.parse(raw) as NukoeviMqttEvent
+    event = JSON.parse(raw) as NukoeviMqttEvent;
   } catch {
-    log(`MQTT input ignored: ${raw}`)
-    return
+    log(`MQTT input ignored: ${raw}`);
+    return;
   }
 
-  const text = normalizeText(String(event.text ?? ''))
-  if (!text) return
+  const text = normalizeText(String(event.text ?? ""));
+  if (!text) return;
   if (
-    event.source === 'stackchan' &&
+    event.source === "stackchan" &&
     lastDirectStackChanInput &&
     lastDirectStackChanInput.text === text &&
-    normalizeDeviceId(lastDirectStackChanInput.deviceId) === normalizeDeviceId(event.device_id ?? event.source ?? 'mqtt') &&
+    normalizeDeviceId(lastDirectStackChanInput.deviceId) ===
+      normalizeDeviceId(event.device_id ?? event.source ?? "mqtt") &&
     Date.now() - lastDirectStackChanInput.ts < 5000
   ) {
-    log(`MQTT input skipped duplicate: ${text}`)
-    return
+    log(`MQTT input skipped duplicate: ${text}`);
+    return;
   }
-  mqttInputCount += 1
-  lastMqttInput = event
+  mqttInputCount += 1;
+  lastMqttInput = event;
 
-  const requestId = event.id ?? randomUUID()
-  if (pending.has(requestId)) return
+  const requestId = event.id ?? randomUUID();
+  if (pending.has(requestId)) return;
+  log(`MQTT input accepted: ${requestId} ${text}`);
 
-  const sessionId = event.session_id ?? 'mqtt'
-  const deviceId = event.device_id ?? event.source ?? 'mqtt'
-  const started = Date.now()
+  const sessionId = event.session_id ?? "mqtt";
+  const deviceId = event.device_id ?? event.source ?? "mqtt";
+  const started = Date.now();
+  rememberTurnTrace({
+    requestId,
+    source: "mqtt",
+    sessionId,
+    deviceId,
+    text,
+    status: "pending",
+    sttAt: event.ts ?? nowIso(),
+    audioChunks: [],
+  });
   const timer = setTimeout(() => {
-    pending.delete(requestId)
-    log(`MQTT input timed out: ${requestId}`)
-  }, assistantTimeoutMs)
+    pending.delete(requestId);
+    const trace = turnTracesByRequest.get(requestId);
+    if (trace) {
+      trace.status = "timeout";
+      trace.error = "assistant timeout";
+    }
+    log(`MQTT input timed out: ${requestId}`);
+  }, assistantTimeoutMs);
 
   pending.set(requestId, {
     id: requestId,
     sessionId,
     deviceId,
     createdAt: started,
-    resolve: value => {
-      clearTimeout(timer)
-      pending.delete(requestId)
-      log(`MQTT input resolved: ${requestId} ${value}`)
+    resolve: (value) => {
+      clearTimeout(timer);
+      pending.delete(requestId);
+      const trace = turnTracesByRequest.get(requestId);
+      if (trace) {
+        trace.replyText = value.text;
+        if (!trace.replyToolAt) trace.replyToolAt = nowIso();
+        if (value.speechHandled) trace.status = "replied";
+      }
+      log(`MQTT input resolved: ${requestId} ${value}`);
     },
-  })
+  });
 
+  if (event.source === "stackchan") {
+    void speakFastProvisionalReply(requestId, sessionId, deviceId).catch((err) => {
+      log(`failed to speak provisional MQTT StackChan reply: ${err}`);
+    });
+  }
+
+  log(`MQTT input emitting channel: ${requestId}`);
   await emitChannel(text, {
-    source: event.source ?? 'mqtt',
+    source: event.source ?? "mqtt",
     request_id: requestId,
     session_id: sessionId,
     device_id: deviceId,
-    user: event.source ?? 'mqtt',
-  }).catch(err => {
-    clearTimeout(timer)
-    pending.delete(requestId)
-    log(`failed to deliver MQTT inbound to Claude: ${err}`)
-  })
+    user: event.source ?? "mqtt",
+  }).catch((err) => {
+    clearTimeout(timer);
+    pending.delete(requestId);
+    log(`failed to deliver MQTT inbound to Claude: ${err}`);
+  });
+  log(`MQTT input emitted channel: ${requestId}`);
 }
 
 function textFromContent(content: unknown): string {
-  if (typeof content === 'string') return content
+  if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
-      .map(item => {
-        if (typeof item === 'string') return item
-        if (item && typeof item === 'object' && 'text' in item) {
-          const text = (item as { text?: unknown }).text
-          return typeof text === 'string' ? text : ''
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object" && "text" in item) {
+          const text = (item as { text?: unknown }).text;
+          return typeof text === "string" ? text : "";
         }
-        return ''
+        return "";
       })
       .filter(Boolean)
-      .join('\n')
+      .join("\n");
   }
-  return ''
+  return "";
 }
 
 function latestUserText(messages: OpenAIMessage[]): string {
   for (const message of [...messages].reverse()) {
-    if (message.role === 'user') {
-      const text = textFromContent(message.content).trim()
-      if (text) return text
+    if (message.role === "user") {
+      const text = textFromContent(message.content).trim();
+      if (text) return text;
     }
   }
-  return ''
+  return "";
 }
 
 function sendJson(ws: ServerWebSocket<StackChanConnection>, value: unknown) {
-  ws.send(JSON.stringify(value))
+  ws.send(JSON.stringify(value));
 }
 
 function normalizeText(text: string) {
-  return text.replace(/\s+/g, ' ').trim()
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function boundedNumber(value: unknown, fallback: number, min: number, max: number) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(min, Math.min(max, number));
 }
 
 function splitAssistantAudioText(text: string) {
-  const normalized = normalizeText(text)
-  if (!fastFirstAudioEnabled || normalized.length <= fastFirstAudioMaxChars) return [normalized]
+  const normalized = normalizeText(text);
+  const parts = normalized
+    .match(/[^。！？!?]+[。！？!?]+[」』）】]*[〜ー]*|[^。！？!?]+$/g)
+    ?.map((part) => part.trim())
+    .filter(Boolean) ?? [normalized];
+  if (parts.length > 1) return parts;
+  if (!fastFirstAudioEnabled || normalized.length <= fastFirstAudioMaxChars) return [normalized];
 
-  const parts = normalized.match(/[^。！？!?]+[。！？!?〜ー]*|.+$/g)?.map(part => part.trim()).filter(Boolean) ?? [normalized]
-  if (parts.length > 1) return parts
-
-  const softBreaks = ['、', ',', '，', ' ']
+  const softBreaks = ["、", ",", "，", " "];
   for (const mark of softBreaks) {
-    const index = normalized.indexOf(mark)
+    const index = normalized.indexOf(mark);
     if (index > 0 && index + 1 <= fastFirstAudioMaxChars) {
-      return [
-        normalized.slice(0, index + 1).trim(),
-        normalized.slice(index + 1).trim(),
-      ].filter(Boolean)
+      return [normalized.slice(0, index + 1).trim(), normalized.slice(index + 1).trim()].filter(
+        Boolean,
+      );
     }
   }
 
   return [
     normalized.slice(0, fastFirstAudioMaxChars).trim(),
     normalized.slice(fastFirstAudioMaxChars).trim(),
-  ].filter(Boolean)
+  ].filter(Boolean);
 }
 
 function normalizeDeviceId(value: string) {
-  return value.replace(/[^0-9a-f]/gi, '').toLowerCase()
+  return value.replace(/[^0-9a-f]/gi, "").toLowerCase();
 }
 
-function sendStackChanText(ws: ServerWebSocket<StackChanConnection>, sessionId: string, text: string, role: 'user' | 'assistant') {
-  const normalized = normalizeText(text)
-  if (!normalized) return
-  if (role === 'user') {
-    sendJson(ws, { session_id: sessionId, type: 'stt', text: normalized })
+function sendStackChanText(
+  ws: ServerWebSocket<StackChanConnection>,
+  sessionId: string,
+  text: string,
+  role: "user" | "assistant",
+) {
+  const normalized = normalizeText(text);
+  if (!normalized) return;
+  if (role === "user") {
+    sendJson(ws, { session_id: sessionId, type: "stt", text: normalized });
   } else {
-    sendJson(ws, { session_id: sessionId, type: 'llm', emotion: 'happy' })
-    sendJson(ws, { session_id: sessionId, type: 'tts', state: 'start' })
-    sendJson(ws, { session_id: sessionId, type: 'tts', state: 'sentence_start', text: normalized })
-    sendJson(ws, { session_id: sessionId, type: 'tts', state: 'stop' })
+    sendJson(ws, { session_id: sessionId, type: "llm", emotion: "happy" });
+    sendJson(ws, { session_id: sessionId, type: "tts", state: "start" });
+    sendJson(ws, { session_id: sessionId, type: "tts", state: "sentence_start", text: normalized });
+    sendJson(ws, { session_id: sessionId, type: "tts", state: "stop" });
   }
 }
 
 function sleep(ms: number) {
-  return new Promise(resolve => setTimeout(resolve, ms))
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+type TraceWaitFor = "first-audio" | "reply-audio" | "final-audio";
+
+function traceWaitForFromValue(value: unknown): TraceWaitFor {
+  const normalized = normalizeText(String(value ?? ""))
+    .toLowerCase()
+    .replace(/_/g, "-");
+  if (normalized === "reply-audio" || normalized === "reply") return "reply-audio";
+  if (normalized === "final-audio" || normalized === "done" || normalized === "audio-done")
+    return "final-audio";
+  return "first-audio";
+}
+
+function traceWaitSatisfied(trace: TurnTrace, waitFor: TraceWaitFor) {
+  if (waitFor === "first-audio") return Boolean(trace.firstAudioFrameAt);
+  if (waitFor === "final-audio") {
+    const replyChunks = trace.audioChunks.filter((chunk) => chunk.kind !== "provisional");
+    if (replyChunks.length === 0) return false;
+    const expectedCount = Math.max(
+      ...replyChunks.map((chunk) => chunk.count ?? replyChunks.length),
+    );
+    return (
+      replyChunks.length >= expectedCount && replyChunks.every((chunk) => Boolean(chunk.finishedAt))
+    );
+  }
+  return trace.audioChunks.some(
+    (chunk) => chunk.kind !== "provisional" && Boolean(chunk.firstFrameAt),
+  );
+}
+
+async function waitForTrace(requestId: string, timeoutMs: number, waitFor: TraceWaitFor) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const trace = turnTracesByRequest.get(requestId);
+    if (trace && traceWaitSatisfied(trace, waitFor)) return trace;
+    await sleep(20);
+  }
+  return turnTracesByRequest.get(requestId);
+}
+
+function localDebugRequest(req: Request) {
+  const url = new URL(req.url);
+  return (
+    url.hostname === "127.0.0.1" ||
+    url.hostname === "localhost" ||
+    url.hostname === "::1" ||
+    url.hostname === "[::1]"
+  );
 }
 
 async function waitForStackChanAudioSockets(timeoutMs: number) {
-  const started = Date.now()
+  const started = Date.now();
   while (stackChanAudioSockets.size === 0 && Date.now() - started < timeoutMs) {
-    await sleep(50)
+    await sleep(50);
   }
 }
 
 function concatUint8Arrays(chunks: Uint8Array[]) {
-  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0)
-  const output = new Uint8Array(total)
-  let offset = 0
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const output = new Uint8Array(total);
+  let offset = 0;
   for (const chunk of chunks) {
-    output.set(chunk, offset)
-    offset += chunk.byteLength
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
   }
-  return output
+  return output;
 }
 
 function hasAsciiPrefix(value: Uint8Array, prefix: string) {
-  if (value.byteLength < prefix.length) return false
+  if (value.byteLength < prefix.length) return false;
   for (let index = 0; index < prefix.length; index++) {
-    if (value[index] !== prefix.charCodeAt(index)) return false
+    if (value[index] !== prefix.charCodeAt(index)) return false;
   }
-  return true
+  return true;
 }
 
 function oggOpusPackets(ogg: Uint8Array) {
-  const packets: Uint8Array[] = []
-  let offset = 0
-  let current: Uint8Array[] = []
+  const packets: Uint8Array[] = [];
+  let offset = 0;
+  let current: Uint8Array[] = [];
 
   while (offset + 27 <= ogg.byteLength) {
-    if (String.fromCharCode(...ogg.slice(offset, offset + 4)) !== 'OggS') {
-      throw new Error(`invalid ogg capture pattern at ${offset}`)
+    if (String.fromCharCode(...ogg.slice(offset, offset + 4)) !== "OggS") {
+      throw new Error(`invalid ogg capture pattern at ${offset}`);
     }
 
-    const segmentCount = ogg[offset + 26]
-    const segmentTableOffset = offset + 27
-    const payloadOffset = segmentTableOffset + segmentCount
+    const segmentCount = ogg[offset + 26];
+    const segmentTableOffset = offset + 27;
+    const payloadOffset = segmentTableOffset + segmentCount;
     if (payloadOffset > ogg.byteLength) {
-      throw new Error('truncated ogg segment table')
+      throw new Error("truncated ogg segment table");
     }
 
-    const segmentSizes = ogg.slice(segmentTableOffset, payloadOffset)
-    const payloadSize = segmentSizes.reduce((sum, value) => sum + value, 0)
-    const pageEnd = payloadOffset + payloadSize
+    const segmentSizes = ogg.slice(segmentTableOffset, payloadOffset);
+    const payloadSize = segmentSizes.reduce((sum, value) => sum + value, 0);
+    const pageEnd = payloadOffset + payloadSize;
     if (pageEnd > ogg.byteLength) {
-      throw new Error('truncated ogg payload')
+      throw new Error("truncated ogg payload");
     }
 
-    let cursor = payloadOffset
+    let cursor = payloadOffset;
     for (const size of segmentSizes) {
-      current.push(ogg.slice(cursor, cursor + size))
-      cursor += size
+      current.push(ogg.slice(cursor, cursor + size));
+      cursor += size;
       if (size < 255) {
-        const packet = concatUint8Arrays(current)
-        current = []
-        if (!hasAsciiPrefix(packet, 'OpusHead') && !hasAsciiPrefix(packet, 'OpusTags')) {
-          packets.push(packet)
+        const packet = concatUint8Arrays(current);
+        current = [];
+        if (!hasAsciiPrefix(packet, "OpusHead") && !hasAsciiPrefix(packet, "OpusTags")) {
+          packets.push(packet);
         }
       }
     }
 
-    offset = pageEnd
+    offset = pageEnd;
   }
 
-  return packets
+  return packets;
 }
 
 function encodeAudioToOpusPackets(audio: Uint8Array) {
-  const result = spawnSync('ffmpeg', [
-    '-hide_banner',
-    '-loglevel',
-    'error',
-    '-i',
-    'pipe:0',
-    '-ar',
-    '16000',
-    '-ac',
-    '1',
-    '-c:a',
-    'libopus',
-    '-application',
-    'voip',
-    '-b:a',
-    '24k',
-    '-frame_duration',
-    '60',
-    '-f',
-    'opus',
-    'pipe:1',
-  ], {
-    input: Buffer.from(audio),
-    maxBuffer: 16 * 1024 * 1024,
-  })
+  const result = spawnSync(
+    "ffmpeg",
+    [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      "pipe:0",
+      "-ar",
+      "16000",
+      "-ac",
+      "1",
+      "-c:a",
+      "libopus",
+      "-application",
+      "voip",
+      "-b:a",
+      "24k",
+      "-frame_duration",
+      "60",
+      "-f",
+      "opus",
+      "pipe:1",
+    ],
+    {
+      input: Buffer.from(audio),
+      maxBuffer: 16 * 1024 * 1024,
+    },
+  );
 
   if (result.status !== 0) {
-    throw new Error(`ffmpeg failed: ${result.stderr.toString().trim()}`)
+    throw new Error(`ffmpeg failed: ${result.stderr.toString().trim()}`);
   }
 
-  return oggOpusPackets(new Uint8Array(result.stdout))
+  return oggOpusPackets(new Uint8Array(result.stdout));
 }
 
 function encodeMp3ToOpusPackets(mp3: Uint8Array) {
-  return encodeAudioToOpusPackets(mp3)
+  return encodeAudioToOpusPackets(mp3);
 }
 
 function synthesizeMacOsSpeech(text: string) {
-  const audioPath = `${tmpdir()}/stackchan-say-${randomUUID()}.aiff`
-  const result = spawnSync('say', ['-v', fastLocalTtsVoice, '-o', audioPath, text], {
-    encoding: 'utf8',
+  const audioPath = `${tmpdir()}/stackchan-say-${randomUUID()}.aiff`;
+  const result = spawnSync("say", ["-v", fastLocalTtsVoice, "-o", audioPath, text], {
+    encoding: "utf8",
     maxBuffer: 1024 * 1024,
-  })
+  });
   try {
     if (result.status !== 0) {
-      throw new Error(`say failed: ${result.stderr || result.stdout}`)
+      throw new Error(`say failed: ${result.stderr || result.stdout}`);
     }
-    return new Uint8Array(readFileSync(audioPath))
+    return new Uint8Array(readFileSync(audioPath));
   } finally {
-    rmSync(audioPath, { force: true })
+    rmSync(audioPath, { force: true });
   }
 }
 
+async function getFastProvisionalOpusPackets(text: string) {
+  if (text !== fastProvisionalReplyText) return undefined;
+  if (!fastProvisionalOpusPackets) await warmFastProvisionalAudio();
+  return fastProvisionalOpusPackets;
+}
+
+function irodoriOpusCacheKey(text: string) {
+  return JSON.stringify({
+    text,
+    speaker: irodoriTtsSpeaker,
+    steps: irodoriTtsSteps,
+    seconds: irodoriTtsSeconds || "",
+    durationScale: irodoriTtsDurationScale,
+    seed: irodoriTtsSeed,
+    caption: irodoriTtsCaption,
+    provider: irodoriTtsProvider,
+  });
+}
+
+function getIrodoriOpusCache(text: string) {
+  return irodoriOpusCache.get(irodoriOpusCacheKey(text));
+}
+
+function setIrodoriOpusCache(text: string, packets: Uint8Array[]) {
+  const key = irodoriOpusCacheKey(text);
+  if (irodoriOpusCache.has(key)) irodoriOpusCache.delete(key);
+  irodoriOpusCache.set(key, packets);
+  while (irodoriOpusCache.size > irodoriOpusCacheMaxEntries) {
+    const first = irodoriOpusCache.keys().next().value;
+    if (!first) break;
+    irodoriOpusCache.delete(first);
+  }
+}
+
+async function getOrCreateIrodoriOpusPackets(text: string) {
+  const cached = getIrodoriOpusCache(text);
+  if (cached) return cached;
+
+  const key = irodoriOpusCacheKey(text);
+  const inFlight = irodoriOpusInFlight.get(key);
+  if (inFlight) return await inFlight;
+
+  const promise = (async () => {
+    const mp3 = await synthesizeIrodoriMp3(text);
+    const packets = encodeAudioToOpusPackets(mp3);
+    setIrodoriOpusCache(text, packets);
+    return packets;
+  })().finally(() => {
+    irodoriOpusInFlight.delete(key);
+  });
+  irodoriOpusInFlight.set(key, promise);
+  return await promise;
+}
+
+async function prewarmIrodoriOpusChunks(chunks: string[]) {
+  if (!irodoriTtsEnabled || chunks.length <= 1 || irodoriTtsParallelChunks <= 1) return;
+  const unique = Array.from(new Set(chunks.filter(Boolean)));
+  let next = 0;
+  const workerCount = Math.min(irodoriTtsParallelChunks, unique.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (next < unique.length) {
+        const chunk = unique[next];
+        next += 1;
+        try {
+          await getOrCreateIrodoriOpusPackets(chunk);
+        } catch (err) {
+          log(`Irodori TTS prewarm skipped: ${err}`);
+        }
+      }
+    }),
+  );
+}
+
+async function warmFastProvisionalAudio() {
+  if (!fastProvisionalReplyEnabled || !fastProvisionalReplyText || fastProvisionalOpusPackets)
+    return;
+  if (fastProvisionalOpusWarmup) return await fastProvisionalOpusWarmup;
+  fastProvisionalOpusWarmup = Promise.resolve()
+    .then(async () => {
+      const started = Date.now();
+      const mp3 = await synthesizeIrodoriMp3(fastProvisionalReplyText);
+      fastProvisionalOpusPackets = encodeMp3ToOpusPackets(mp3);
+      setIrodoriOpusCache(fastProvisionalReplyText, fastProvisionalOpusPackets);
+      log(
+        `fast provisional audio warmed: packets=${fastProvisionalOpusPackets.length} duration=${Date.now() - started}`,
+      );
+    })
+    .catch((err) => {
+      log(`fast provisional audio warmup skipped: ${err}`);
+    })
+    .finally(() => {
+      fastProvisionalOpusWarmup = undefined;
+    });
+  return await fastProvisionalOpusWarmup;
+}
+
 function buildIrodoriSynthesisUrl(text: string, steps: string, seconds?: string) {
-  const url = new URL(irodoriTtsUrl)
-  url.searchParams.set('text', text)
-  url.searchParams.set('speaker', irodoriTtsSpeaker)
-  url.searchParams.set('steps', steps)
-  if (seconds !== undefined) url.searchParams.set('seconds', seconds)
-  if (irodoriTtsDurationScale) url.searchParams.set('duration_scale', irodoriTtsDurationScale)
-  if (irodoriTtsKey) url.searchParams.set('key', irodoriTtsKey)
-  return url
+  const url = new URL(irodoriTtsUrl);
+  url.searchParams.set("text", text);
+  url.searchParams.set("speaker", irodoriTtsSpeaker);
+  url.searchParams.set("steps", steps);
+  if (seconds !== undefined) url.searchParams.set("seconds", seconds);
+  if (irodoriTtsDurationScale) url.searchParams.set("duration_scale", irodoriTtsDurationScale);
+  if (irodoriTtsKey) url.searchParams.set("key", irodoriTtsKey);
+  return url;
 }
 
 function irodoriZeroGpuBaseUrl() {
-  const url = new URL(irodoriTtsUrl)
-  return url.origin
+  const url = new URL(irodoriTtsUrl);
+  return url.origin;
 }
 
 function irodoriZeroGpuHeaders(contentType = false) {
-  const headers: Record<string, string> = {}
-  if (contentType) headers['Content-Type'] = 'application/json'
-  if (irodoriTtsHfToken) headers.Authorization = `Bearer ${irodoriTtsHfToken}`
-  return headers
+  const headers: Record<string, string> = {};
+  if (contentType) headers["Content-Type"] = "application/json";
+  if (irodoriTtsHfToken) headers.Authorization = `Bearer ${irodoriTtsHfToken}`;
+  return headers;
 }
 
 function irodoriZeroGpuPayload(text: string, steps: string, seconds?: string) {
   return {
     text,
     speaker: irodoriTtsSpeaker,
-    seconds: seconds ?? '',
-    duration_scale: Number(irodoriTtsDurationScale || '1'),
+    seconds: seconds ?? "",
+    duration_scale: Number(irodoriTtsDurationScale || "1"),
     steps: Number(steps),
     seed: irodoriTtsSeed,
     caption: irodoriTtsCaption,
-  }
+  };
 }
 
 function parseGradioSse(body: string, label: string) {
-  let eventName = ''
+  let eventName = "";
   for (const rawLine of body.split(/\r?\n/)) {
-    const line = rawLine.trim()
-    if (!line) continue
-    if (line.startsWith('event:')) {
-      eventName = line.slice('event:'.length).trim()
-      continue
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith("event:")) {
+      eventName = line.slice("event:".length).trim();
+      continue;
     }
-    if (!line.startsWith('data:')) continue
-    const data = line.slice('data:'.length).trim()
-    if (eventName === 'error') {
-      throw new Error(`Irodori ${label} failed: ${data}`)
+    if (!line.startsWith("data:")) continue;
+    const data = line.slice("data:".length).trim();
+    if (eventName === "error") {
+      throw new Error(`Irodori ${label} failed: ${data}`);
     }
-    const parsed = JSON.parse(data) as unknown
-    if (eventName === 'complete') return parsed
+    const parsed = JSON.parse(data) as unknown;
+    if (eventName === "complete") return parsed;
   }
-  throw new Error(`Irodori ${label} failed: ZeroGPU stream ended before completion`)
+  throw new Error(`Irodori ${label} failed: ZeroGPU stream ended before completion`);
 }
 
 function extractGradioAudioUrl(result: unknown) {
-  let source: unknown = result
-  if (Array.isArray(source)) source = source[0]
-  if (Array.isArray(source)) source = source[0]
-  if (source && typeof source === 'object') {
-    const file = source as GradioFileResult
-    source = file.url ?? file.path ?? file.name
+  let source: unknown = result;
+  if (Array.isArray(source)) source = source[0];
+  if (Array.isArray(source)) source = source[0];
+  if (source && typeof source === "object") {
+    const file = source as GradioFileResult;
+    source = file.url ?? file.path ?? file.name;
   }
-  if (typeof source !== 'string' || !source) {
-    throw new Error('Irodori response has no mp3 URL')
+  if (typeof source !== "string" || !source) {
+    throw new Error("Irodori response has no mp3 URL");
   }
-  return source
+  return source;
 }
 
-async function requestIrodoriZeroGpuSynthesis(text: string, steps: string, seconds: string | undefined, label: string, signal?: AbortSignal) {
-  assertIrodoriNotRateLimited(label)
-  const baseUrl = irodoriZeroGpuBaseUrl()
-  const response = await fetch(`${baseUrl}/gradio_api/call/v2/synthesize`, {
-    method: 'POST',
-    headers: irodoriZeroGpuHeaders(true),
-    body: JSON.stringify(irodoriZeroGpuPayload(text, steps, seconds)),
+async function requestIrodoriZeroGpuSynthesis(
+  text: string,
+  steps: string,
+  seconds: string | undefined,
+  label: string,
+  signal?: AbortSignal,
+) {
+  assertIrodoriNotRateLimited(label);
+  const baseUrl = irodoriZeroGpuBaseUrl();
+  let response = await postIrodoriZeroGpuSynthesis(
+    baseUrl,
+    "v2/synthesize",
+    text,
+    steps,
+    seconds,
     signal,
-  })
-  const body = await response.text()
+  );
+  if (response.status === 405) {
+    response = await postIrodoriZeroGpuSynthesis(
+      baseUrl,
+      "synthesize",
+      text,
+      steps,
+      seconds,
+      signal,
+    );
+  }
+  const body = await response.text();
   if (!response.ok) {
-    const reason = `${response.status} ${body}`
-    maybeMarkIrodoriRateLimited(reason)
-    throw new Error(`Irodori ${label} failed: ${reason}`)
+    const reason = `${response.status} ${body}`;
+    maybeMarkIrodoriRateLimited(reason);
+    throw new Error(`Irodori ${label} failed: ${reason}`);
   }
 
-  const json = JSON.parse(body) as { event_id?: string }
+  const json = JSON.parse(body) as { event_id?: string };
   if (!json.event_id) {
-    throw new Error(`Irodori ${label} failed: ZeroGPU did not return event_id`)
+    throw new Error(`Irodori ${label} failed: ZeroGPU did not return event_id`);
   }
 
   const resultResponse = await fetch(`${baseUrl}/gradio_api/call/synthesize/${json.event_id}`, {
     headers: irodoriZeroGpuHeaders(),
     signal,
-  })
-  const resultBody = await resultResponse.text()
+  });
+  const resultBody = await resultResponse.text();
   if (!resultResponse.ok) {
-    const reason = `${resultResponse.status} ${resultBody}`
-    maybeMarkIrodoriRateLimited(reason)
-    throw new Error(`Irodori ${label} failed: ${reason}`)
+    const reason = `${resultResponse.status} ${resultBody}`;
+    maybeMarkIrodoriRateLimited(reason);
+    throw new Error(`Irodori ${label} failed: ${reason}`);
   }
-  return parseGradioSse(resultBody, label)
+  return parseGradioSse(resultBody, label);
+}
+
+async function postIrodoriZeroGpuSynthesis(
+  baseUrl: string,
+  endpoint: string,
+  text: string,
+  steps: string,
+  seconds: string | undefined,
+  signal?: AbortSignal,
+) {
+  const payload = irodoriZeroGpuPayload(text, steps, seconds);
+  const body =
+    endpoint === "synthesize"
+      ? {
+          data: [
+            payload.text,
+            payload.speaker,
+            payload.seconds,
+            payload.duration_scale,
+            payload.steps,
+            payload.seed,
+            payload.caption,
+          ],
+        }
+      : payload;
+  return await fetch(`${baseUrl}/gradio_api/call/${endpoint}`, {
+    method: "POST",
+    headers: irodoriZeroGpuHeaders(true),
+    body: JSON.stringify(body),
+    signal,
+  });
 }
 
 function markIrodoriRateLimited(reason: string) {
-  irodoriTtsRateLimitedUntil = Date.now() + irodoriTtsRateLimitCooldownMs
+  irodoriTtsRateLimitedUntil = Date.now() + irodoriTtsRateLimitCooldownMs;
   lastIrodoriTtsRateLimit = {
     reason,
     until: new Date(irodoriTtsRateLimitedUntil).toISOString(),
     ts: nowIso(),
-  }
+  };
 }
 
 function maybeMarkIrodoriRateLimited(reason: string) {
-  if (!reason.includes('429') && !reason.includes('Too Many Requests')) return
-  markIrodoriRateLimited(reason)
+  if (!reason.includes("429") && !reason.includes("Too Many Requests")) return;
+  markIrodoriRateLimited(reason);
 }
 
 function assertIrodoriNotRateLimited(label: string) {
-  if (irodoriTtsRateLimitedUntil <= Date.now()) return
-  throw new Error(`Irodori ${label} skipped: rate limit cooldown until ${new Date(irodoriTtsRateLimitedUntil).toISOString()}`)
+  if (irodoriTtsRateLimitedUntil <= Date.now()) return;
+  throw new Error(
+    `Irodori ${label} skipped: rate limit cooldown until ${new Date(irodoriTtsRateLimitedUntil).toISOString()}`,
+  );
 }
 
 async function requestIrodoriSynthesis(url: URL, label: string, signal?: AbortSignal) {
-  assertIrodoriNotRateLimited(label)
-  const response = await fetch(url, { signal })
-  const body = await response.text()
+  assertIrodoriNotRateLimited(label);
+  const response = await fetch(url, { signal });
+  const body = await response.text();
   if (!response.ok) {
-    const reason = `${response.status} ${body}`
-    maybeMarkIrodoriRateLimited(reason)
-    throw new Error(`Irodori ${label} failed: ${reason}`)
+    const reason = `${response.status} ${body}`;
+    maybeMarkIrodoriRateLimited(reason);
+    throw new Error(`Irodori ${label} failed: ${reason}`);
   }
 
-  const json = JSON.parse(body) as IrodoriSynthesisResponse
+  const json = JSON.parse(body) as IrodoriSynthesisResponse;
   if (json.success === false) {
-    const reason = json.error ?? body
-    maybeMarkIrodoriRateLimited(reason)
-    throw new Error(`Irodori ${label} failed: ${reason}`)
+    const reason = json.error ?? body;
+    maybeMarkIrodoriRateLimited(reason);
+    throw new Error(`Irodori ${label} failed: ${reason}`);
   }
-  return json
+  return json;
 }
 
 function cancelIrodoriWarmup(reason: string) {
-  if (!irodoriWarmupInFlight || !irodoriWarmupAbortController) return
+  if (!irodoriWarmupInFlight || !irodoriWarmupAbortController) return;
   lastIrodoriWarmup = {
-    state: 'canceled',
+    state: "canceled",
     reason,
     ts: nowIso(),
-  }
-  irodoriWarmupAbortController.abort(reason)
+  };
+  irodoriWarmupAbortController.abort(reason);
 }
 
 async function warmIrodoriTts() {
-  if (!irodoriTtsEnabled) return
-  if (irodoriWarmupInFlight) return await irodoriWarmupInFlight
+  if (!irodoriTtsEnabled) return;
+  if (irodoriWarmupInFlight) return await irodoriWarmupInFlight;
 
-  const now = Date.now()
-  const elapsed = now - lastIrodoriWarmupAt
+  const now = Date.now();
+  const elapsed = now - lastIrodoriWarmupAt;
   if (elapsed < irodoriTtsWarmupCooldownMs) {
     lastIrodoriWarmup = {
-      state: 'skipped',
+      state: "skipped",
       reason: `cooldown ${irodoriTtsWarmupCooldownMs - elapsed}ms`,
       ts: nowIso(),
-    }
-    return
+    };
+    return;
   }
 
   irodoriWarmupInFlight = (async () => {
-    const started = Date.now()
-    lastIrodoriWarmupAt = started
-    lastIrodoriWarmup = { state: 'started', ts: nowIso() }
-    const controller = new AbortController()
-    irodoriWarmupAbortController = controller
-    if (irodoriTtsProvider === 'zerogpu-direct') {
-      await requestIrodoriZeroGpuSynthesis(irodoriTtsWarmupText, irodoriTtsWarmupSteps, '', 'warmup', controller.signal)
+    const started = Date.now();
+    lastIrodoriWarmupAt = started;
+    lastIrodoriWarmup = { state: "started", ts: nowIso() };
+    const controller = new AbortController();
+    irodoriWarmupAbortController = controller;
+    if (irodoriTtsProvider === "zerogpu-direct") {
+      await requestIrodoriZeroGpuSynthesis(
+        irodoriTtsWarmupText,
+        irodoriTtsWarmupSteps,
+        "",
+        "warmup",
+        controller.signal,
+      );
     } else {
-      const url = buildIrodoriSynthesisUrl(irodoriTtsWarmupText, irodoriTtsWarmupSteps, '')
-      await requestIrodoriSynthesis(url, 'warmup', controller.signal)
+      const url = buildIrodoriSynthesisUrl(irodoriTtsWarmupText, irodoriTtsWarmupSteps, "");
+      await requestIrodoriSynthesis(url, "warmup", controller.signal);
     }
     lastIrodoriWarmup = {
-      state: 'ok',
+      state: "ok",
       durationMs: Date.now() - started,
       ts: nowIso(),
-    }
-  })().catch(err => {
-    if (irodoriWarmupAbortController?.signal.aborted) {
-      return
-    }
-    lastIrodoriWarmup = {
-      state: 'failed',
-      reason: String(err),
-      ts: nowIso(),
-    }
-    throw err
-  }).finally(() => {
-    irodoriWarmupInFlight = undefined
-    irodoriWarmupAbortController = undefined
-  })
+    };
+  })()
+    .catch((err) => {
+      if (irodoriWarmupAbortController?.signal.aborted) {
+        return;
+      }
+      lastIrodoriWarmup = {
+        state: "failed",
+        reason: String(err),
+        ts: nowIso(),
+      };
+      throw err;
+    })
+    .finally(() => {
+      irodoriWarmupInFlight = undefined;
+      irodoriWarmupAbortController = undefined;
+    });
 
-  await irodoriWarmupInFlight
+  await irodoriWarmupInFlight;
 }
 
 async function synthesizeIrodoriMp3(text: string) {
-  cancelIrodoriWarmup('synthesis request started')
-  let audioUrl: string
-  if (irodoriTtsProvider === 'zerogpu-direct') {
-    const result = await requestIrodoriZeroGpuSynthesis(text, irodoriTtsSteps, irodoriTtsSeconds || undefined, 'synthesis')
-    audioUrl = extractGradioAudioUrl(result)
+  cancelIrodoriWarmup("synthesis request started");
+  let audioUrl: string;
+  if (irodoriTtsProvider === "zerogpu-direct") {
+    const result = await requestIrodoriZeroGpuSynthesis(
+      text,
+      irodoriTtsSteps,
+      irodoriTtsSeconds || undefined,
+      "synthesis",
+    );
+    audioUrl = extractGradioAudioUrl(result);
   } else {
-    const url = buildIrodoriSynthesisUrl(text, irodoriTtsSteps, irodoriTtsSeconds || undefined)
-    const json = await requestIrodoriSynthesis(url, 'synthesis')
-    audioUrl = json.mp3StreamingUrl ?? json.mp3DownloadUrl ?? ''
+    const url = buildIrodoriSynthesisUrl(text, irodoriTtsSteps, irodoriTtsSeconds || undefined);
+    const json = await requestIrodoriSynthesis(url, "synthesis");
+    audioUrl = json.mp3StreamingUrl ?? json.mp3DownloadUrl ?? "";
     if (!audioUrl) {
-      throw new Error('Irodori response has no mp3 URL')
+      throw new Error("Irodori response has no mp3 URL");
     }
   }
 
   const audioResponse = await fetch(audioUrl, {
-    headers: irodoriTtsProvider === 'zerogpu-direct' ? irodoriZeroGpuHeaders() : undefined,
-  })
+    headers: irodoriTtsProvider === "zerogpu-direct" ? irodoriZeroGpuHeaders() : undefined,
+  });
   if (!audioResponse.ok) {
-    throw new Error(`Irodori audio download failed: ${audioResponse.status}`)
+    throw new Error(`Irodori audio download failed: ${audioResponse.status}`);
   }
-  return new Uint8Array(await audioResponse.arrayBuffer())
+  return new Uint8Array(await audioResponse.arrayBuffer());
 }
 
-async function sendStackChanAssistant(ws: ServerWebSocket<StackChanConnection>, sessionId: string, text: string) {
-  const normalized = normalizeText(text)
-  if (!normalized) return
+async function sendStackChanAssistant(
+  ws: ServerWebSocket<StackChanConnection>,
+  sessionId: string,
+  text: string,
+) {
+  const normalized = normalizeText(text);
+  if (!normalized) return;
 
-  sendJson(ws, { session_id: sessionId, type: 'llm', emotion: 'happy' })
-  sendJson(ws, { session_id: sessionId, type: 'tts', state: 'start' })
-  sendJson(ws, { session_id: sessionId, type: 'tts', state: 'sentence_start', text: normalized })
+  sendJson(ws, { session_id: sessionId, type: "llm", emotion: "happy" });
+  sendJson(ws, { session_id: sessionId, type: "tts", state: "start" });
+  sendJson(ws, { session_id: sessionId, type: "tts", state: "sentence_start", text: normalized });
 
   if (irodoriTtsEnabled) {
     try {
-      log(`Irodori TTS request: ${normalized}`)
-      const mp3 = await synthesizeIrodoriMp3(normalized)
-      const packets = encodeMp3ToOpusPackets(mp3)
-      log(`Irodori TTS packets: ${packets.length}`)
+      log(`Irodori TTS request: ${normalized}`);
+      const mp3 = await synthesizeIrodoriMp3(normalized);
+      const packets = encodeMp3ToOpusPackets(mp3);
+      log(`Irodori TTS packets: ${packets.length}`);
       for (const packet of packets) {
-        ws.send(packet)
+        ws.send(packet);
         if (irodoriTtsFrameDelayMs > 0) {
-          await sleep(irodoriTtsFrameDelayMs)
+          await sleep(irodoriTtsFrameDelayMs);
         }
       }
     } catch (err) {
-      log(`Irodori TTS skipped: ${err}`)
+      log(`Irodori TTS skipped: ${err}`);
     }
   }
 
-  sendJson(ws, { session_id: sessionId, type: 'tts', state: 'stop' })
+  sendJson(ws, { session_id: sessionId, type: "tts", state: "stop" });
 }
 
 async function sendStackChanAssistantSafe(ws: ServerWebSocket<StackChanConnection>, text: string) {
   try {
-    await sendStackChanAssistant(ws, ws.data.sessionId, text)
+    await sendStackChanAssistant(ws, ws.data.sessionId, text);
   } catch (err) {
-    log(`StackChan assistant speech failed: ${err}`)
+    log(`StackChan assistant speech failed: ${err}`);
   }
 }
 
-async function publishMqttAssistantAudio(text: string, options: {
-  requestId?: string
-  chunkIndex?: number
-  chunkCount?: number
-  originalText?: string
-} = {}) {
-  if (!mqttEnabled || !irodoriTtsEnabled) return
+async function publishMqttAssistantAudio(
+  text: string,
+  options: {
+    requestId?: string;
+    kind?: "provisional" | "reply";
+    chunkIndex?: number;
+    chunkCount?: number;
+    originalText?: string;
+  } = {},
+) {
+  if (!mqttEnabled || !irodoriTtsEnabled) return;
 
-  const audioId = randomUUID()
-  const started = Date.now()
+  const generation = assistantAudioGeneration;
+  const audioId = randomUUID();
+  const started = Date.now();
   const session: MqttAudioPublishSession = {
     id: audioId,
     text,
     requestId: options.requestId,
+    kind: options.kind,
     chunkIndex: options.chunkIndex,
     chunkCount: options.chunkCount,
     originalText: options.originalText,
@@ -1252,326 +1725,411 @@ async function publishMqttAssistantAudio(text: string, options: {
     total: 0,
     published: 0,
     startedAt: nowIso(),
-  }
-  recentMqttAudioPublishes.push(session)
+  };
+  recentMqttAudioPublishes.push(session);
   while (recentMqttAudioPublishes.length > 12) {
-    recentMqttAudioPublishes.shift()
+    recentMqttAudioPublishes.shift();
   }
-  const trace = options.requestId ? turnTracesByRequest.get(options.requestId) : undefined
+  const trace = options.requestId ? turnTracesByRequest.get(options.requestId) : undefined;
   if (trace) {
     trace.audioChunks.push({
       id: audioId,
       index: options.chunkIndex,
       count: options.chunkCount,
+      kind: options.kind,
       text,
       startedAt: session.startedAt,
-    })
-    if (!trace.firstAudioRequestAt) trace.firstAudioRequestAt = session.startedAt
+    });
+    if (!trace.firstAudioRequestAt) trace.firstAudioRequestAt = session.startedAt;
   }
 
   try {
-    const useLocalTts = fastLocalTtsEnabled && (!fastLocalTtsFirstChunkOnly || options.chunkIndex === undefined || options.chunkIndex === 0)
-    session.ttsProvider = useLocalTts ? 'macos-say' : 'irodori'
-    log(`${session.ttsProvider} TTS request: ${audioId} transport=${irodoriTtsAudioTransport} ${text}`)
-    const synthesisStarted = Date.now()
-    session.synthesisStartedAt = nowIso()
-    const audio = useLocalTts ? synthesizeMacOsSpeech(text) : await synthesizeIrodoriMp3(text)
-    session.synthesisFinishedAt = nowIso()
-    session.synthesisDurationMs = Date.now() - synthesisStarted
-    const encodeStarted = Date.now()
-    const packets = encodeAudioToOpusPackets(audio)
-    session.encodeDurationMs = Date.now() - encodeStarted
-    session.total = packets.length
-    session.publishStartedAt = nowIso()
-    const publishStarted = Date.now()
-    const allowWebSocketAudio = irodoriTtsAudioTransport !== 'mqtt'
-    if (allowWebSocketAudio && stackChanAudioSockets.size === 0 && stackChanAudioWsWaitMs > 0) {
-      await waitForStackChanAudioSockets(stackChanAudioWsWaitMs)
+    const provisional = options.kind === "provisional";
+    const useLocalTts =
+      fastLocalTtsEnabled &&
+      (!fastLocalTtsFirstChunkOnly || options.chunkIndex === undefined || options.chunkIndex === 0);
+    session.ttsProvider = useLocalTts ? "macos-say" : "irodori";
+    log(
+      `${session.ttsProvider} TTS request: ${audioId} transport=${irodoriTtsAudioTransport} ${text}`,
+    );
+    const synthesisStarted = Date.now();
+    session.synthesisStartedAt = nowIso();
+    let packets = provisional
+      ? await getFastProvisionalOpusPackets(text)
+      : useLocalTts
+        ? undefined
+        : await getOrCreateIrodoriOpusPackets(text);
+    const audio = packets
+      ? undefined
+      : useLocalTts
+        ? synthesizeMacOsSpeech(text)
+        : await synthesizeIrodoriMp3(text);
+    session.synthesisFinishedAt = nowIso();
+    session.synthesisDurationMs = Date.now() - synthesisStarted;
+    const encodeStarted = Date.now();
+    if (!packets) {
+      packets = encodeAudioToOpusPackets(audio);
+      if (!useLocalTts) setIrodoriOpusCache(text, packets);
+    }
+    if (assistantAudioCanceled(generation)) {
+      markAssistantAudioCanceled(session, trace, audioId, started);
+      return;
+    }
+    session.encodeDurationMs = Date.now() - encodeStarted;
+    session.total = packets.length;
+    session.publishStartedAt = nowIso();
+    const publishStarted = Date.now();
+    const allowWebSocketAudio = irodoriTtsAudioTransport !== "mqtt";
+    const audioWsWaitMs = provisional ? fastProvisionalAudioWsWaitMs : stackChanAudioWsWaitMs;
+    if (allowWebSocketAudio && stackChanAudioSockets.size === 0 && audioWsWaitMs > 0) {
+      await waitForStackChanAudioSockets(audioWsWaitMs);
     }
 
-    const audioSockets = allowWebSocketAudio ? Array.from(stackChanAudioSockets) : []
+    const audioSockets = allowWebSocketAudio ? Array.from(stackChanAudioSockets) : [];
     if (audioSockets.length > 0) {
-      session.transport = 'ws'
-      session.frameDelayMs = irodoriTtsFrameDelayMs
+      session.transport = "ws";
+      session.frameDelayMs = irodoriTtsFrameDelayMs;
       const startMessage = JSON.stringify({
-        type: 'audio.start',
+        type: "audio.start",
         audio_id: audioId,
         text,
         sample_rate: 16000,
         frame_duration: 60,
         total: packets.length,
-      })
+      });
       const stopMessage = JSON.stringify({
-        type: 'audio.stop',
+        type: "audio.stop",
         audio_id: audioId,
         total: packets.length,
-      })
-      log(`${session.ttsProvider} WS audio packets: ${audioId} total=${packets.length} clients=${audioSockets.length} delay=${irodoriTtsFrameDelayMs} synthesis=${session.synthesisDurationMs} encode=${session.encodeDurationMs}`)
+      });
+      log(
+        `${session.ttsProvider} WS audio packets: ${audioId} total=${packets.length} clients=${audioSockets.length} delay=${irodoriTtsFrameDelayMs} synthesis=${session.synthesisDurationMs} encode=${session.encodeDurationMs}`,
+      );
       for (const ws of audioSockets) {
-        ws.send(startMessage)
+        ws.send(startMessage);
       }
       for (let i = 0; i < packets.length; i++) {
+        if (assistantAudioCanceled(generation)) {
+          for (const ws of audioSockets) {
+            ws.send(stopMessage);
+          }
+          markAssistantAudioCanceled(session, trace, audioId, started);
+          return;
+        }
         if (i === 0) {
-          session.firstFrameAt = nowIso()
+          session.firstFrameAt = nowIso();
           if (trace && !trace.firstAudioFrameAt) {
-            trace.firstAudioFrameAt = session.firstFrameAt
-            trace.status = 'audio_started'
+            trace.firstAudioFrameAt = session.firstFrameAt;
+            trace.status = "audio_started";
           }
         }
         for (const ws of audioSockets) {
-          ws.send(packets[i])
+          ws.send(packets[i]);
         }
-        session.published = i + 1
-        session.lastFrameAt = nowIso()
+        session.published = i + 1;
+        session.lastFrameAt = nowIso();
         if (irodoriTtsFrameDelayMs > 0) {
-          await sleep(irodoriTtsFrameDelayMs)
+          await sleep(irodoriTtsFrameDelayMs);
         }
       }
       for (const ws of audioSockets) {
-        ws.send(stopMessage)
+        ws.send(stopMessage);
       }
-    } else if (irodoriTtsAudioTransport === 'websocket') {
-      throw new Error('Irodori websocket TTS failed: no StackChan audio websocket clients')
+    } else if (
+      irodoriTtsAudioTransport === "websocket" &&
+      !(provisional && fastProvisionalMqttFallback) &&
+      !stackChanAudioMqttFallback
+    ) {
+      throw new Error("Irodori websocket TTS failed: no StackChan audio websocket clients");
     } else {
-      session.transport = 'mqtt'
-      log(`${session.ttsProvider} MQTT audio packets: ${audioId} total=${packets.length} qos=${mqttAudioQos} delay=${irodoriTtsMqttFrameDelayMs} synthesis=${session.synthesisDurationMs} encode=${session.encodeDurationMs}`)
+      session.transport = "mqtt";
+      log(
+        `${session.ttsProvider} MQTT audio packets: ${audioId} total=${packets.length} qos=${mqttAudioQos} delay=${irodoriTtsMqttFrameDelayMs} synthesis=${session.synthesisDurationMs} encode=${session.encodeDurationMs}`,
+      );
       for (let i = 0; i < packets.length; i++) {
+        if (assistantAudioCanceled(generation)) {
+          markAssistantAudioCanceled(session, trace, audioId, started);
+          return;
+        }
         if (i === 0) {
-          session.firstFrameAt = nowIso()
+          session.firstFrameAt = nowIso();
           if (trace && !trace.firstAudioFrameAt) {
-            trace.firstAudioFrameAt = session.firstFrameAt
-            trace.status = 'audio_started'
+            trace.firstAudioFrameAt = session.firstFrameAt;
+            trace.status = "audio_started";
           }
         }
-        await publishMqttOutputAudio(mqttEvent('output.audio.opus', text, {
-          source: 'stackchan-relay',
-          target: 'stackchan',
-          sample_rate: 16000,
-          frame_duration: 60,
-          audio_id: audioId,
-          sequence: i,
-          total: packets.length,
-          payload: Buffer.from(packets[i]).toString('base64'),
-        }))
-        session.published = i + 1
-        session.lastFrameAt = nowIso()
+        await publishMqttOutputAudio(
+          mqttEvent("output.audio.opus", text, {
+            source: "stackchan-relay",
+            target: "stackchan",
+            sample_rate: 16000,
+            frame_duration: 60,
+            audio_id: audioId,
+            sequence: i,
+            total: packets.length,
+            payload: Buffer.from(packets[i]).toString("base64"),
+          }),
+        );
+        session.published = i + 1;
+        session.lastFrameAt = nowIso();
         if (irodoriTtsMqttFrameDelayMs > 0) {
-          await sleep(irodoriTtsMqttFrameDelayMs)
+          await sleep(irodoriTtsMqttFrameDelayMs);
         }
       }
     }
-    session.publishFinishedAt = nowIso()
-    session.publishDurationMs = Date.now() - publishStarted
-    session.finishedAt = nowIso()
-    session.durationMs = Date.now() - started
+    session.publishFinishedAt = nowIso();
+    session.publishDurationMs = Date.now() - publishStarted;
+    session.finishedAt = nowIso();
+    session.durationMs = Date.now() - started;
     if (trace) {
-      const chunk = trace.audioChunks.find(item => item.id === audioId)
+      const chunk = trace.audioChunks.find((item) => item.id === audioId);
       if (chunk) {
-        chunk.firstFrameAt = session.firstFrameAt
-        chunk.finishedAt = session.finishedAt
-        chunk.synthesisDurationMs = session.synthesisDurationMs
-        chunk.publishDurationMs = session.publishDurationMs
-        chunk.durationMs = session.durationMs
-        chunk.ttsProvider = session.ttsProvider
+        chunk.firstFrameAt = session.firstFrameAt;
+        chunk.finishedAt = session.finishedAt;
+        chunk.synthesisDurationMs = session.synthesisDurationMs;
+        chunk.publishDurationMs = session.publishDurationMs;
+        chunk.durationMs = session.durationMs;
+        chunk.ttsProvider = session.ttsProvider;
       }
-      if (options.chunkIndex === 0) trace.firstAudioDoneAt = session.finishedAt
-      if (options.chunkIndex === undefined || options.chunkIndex === (options.chunkCount ?? 1) - 1) {
-        trace.finalAudioDoneAt = session.finishedAt
-        trace.status = 'audio_done'
+      if (options.chunkIndex === 0 && !trace.firstAudioDoneAt)
+        trace.firstAudioDoneAt = session.finishedAt;
+      if (
+        options.kind !== "provisional" &&
+        (options.chunkIndex === undefined || options.chunkIndex === (options.chunkCount ?? 1) - 1)
+      ) {
+        trace.finalAudioDoneAt = session.finishedAt;
+        trace.status = "audio_done";
       }
     }
-    log(`${session.ttsProvider} ${session.transport?.toUpperCase() ?? 'AUDIO'} audio published: ${audioId} total=${session.total} duration=${session.durationMs} synthesis=${session.synthesisDurationMs} publish=${session.publishDurationMs}`)
+    log(
+      `${session.ttsProvider} ${session.transport?.toUpperCase() ?? "AUDIO"} audio published: ${audioId} total=${session.total} duration=${session.durationMs} synthesis=${session.synthesisDurationMs} publish=${session.publishDurationMs}`,
+    );
   } catch (err) {
-    session.error = String(err)
-    session.finishedAt = nowIso()
-    session.durationMs = Date.now() - started
+    session.error = String(err);
+    session.finishedAt = nowIso();
+    session.durationMs = Date.now() - started;
     if (trace) {
-      const chunk = trace.audioChunks.find(item => item.id === audioId)
+      const chunk = trace.audioChunks.find((item) => item.id === audioId);
       if (chunk) {
-        chunk.error = session.error
-        chunk.finishedAt = session.finishedAt
-        chunk.durationMs = session.durationMs
+        chunk.error = session.error;
+        chunk.finishedAt = session.finishedAt;
+        chunk.durationMs = session.durationMs;
       }
-      trace.error = session.error
-      trace.status = 'error'
+      trace.error = session.error;
+      trace.status = "error";
     }
-    log(`Irodori TTS skipped: ${err}`)
+    log(`Irodori TTS skipped: ${err}`);
   }
 }
 
 function trimPendingMqttAssistantAudio() {
-  const expiresAt = Date.now() - assistantSpeechQueueMs
-  while (pendingMqttAssistantAudio.length > 0 && pendingMqttAssistantAudio[0].createdAt < expiresAt) {
-    pendingMqttAssistantAudio.shift()
+  const expiresAt = Date.now() - assistantSpeechQueueMs;
+  while (
+    pendingMqttAssistantAudio.length > 0 &&
+    pendingMqttAssistantAudio[0].createdAt < expiresAt
+  ) {
+    pendingMqttAssistantAudio.shift();
   }
   while (pendingMqttAssistantAudio.length > assistantSpeechQueueLimit) {
-    pendingMqttAssistantAudio.shift()
+    pendingMqttAssistantAudio.shift();
   }
 }
 
 async function flushPendingMqttAssistantAudio() {
-  if (mqttAssistantAudioSending) return
-  trimPendingMqttAssistantAudio()
-  if (pendingMqttAssistantAudio.length === 0) return
+  if (mqttAssistantAudioSending) return;
+  trimPendingMqttAssistantAudio();
+  if (pendingMqttAssistantAudio.length === 0) return;
 
-  mqttAssistantAudioSending = true
+  mqttAssistantAudioSending = true;
   try {
     while (pendingMqttAssistantAudio.length > 0) {
-      const item = pendingMqttAssistantAudio.shift()
-      if (!item) continue
+      const item = pendingMqttAssistantAudio.shift();
+      if (!item) continue;
       await publishMqttAssistantAudio(item.text, {
         requestId: item.requestId,
+        kind: item.kind,
         chunkIndex: item.chunkIndex,
         chunkCount: item.chunkCount,
         originalText: item.originalText,
-      })
+      });
     }
   } finally {
-    mqttAssistantAudioSending = false
+    mqttAssistantAudioSending = false;
   }
 }
 
-function queueMqttAssistantAudio(text: string, options: { requestId?: string } = {}) {
-  const normalized = normalizeText(text)
-  if (!normalized || !mqttEnabled || !irodoriTtsEnabled) return
-  const chunks = splitAssistantAudioText(normalized)
+function queueMqttAssistantAudio(
+  text: string,
+  options: { requestId?: string; kind?: "provisional" | "reply" } = {},
+) {
+  const normalized = normalizeText(text);
+  if (!normalized || !mqttEnabled || !irodoriTtsEnabled) return;
+  const chunks = splitAssistantAudioText(normalized);
+  if (options.kind !== "provisional") {
+    void prewarmIrodoriOpusChunks(chunks);
+  }
   chunks.forEach((chunk, index) => {
     pendingMqttAssistantAudio.push({
       text: chunk,
       createdAt: Date.now(),
       requestId: options.requestId,
+      kind: options.kind,
       chunkIndex: index,
       chunkCount: chunks.length,
       originalText: normalized,
-    })
-  })
-  trimPendingMqttAssistantAudio()
+    });
+  });
+  trimPendingMqttAssistantAudio();
   setTimeout(() => {
-    void flushPendingMqttAssistantAudio()
-  }, 0)
+    void flushPendingMqttAssistantAudio();
+  }, 0);
 }
 
 function trimPendingAssistantSpeech() {
-  const expiresAt = Date.now() - assistantSpeechQueueMs
+  const expiresAt = Date.now() - assistantSpeechQueueMs;
   while (pendingAssistantSpeech.length > 0 && pendingAssistantSpeech[0].createdAt < expiresAt) {
-    pendingAssistantSpeech.shift()
+    pendingAssistantSpeech.shift();
   }
   while (pendingAssistantSpeech.length > assistantSpeechQueueLimit) {
-    pendingAssistantSpeech.shift()
+    pendingAssistantSpeech.shift();
   }
 }
 
 async function flushPendingAssistantSpeech() {
-  if (assistantSpeechSending) return
-  trimPendingAssistantSpeech()
-  if (pendingAssistantSpeech.length === 0 || stackChanSockets.size === 0) return
+  if (assistantSpeechSending) return;
+  trimPendingAssistantSpeech();
+  if (pendingAssistantSpeech.length === 0 || stackChanSockets.size === 0) return;
 
-  assistantSpeechSending = true
+  assistantSpeechSending = true;
   try {
     while (pendingAssistantSpeech.length > 0 && stackChanSockets.size > 0) {
-      const item = pendingAssistantSpeech.shift()
-      if (!item) continue
+      const item = pendingAssistantSpeech.shift();
+      if (!item) continue;
       for (const ws of Array.from(stackChanSockets)) {
-        await sendStackChanAssistantSafe(ws, item.text)
+        await sendStackChanAssistantSafe(ws, item.text);
       }
     }
   } finally {
-    assistantSpeechSending = false
+    assistantSpeechSending = false;
   }
 }
 
-async function speakStackChanAssistant(text: string, queueWhenDisconnected: boolean, options: { requestId?: string } = {}) {
-  const normalized = normalizeText(text)
-  if (!normalized) return
+async function speakStackChanAssistant(
+  text: string,
+  queueWhenDisconnected: boolean,
+  options: {
+    requestId?: string;
+    kind?: "provisional" | "reply";
+  } = {},
+) {
+  const normalized = normalizeText(text);
+  if (!normalized) return;
 
-  trimPendingAssistantSpeech()
+  trimPendingAssistantSpeech();
   if (mqttEnabled && irodoriTtsEnabled) {
-    lastAssistantSpeech = { text: normalized, queued: false, ts: nowIso() }
-    const trace = options.requestId ? turnTracesByRequest.get(options.requestId) : undefined
+    lastAssistantSpeech = { text: normalized, queued: false, ts: nowIso() };
+    const trace = options.requestId ? turnTracesByRequest.get(options.requestId) : undefined;
     if (trace) {
-      trace.assistantSpeechAt = lastAssistantSpeech.ts
-      trace.status = 'replied'
+      if (options.kind === "provisional") {
+        trace.provisionalReplyAt = lastAssistantSpeech.ts;
+        trace.provisionalReplyText = normalized;
+      } else {
+        trace.assistantSpeechAt = lastAssistantSpeech.ts;
+        trace.status = "replied";
+      }
     }
-    queueMqttAssistantAudio(normalized, { requestId: options.requestId })
-    return
+    queueMqttAssistantAudio(normalized, {
+      requestId: options.requestId,
+      kind: options.kind ?? "reply",
+    });
+    return;
   }
 
   if (stackChanSockets.size === 0) {
     if (mqttEnabled) {
-      lastAssistantSpeech = { text: normalized, queued: false, ts: nowIso() }
-      queueMqttAssistantAudio(normalized, { requestId: options.requestId })
+      lastAssistantSpeech = { text: normalized, queued: false, ts: nowIso() };
+      queueMqttAssistantAudio(normalized, {
+        requestId: options.requestId,
+        kind: options.kind ?? "reply",
+      });
     } else if (queueWhenDisconnected) {
-      pendingAssistantSpeech.push({ text: normalized, createdAt: Date.now() })
-      lastAssistantSpeech = { text: normalized, queued: true, ts: nowIso() }
-      log(`StackChan assistant speech queued: ${normalized}`)
+      pendingAssistantSpeech.push({ text: normalized, createdAt: Date.now() });
+      lastAssistantSpeech = { text: normalized, queued: true, ts: nowIso() };
+      log(`StackChan assistant speech queued: ${normalized}`);
     }
-    return
+    return;
   }
 
-  lastAssistantSpeech = { text: normalized, queued: false, ts: nowIso() }
+  lastAssistantSpeech = { text: normalized, queued: false, ts: nowIso() };
   for (const ws of Array.from(stackChanSockets)) {
-    void sendStackChanAssistantSafe(ws, normalized)
+    void sendStackChanAssistantSafe(ws, normalized);
   }
 }
 
 function finishStackChanTurn(ws: ServerWebSocket<StackChanConnection>) {
-  if (ws.data.turnClosing) return
-  ws.data.turnClosing = true
+  if (ws.data.turnClosing) return;
+  ws.data.turnClosing = true;
   setTimeout(() => {
-    ws.data.upstream?.close()
-    ws.data.upstream = undefined
-    ws.data.turnClosing = false
-  }, 300)
+    ws.data.upstream?.close();
+    ws.data.upstream = undefined;
+    ws.data.turnClosing = false;
+  }, 300);
 }
 
 function headerObject(headers: Headers) {
-  const output: Record<string, string> = {}
+  const output: Record<string, string> = {};
   for (const [key, value] of headers) {
-    const lower = key.toLowerCase()
-    if (lower === 'host' || lower === 'content-length' || lower === 'accept-encoding' || lower === 'connection') continue
-    output[key] = value
+    const lower = key.toLowerCase();
+    if (
+      lower === "host" ||
+      lower === "content-length" ||
+      lower === "accept-encoding" ||
+      lower === "connection"
+    )
+      continue;
+    output[key] = value;
   }
-  return output
+  return output;
 }
 
 function authorizationValue(token: string) {
-  if (!token) return ''
-  return token.includes(' ') ? token : `Bearer ${token}`
+  if (!token) return "";
+  return token.includes(" ") ? token : `Bearer ${token}`;
 }
 
 function deviceKey(req: Request) {
-  return req.headers.get('device-id') ?? req.headers.get('Device-Id') ?? 'stackchan'
+  return req.headers.get("device-id") ?? req.headers.get("Device-Id") ?? "stackchan";
 }
 
 async function fetchUpstreamOta(req: Request) {
-  const body = await req.text()
+  const body = await req.text();
   const response = await fetch(upstreamOtaUrl, {
     method: req.method,
     headers: headerObject(req.headers),
-    body: req.method === 'GET' || req.method === 'HEAD' ? undefined : body,
-  })
-  const text = await response.text()
-  let json: Record<string, unknown>
+    body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
+  });
+  const text = await response.text();
+  let json: Record<string, unknown>;
   try {
-    json = JSON.parse(text)
+    json = JSON.parse(text);
   } catch {
-    throw new Error(`upstream OTA returned non JSON: ${response.status}`)
+    throw new Error(`upstream OTA returned non JSON: ${response.status}`);
   }
   if (!response.ok) {
-    throw new Error(`upstream OTA failed: ${response.status} ${text}`)
+    throw new Error(`upstream OTA failed: ${response.status} ${text}`);
   }
-  return json
+  return json;
 }
 
 function parseUpstreamConfig(json: Record<string, unknown>): UpstreamConfig | undefined {
-  const websocket = json.websocket
-  if (!websocket || typeof websocket !== 'object') return undefined
-  const value = websocket as Record<string, unknown>
-  const url = typeof value.url === 'string' ? value.url : ''
-  if (!url) return undefined
-  const token = typeof value.token === 'string' ? value.token : ''
-  const version = typeof value.version === 'number' ? value.version : 1
-  return { url, token, version }
+  const websocket = json.websocket;
+  if (!websocket || typeof websocket !== "object") return undefined;
+  const value = websocket as Record<string, unknown>;
+  const url = typeof value.url === "string" ? value.url : "";
+  if (!url) return undefined;
+  const token = typeof value.token === "string" ? value.token : "";
+  const version = typeof value.version === "number" ? value.version : 1;
+  return { url, token, version };
 }
 
 function localOtaResponse(upstream: Record<string, unknown>, version: number) {
@@ -1579,98 +2137,108 @@ function localOtaResponse(upstream: Record<string, unknown>, version: number) {
     ...upstream,
     websocket: {
       url: `ws://${publicHost}:${port}/xiaozhi`,
-      token: '',
+      token: "",
       version,
     },
-  }
-  delete response.firmware
-  delete response.mqtt
-  return response
+  };
+  delete response.firmware;
+  delete response.mqtt;
+  return response;
 }
 
 function cachedLocalOtaResponse(req: Request) {
-  const key = deviceKey(req)
-  const config = upstreamConfigs.get(key) ?? upstreamConfigs.get('stackchan')
-  if (!config) return undefined
-  return localOtaResponse({}, config.version)
+  const key = deviceKey(req);
+  const config = upstreamConfigs.get(key) ?? upstreamConfigs.get("stackchan");
+  if (!config) return undefined;
+  return localOtaResponse({}, config.version);
 }
 
 async function emitClaudeCodeChannel(text: string, meta: Record<string, string>) {
+  log(`Claude Code channel notification: request_id=${meta.request_id ?? ""}`);
   await mcp.notification({
-    method: 'notifications/claude/channel',
+    method: "notifications/claude/channel",
     params: {
       content: text,
       meta: {
         request_id: meta.request_id ?? randomUUID(),
-        session_id: meta.session_id ?? 'stackchan',
-        device_id: meta.device_id ?? 'stackchan',
-        user: meta.user ?? 'stackchan',
+        session_id: meta.session_id ?? "stackchan",
+        device_id: meta.device_id ?? "stackchan",
+        user: meta.user ?? "stackchan",
         ts: nowIso(),
       },
     },
-  })
+  });
 }
 
 function emitEvictlChannel(text: string, meta: Record<string, string>) {
-  const requestId = meta.request_id ?? randomUUID()
-  const source = meta.source ?? 'stackchan'
-  const sessionId = meta.session_id ?? 'stackchan'
-  const deviceId = meta.device_id ?? 'stackchan'
+  const requestId = meta.request_id ?? randomUUID();
+  const source = meta.source ?? "stackchan";
+  const sessionId = meta.session_id ?? "stackchan";
+  const deviceId = meta.device_id ?? "stackchan";
   const prompt = [
     `StackChan voice input arrived from ${source}. request_id: ${requestId}; session_id: ${sessionId}; device_id: ${deviceId}; text: ${text}`,
-    'Reply by calling mcp__stackchan__reply with this exact request_id and a concise Japanese text.',
-    'Do not call Telegram tools for this StackChan voice input.',
-  ].join(' ')
-  const result = spawnSync(evictlBin, ['send', evictlIdentity, '--text', prompt, '--source', 'stackchan-relay'], {
-    encoding: 'utf8',
-  })
+    "Reply by calling mcp__stackchan__reply with this exact request_id and a concise Japanese text.",
+    "Do not call Telegram tools for this StackChan voice input.",
+  ].join(" ");
+  const result = spawnSync(
+    evictlBin,
+    ["send", evictlIdentity, "--text", prompt, "--source", "stackchan-relay"],
+    {
+      encoding: "utf8",
+    },
+  );
   if (result.status !== 0) {
-    throw new Error(`evictl send failed: ${result.stderr || result.stdout}`)
+    throw new Error(`evictl send failed: ${result.stderr || result.stdout}`);
   }
 }
 
 async function emitChannel(text: string, meta: Record<string, string>) {
-  const requestId = meta.request_id
-  const trace = requestId ? turnTracesByRequest.get(requestId) : undefined
-  lastChannelEmit = { text, meta, transport: stackChanAgentTransport, ts: nowIso() }
-  if (trace) trace.channelEmitAt = lastChannelEmit.ts
-  if (stackChanAgentTransport === 'evictl') {
-    emitEvictlChannel(text, meta)
-    if (trace) trace.channelEmitDoneAt = nowIso()
-    return
+  const requestId = meta.request_id;
+  const trace = requestId ? turnTracesByRequest.get(requestId) : undefined;
+  lastChannelEmit = { text, meta, transport: stackChanAgentTransport, ts: nowIso() };
+  if (trace) trace.channelEmitAt = lastChannelEmit.ts;
+  if (stackChanAgentTransport === "evictl") {
+    emitEvictlChannel(text, meta);
+    if (trace) trace.channelEmitDoneAt = nowIso();
+    return;
   }
-  await emitClaudeCodeChannel(text, meta)
-  if (trace) trace.channelEmitDoneAt = nowIso()
+  await emitClaudeCodeChannel(text, meta);
+  if (trace) trace.channelEmitDoneAt = nowIso();
 }
 
-async function askClaude(text: string, socket: ServerWebSocket<StackChanConnection> | undefined, sessionId: string, deviceId: string): Promise<ClaudeReply> {
-  const id = randomUUID()
-  const started = Date.now()
-  const listenStart = latestXiaozhiEvent(sessionId, 'listen', 'start')
-  const listenStop = latestXiaozhiEvent(sessionId, 'listen', 'stop')
-  const stt = latestUpstreamMessage(sessionId, 'stt')
+async function askClaude(
+  text: string,
+  socket: ServerWebSocket<StackChanConnection> | undefined,
+  sessionId: string,
+  deviceId: string,
+): Promise<ClaudeReply> {
+  const id = randomUUID();
+  const started = Date.now();
+  const listenStart = latestXiaozhiEvent(sessionId, "listen", "start");
+  const listenStop = latestXiaozhiEvent(sessionId, "listen", "stop");
+  const stt = latestUpstreamMessage(sessionId, "stt");
   rememberTurnTrace({
     requestId: id,
-    source: socket ? 'stackchan' : 'http',
+    source: socket ? "stackchan" : "http",
     sessionId,
     deviceId,
     text,
-    status: 'pending',
+    status: "pending",
     listenStartedAt: listenStart?.ts,
     listenStoppedAt: listenStop?.ts,
     sttAt: stt?.ts ?? nowIso(),
     audioChunks: [],
-  })
+  });
   return await new Promise<ClaudeReply>((resolve) => {
     const timer = setTimeout(() => {
-      pending.delete(id)
-      const trace = turnTracesByRequest.get(id)
+      pending.delete(id);
+      const trace = turnTracesByRequest.get(id);
       if (trace) {
-        trace.status = 'timeout'
-        trace.error = 'assistant timeout'
+        trace.status = "timeout";
+        trace.error = "assistant timeout";
       }
-      resolve({ text: '時間がかかりすぎちゃったの。もう一回話しかけてね。', speechHandled: false })
-    }, assistantTimeoutMs)
+      resolve({ text: "時間がかかりすぎちゃったの。もう一回話しかけてね。", speechHandled: false });
+    }, assistantTimeoutMs);
 
     pending.set(id, {
       id,
@@ -1678,137 +2246,220 @@ async function askClaude(text: string, socket: ServerWebSocket<StackChanConnecti
       deviceId,
       createdAt: started,
       socket,
-      resolve: value => {
-        clearTimeout(timer)
-        pending.delete(id)
-        const trace = turnTracesByRequest.get(id)
+      resolve: (value) => {
+        clearTimeout(timer);
+        pending.delete(id);
+        const trace = turnTracesByRequest.get(id);
         if (trace) {
-          trace.replyText = value.text
-          if (!trace.replyToolAt) trace.replyToolAt = nowIso()
-          if (value.speechHandled) trace.status = 'replied'
+          trace.replyText = value.text;
+          if (!trace.replyToolAt) trace.replyToolAt = nowIso();
+          if (value.speechHandled) trace.status = "replied";
         }
-        resolve(value)
+        resolve(value);
       },
-    })
+    });
 
-    const event = mqttEvent('input.text', text, {
+    if (socket) {
+      void speakFastProvisionalReply(id, sessionId, deviceId).catch((err) => {
+        log(`failed to speak provisional StackChan reply: ${err}`);
+      });
+    }
+
+    const event = mqttEvent("input.text", text, {
       id,
-      source: socket ? 'stackchan' : 'http',
-      channel: socket ? 'stackchan' : 'openai-compatible',
+      source: socket ? "stackchan" : "http",
+      channel: socket ? "stackchan" : "openai-compatible",
       session_id: sessionId,
       device_id: deviceId,
-      target: 'claude',
-    })
+      target: "claude",
+    });
 
-    void publishMqttInput(event).catch(err => {
-      log(`failed to publish MQTT input: ${err}`)
-    })
+    void publishMqttInput(event).catch((err) => {
+      log(`failed to publish MQTT input: ${err}`);
+    });
 
     if (!directMcpChannel) {
-      log(`waiting MQTT output: ${id}`)
-      return
+      log(`waiting MQTT output: ${id}`);
+      return;
     }
 
     void emitChannel(text, {
-      source: 'stackchan',
+      source: "stackchan",
       request_id: id,
       session_id: sessionId,
       device_id: deviceId,
-      user: 'stackchan',
-    }).catch(err => {
-      clearTimeout(timer)
-      pending.delete(id)
-      const trace = turnTracesByRequest.get(id)
+      user: "stackchan",
+    }).catch((err) => {
+      clearTimeout(timer);
+      pending.delete(id);
+      const trace = turnTracesByRequest.get(id);
       if (trace) {
-        trace.status = 'error'
-        trace.error = String(err)
+        trace.status = "error";
+        trace.error = String(err);
       }
-      log(`failed to deliver inbound to Claude: ${err}`)
-      resolve({ text: 'Claude Code Channels に送れなかったの。Mac 側を確認してね。', speechHandled: false })
-    })
-  })
+      log(`failed to deliver inbound to Claude: ${err}`);
+      resolve({
+        text: "Claude Code Channels に送れなかったの。Mac 側を確認してね。",
+        speechHandled: false,
+      });
+    });
+  });
 }
 
 class UpstreamConnection {
-  private ws?: WebSocket
-  private opened?: Promise<void>
-  private suppressResponse = false
+  private ws?: WebSocket;
+  private opened?: Promise<void>;
+  private suppressResponse = false;
+  private needsHelloReplay: boolean;
+  private wsHasConnected = false;
+  private handshaking = false;
+  private pendingMessages: (string | Uint8Array | ArrayBuffer | Buffer)[] = [];
+  private handshakeResolve?: () => void;
+  private handshakePromise?: Promise<void>;
+  private mcpResponseCount = 0;
 
   constructor(
     private readonly local: ServerWebSocket<StackChanConnection>,
     private readonly config: UpstreamConfig,
-  ) {}
+  ) {
+    this.needsHelloReplay = !!local.data.helloMessage;
+  }
 
   async send(value: string | Uint8Array | ArrayBuffer | Buffer) {
-    await this.ensureOpen()
-    this.ws?.send(value)
+    await this.ensureOpen();
+    if (this.handshaking) {
+      if (typeof value === "string") {
+        try {
+          const parsed = JSON.parse(value as string);
+          if (parsed.type === "mcp") {
+            this.ws?.send(value);
+            this.mcpResponseCount++;
+            if (this.mcpResponseCount >= 2) {
+              this.completeHandshake();
+            }
+            return;
+          }
+        } catch {}
+      }
+      this.pendingMessages.push(value);
+      if (this.handshakePromise) await this.handshakePromise;
+      return;
+    }
+    if (typeof value === "string") {
+      try {
+        const parsed = JSON.parse(value as string);
+        if (parsed.type === "hello") {
+          this.ws?.send(value);
+          this.startHandshake("hello sent to upstream");
+          return;
+        }
+      } catch {}
+    }
+    this.ws?.send(value);
   }
 
   close() {
-    this.ws?.close()
+    this.ws?.close();
+  }
+
+  private startHandshake(reason: string) {
+    this.handshaking = true;
+    this.mcpResponseCount = 0;
+    this.pendingMessages = [];
+    this.handshakePromise = new Promise((r) => {
+      this.handshakeResolve = r;
+    });
+    log(`upstream handshake started: ${reason}`);
+    setTimeout(() => {
+      if (this.handshaking) {
+        this.completeHandshake();
+        log("upstream handshake timeout forced");
+      }
+    }, 5000);
+  }
+
+  private completeHandshake() {
+    this.handshaking = false;
+    log(`upstream handshake complete, flushing ${this.pendingMessages.length} queued messages`);
+    for (const msg of this.pendingMessages) {
+      this.ws?.send(msg);
+    }
+    this.pendingMessages = [];
+    this.handshakeResolve?.();
   }
 
   private async ensureOpen() {
-    if (this.ws?.readyState === WebSocket.OPEN) return
-    if (this.opened) return await this.opened
+    if (this.ws?.readyState === WebSocket.OPEN) return;
+    if (this.local.data.turnClosing) return;
+    if (this.opened) return await this.opened;
 
     this.opened = new Promise((resolve, reject) => {
       const headers: Record<string, string> = {
-        'Protocol-Version': String(this.config.version || this.local.data.protocolVersion || '1'),
-        'Device-Id': this.local.data.deviceId,
-        'Client-Id': this.local.data.clientId,
-      }
-      const authorization = authorizationValue(this.config.token)
-      if (authorization) headers.Authorization = authorization
+        "Protocol-Version": String(this.config.version || this.local.data.protocolVersion || "1"),
+        "Device-Id": this.local.data.deviceId,
+        "Client-Id": this.local.data.clientId,
+      };
+      const authorization = authorizationValue(this.config.token);
+      if (authorization) headers.Authorization = authorization;
 
-      const ws = new WebSocket(this.config.url, { headers })
+      const ws = new WebSocket(this.config.url, { headers });
       const timer = setTimeout(() => {
-        ws.close()
-        reject(new Error(`upstream connect timeout: ${this.config.url}`))
-      }, 10000)
+        ws.close();
+        reject(new Error(`upstream connect timeout: ${this.config.url}`));
+      }, 10000);
 
-      ws.addEventListener('open', () => {
-        clearTimeout(timer)
-        this.ws = ws
-        log(`upstream connected: ${this.config.url}`)
-        resolve()
-      })
-      ws.addEventListener('message', event => this.handleMessage(event.data))
-      ws.addEventListener('close', event => {
-        log(`upstream disconnected code=${event.code} reason=${event.reason}`)
-        if (this.ws === ws) this.ws = undefined
-      })
-      ws.addEventListener('error', () => {
-        reject(new Error(`upstream connect failed: ${this.config.url}`))
-      })
+      ws.addEventListener("open", () => {
+        clearTimeout(timer);
+        this.ws = ws;
+        log(`upstream connected: ${this.config.url}`);
+        if ((this.needsHelloReplay || this.wsHasConnected) && this.local.data.helloMessage) {
+          ws.send(this.local.data.helloMessage);
+          this.startHandshake("hello replayed on reconnect");
+        }
+        this.wsHasConnected = true;
+        resolve();
+      });
+      ws.addEventListener("message", (event) => this.handleMessage(event.data));
+      ws.addEventListener("close", (event) => {
+        log(`upstream disconnected code=${event.code} reason=${event.reason}`);
+        if (this.ws === ws) this.ws = undefined;
+      });
+      ws.addEventListener("error", () => {
+        reject(new Error(`upstream connect failed: ${this.config.url}`));
+      });
     }).finally(() => {
-      this.opened = undefined
-    })
+      this.opened = undefined;
+    });
 
-    return await this.opened
+    return await this.opened;
   }
 
   private handleMessage(data: unknown) {
-    if (typeof data !== 'string') {
-      const bytes = data instanceof ArrayBuffer ? data.byteLength : data instanceof Uint8Array ? data.byteLength : 0
-      xiaozhiAudioFramesOut += 1
-      xiaozhiAudioBytesOut += bytes
+    if (typeof data !== "string") {
+      const bytes =
+        data instanceof ArrayBuffer
+          ? data.byteLength
+          : data instanceof Uint8Array
+            ? data.byteLength
+            : 0;
+      xiaozhiAudioFramesOut += 1;
+      xiaozhiAudioBytesOut += bytes;
       lastXiaozhiAudioOut = {
         bytes,
         ts: nowIso(),
         sessionId: this.local.data.sessionId,
         deviceId: this.local.data.deviceId,
-      }
-      if (!this.suppressResponse) this.local.send(data as ArrayBuffer)
-      return
+      };
+      if (!this.suppressResponse) this.local.send(data as ArrayBuffer);
+      return;
     }
 
-    let message: { type?: string; state?: string; text?: string; session_id?: string }
+    let message: { type?: string; state?: string; text?: string; session_id?: string };
     try {
-      message = JSON.parse(data)
+      message = JSON.parse(data);
     } catch {
-      if (!this.suppressResponse) this.local.send(data)
-      return
+      if (!this.suppressResponse) this.local.send(data);
+      return;
     }
 
     lastUpstreamTextMessage = {
@@ -1819,412 +2470,687 @@ class UpstreamConnection {
       ts: nowIso(),
       sessionId: this.local.data.sessionId,
       deviceId: this.local.data.deviceId,
-    }
-    recentUpstreamTextMessages.push(lastUpstreamTextMessage)
-    while (recentUpstreamTextMessages.length > 20) recentUpstreamTextMessages.shift()
+    };
+    recentUpstreamTextMessages.push(lastUpstreamTextMessage);
+    while (recentUpstreamTextMessages.length > 20) recentUpstreamTextMessages.shift();
     log(
-      `upstream -> xiaozhi: type=${message.type ?? ''} state=${message.state ?? ''} text=${lastUpstreamTextMessage.textPreview ?? ''}`,
-    )
+      `upstream -> xiaozhi: type=${message.type ?? ""} state=${message.state ?? ""} text=${lastUpstreamTextMessage.textPreview ?? ""}`,
+    );
 
-    if (message.type === 'hello') {
-      if (message.session_id) this.local.data.sessionId = message.session_id
-      this.local.send(data)
-      return
+    if (message.type === "hello") {
+      if (message.session_id) this.local.data.sessionId = message.session_id;
+      this.local.send(data);
+      return;
     }
 
-    if (message.type === 'stt' && message.text) {
-      const transcript = normalizeText(message.text)
-      if (!transcript) return
-      this.local.data.transcript = transcript
-      sendStackChanText(this.local, this.local.data.sessionId, transcript, 'user')
+    if (message.type === "stt" && message.text) {
+      const transcript = normalizeText(message.text);
+      if (!transcript) return;
+      this.local.data.transcript = transcript;
+      sendStackChanText(this.local, this.local.data.sessionId, transcript, "user");
       if (!this.local.data.claudeAsked) {
-        this.local.data.claudeAsked = true
+        this.local.data.claudeAsked = true;
         lastDirectStackChanInput = {
           text: transcript,
           sessionId: this.local.data.sessionId,
           deviceId: this.local.data.deviceId,
           ts: Date.now(),
-        }
+        };
         void askClaude(transcript, this.local, this.local.data.sessionId, this.local.data.deviceId)
-          .then(reply => {
-            if (!reply.speechHandled) void sendStackChanAssistantSafe(this.local, reply.text)
+          .then((reply) => {
+            if (!reply.speechHandled) void sendStackChanAssistantSafe(this.local, reply.text);
           })
-          .catch(err => {
-            log(`failed to deliver StackChan STT to Claude: ${err}`)
+          .catch((err) => {
+            log(`failed to deliver StackChan STT to Claude: ${err}`);
           })
-          .finally(() => finishStackChanTurn(this.local))
-        this.suppressResponse = true
-        this.abortUpstream()
+          .finally(() => finishStackChanTurn(this.local));
+        this.suppressResponse = true;
+        this.abortUpstream();
       }
-      return
+      return;
     }
 
-    if (this.suppressResponse && (message.type === 'llm' || message.type === 'tts')) return
-    this.local.send(data)
+    if (this.suppressResponse && (message.type === "llm" || message.type === "tts")) return;
+    this.local.send(data);
   }
 
   private abortUpstream() {
-    const sessionId = this.local.data.sessionId
-    if (!sessionId) return
-    this.ws?.send(JSON.stringify({ session_id: sessionId, type: 'abort' }))
+    const sessionId = this.local.data.sessionId;
+    if (!sessionId) return;
+    this.ws?.send(JSON.stringify({ session_id: sessionId, type: "abort" }));
   }
-
 }
 
 const mcp = new Server(
-  { name: 'stackchan', version: '0.0.1' },
+  { name: "stackchan", version: "0.0.1" },
   {
     capabilities: {
       tools: {},
       experimental: {
-        'claude/channel': {},
+        "claude/channel": {},
       },
     },
     instructions: [
       'Messages from StackChan arrive as <channel source="stackchan" request_id="..." session_id="..." device_id="..." user="stackchan" ts="...">.',
-      'Anything that should appear on the StackChan display must be sent with the reply tool. Pass request_id back unchanged when replying to StackChan input. For output mirrored from another channel, reuse the exact same response text already sent to that channel, omit request_id, and do not compose a second variant.',
-      'Do not use Telegram tools for StackChan replies.',
-    ].join('\n'),
+      "Anything that should appear on the StackChan display must be sent with the reply tool. Pass request_id back unchanged when replying to StackChan input. For output mirrored from another channel, reuse the exact same response text already sent to that channel, omit request_id, and do not compose a second variant.",
+      "Do not use Telegram tools for StackChan replies.",
+    ].join("\n"),
   },
-)
+);
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
-      name: 'reply',
-      description: 'Reply to StackChan. Pass request_id from an inbound StackChan channel message when available. Without request_id, the text is broadcast to the StackChan display and voice output.',
+      name: "reply",
+      description:
+        "Reply to StackChan. Pass request_id from an inbound StackChan channel message when available. Without request_id, the text is broadcast to the StackChan display and voice output.",
       inputSchema: {
-        type: 'object',
+        type: "object",
         properties: {
-          request_id: { type: 'string' },
-          text: { type: 'string' },
+          request_id: { type: "string" },
+          text: { type: "string" },
         },
-        required: ['text'],
+        required: ["text"],
       },
     },
   ],
-}))
+}));
 
-mcp.setRequestHandler(CallToolRequestSchema, async req => {
-  const args = (req.params.arguments ?? {}) as Record<string, unknown>
-  if (req.params.name !== 'reply') {
-    throw new Error(`unknown tool: ${req.params.name}`)
+mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const args = (req.params.arguments ?? {}) as Record<string, unknown>;
+  if (req.params.name !== "reply") {
+    throw new Error(`unknown tool: ${req.params.name}`);
   }
 
-  const requestId = String(args.request_id ?? '')
-  const text = String(args.text ?? '').trim()
-  const entry = pending.get(requestId)
+  const requestId = String(args.request_id ?? "");
+  const text = String(args.text ?? "").trim();
+  const entry = pending.get(requestId);
   if (!entry) {
     if (requestId && mqttEmbedded) {
-      log(`StackChan reply ignored: unknown request_id=${requestId}`)
-      return { content: [{ type: 'text', text: 'ignored unknown request_id' }] }
+      log(`StackChan reply ignored: unknown request_id=${requestId}`);
+      return { content: [{ type: "text", text: "ignored unknown request_id" }] };
     }
-    const event = mqttEvent('output.text', text, {
+    const event = mqttEvent("output.text", text, {
       correlation_id: requestId || randomUUID(),
-      source: 'claude',
-      target: 'all',
-      session_id: requestId ? 'stackchan-reply' : 'broadcast',
-      device_id: 'stackchan',
-    })
-    rememberLocalOutput(event)
-    await publishMqttOutput(event)
-    void speakStackChanAssistant(text, false, { requestId })
-    return { content: [{ type: 'text', text: 'sent' }] }
+      source: "claude",
+      target: "all",
+      session_id: requestId ? "stackchan-reply" : "broadcast",
+      device_id: "stackchan",
+    });
+    rememberLocalOutput(event);
+    await publishMqttOutput(event);
+    void speakStackChanAssistant(text, false, { requestId });
+    return { content: [{ type: "text", text: "sent" }] };
   }
-  const trace = turnTracesByRequest.get(requestId)
+  const trace = turnTracesByRequest.get(requestId);
   if (trace) {
-    trace.replyToolAt = nowIso()
-    trace.replyText = text
-    trace.status = 'replied'
+    trace.replyToolAt = nowIso();
+    trace.replyText = text;
+    trace.status = "replied";
   }
 
-  const event = mqttEvent('output.text', text, {
+  const event = mqttEvent("output.text", text, {
     correlation_id: requestId,
-    source: 'claude',
-    target: 'all',
+    source: "claude",
+    target: "all",
     session_id: entry.sessionId,
     device_id: entry.deviceId,
-  })
-  rememberLocalOutput(event)
-  await publishMqttOutput(event)
-  void speakStackChanAssistant(text, false, { requestId })
-  entry.resolve({ text, speechHandled: true })
-  return { content: [{ type: 'text', text: 'sent' }] }
-})
+  });
+  rememberLocalOutput(event);
+  await publishMqttOutput(event);
+  void speakStackChanAssistant(text, false, { requestId });
+  entry.resolve({ text, speechHandled: true });
+  return { content: [{ type: "text", text: "sent" }] };
+});
 
 async function handleChatCompletions(req: Request): Promise<Response> {
-  const body = await req.json().catch(() => ({})) as { messages?: OpenAIMessage[]; model?: string }
-  const text = latestUserText(body.messages ?? [])
+  const body = (await req.json().catch(() => ({}))) as {
+    messages?: OpenAIMessage[];
+    model?: string;
+  };
+  const text = latestUserText(body.messages ?? []);
   if (!text) {
-    return Response.json({ error: { message: 'no user message' } }, { status: 400 })
+    return Response.json({ error: { message: "no user message" } }, { status: 400 });
   }
 
-  const reply = await askClaude(text, undefined, 'openai-compatible', 'http')
+  const reply = await askClaude(text, undefined, "openai-compatible", "http");
   return Response.json({
     id: `chatcmpl-${randomUUID()}`,
-    object: 'chat.completion',
+    object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
-    model: body.model ?? 'stackchan-claude-code-channels',
+    model: body.model ?? "stackchan-claude-code-channels",
     choices: [
       {
         index: 0,
         message: {
-          role: 'assistant',
+          role: "assistant",
           content: reply.text,
         },
-        finish_reason: 'stop',
+        finish_reason: "stop",
       },
     ],
-  })
+  });
 }
+
+async function handleDebugStackChanButtonTurn(req: Request): Promise<Response> {
+  if (!localDebugRequest(req)) {
+    return Response.json({ error: "debug endpoint is localhost only" }, { status: 403 });
+  }
+
+  const body = (await req.json().catch(() => ({}))) as {
+    text?: string;
+    requestId?: string;
+    request_id?: string;
+    sessionId?: string;
+    session_id?: string;
+    deviceId?: string;
+    device_id?: string;
+    listenMs?: number;
+    stopToSttMs?: number;
+    timeoutMs?: number;
+    waitFor?: string;
+    speakProvisional?: boolean;
+  };
+  const text = normalizeText(String(body.text ?? "こんにちは。"));
+  if (!text) return Response.json({ error: "text is required" }, { status: 400 });
+
+  const requestId = normalizeText(
+    String(body.requestId ?? body.request_id ?? `debug-button-${randomUUID()}`),
+  );
+  if (pending.has(requestId) || turnTracesByRequest.has(requestId)) {
+    return Response.json({ error: "requestId already exists", requestId }, { status: 409 });
+  }
+
+  const sessionId = normalizeText(
+    String((body.sessionId ?? body.session_id ?? xiaozhiListeningSessionId) || "debug-button"),
+  );
+  const deviceId = normalizeText(
+    String((body.deviceId ?? body.device_id ?? xiaozhiListeningDeviceId) || "debug-button"),
+  );
+  const listenMs = boundedNumber(body.listenMs, 3200, 0, 60_000);
+  const stopToSttMs = boundedNumber(body.stopToSttMs, 250, 0, 60_000);
+  const timeoutMs = boundedNumber(body.timeoutMs, 5000, 100, assistantTimeoutMs);
+  const waitFor = traceWaitForFromValue(body.waitFor);
+  const sttAtMs = Date.now();
+  const listenStoppedAtMs = sttAtMs - stopToSttMs;
+  const listenStartedAtMs = listenStoppedAtMs - listenMs;
+
+  rememberTurnTrace({
+    requestId,
+    source: "debug-button",
+    sessionId,
+    deviceId,
+    text,
+    status: "pending",
+    listenStartedAt: new Date(listenStartedAtMs).toISOString(),
+    listenStoppedAt: new Date(listenStoppedAtMs).toISOString(),
+    sttAt: new Date(sttAtMs).toISOString(),
+    audioChunks: [],
+  });
+
+  const timer = setTimeout(() => {
+    pending.delete(requestId);
+    const trace = turnTracesByRequest.get(requestId);
+    if (trace) {
+      trace.status = "timeout";
+      trace.error = "assistant timeout";
+    }
+  }, assistantTimeoutMs);
+
+  pending.set(requestId, {
+    id: requestId,
+    sessionId,
+    deviceId,
+    createdAt: sttAtMs,
+    resolve: (value) => {
+      clearTimeout(timer);
+      pending.delete(requestId);
+      const trace = turnTracesByRequest.get(requestId);
+      if (trace) {
+        trace.replyText = value.text;
+        if (!trace.replyToolAt) trace.replyToolAt = nowIso();
+        if (value.speechHandled) trace.status = "replied";
+      }
+    },
+  });
+
+  if (body.speakProvisional !== false) {
+    void speakFastProvisionalReply(requestId, sessionId, deviceId).catch((err) => {
+      log(`failed to speak debug provisional StackChan reply: ${err}`);
+    });
+  }
+
+  const event = mqttEvent("input.text", text, {
+    id: requestId,
+    source: "stackchan",
+    channel: "debug-button",
+    session_id: sessionId,
+    device_id: deviceId,
+    target: "claude",
+  });
+
+  void publishMqttInput(event).catch((err) => {
+    log(`failed to publish debug MQTT input: ${err}`);
+  });
+
+  if (directMcpChannel && mqttInputHandlerEnabled) {
+    await emitChannel(text, {
+      source: "debug-button",
+      request_id: requestId,
+      session_id: sessionId,
+      device_id: deviceId,
+      user: "stackchan-debug",
+    }).catch((err) => {
+      clearTimeout(timer);
+      pending.delete(requestId);
+      const trace = turnTracesByRequest.get(requestId);
+      if (trace) {
+        trace.status = "error";
+        trace.error = String(err);
+      }
+      log(`failed to deliver debug button turn to Claude: ${err}`);
+    });
+  }
+
+  const trace = await waitForTrace(requestId, timeoutMs, waitFor);
+  return Response.json({
+    requestId,
+    waitFor,
+    observed: trace ? traceWaitSatisfied(trace, waitFor) : false,
+    firstAudioFrameObserved: Boolean(trace?.firstAudioFrameAt),
+    trace: trace ? turnTraceView(trace) : undefined,
+  });
+}
+
+async function handleDebugStackChanVoiceTurn(req: Request): Promise<Response> {
+  if (!localDebugRequest(req)) {
+    return Response.json({ error: "debug endpoint is localhost only" }, { status: 403 });
+  }
+
+  const body = (await req.json().catch(() => ({}))) as {
+    holdMs?: number;
+    hold_ms?: number;
+    timeoutMs?: number;
+    timeout_ms?: number;
+  };
+  const holdMs = boundedNumber(body.holdMs ?? body.hold_ms, 2500, 700, 30000);
+  const timeoutMs = boundedNumber(
+    body.timeoutMs ?? body.timeout_ms,
+    Math.max(60000, holdMs + 12000),
+    1000,
+    120000,
+  );
+  const startedAt = Date.now();
+  const command = mqttEvent("debug.voice_turn", "start", {
+    source: "debug-voice-turn",
+    target: "stackchan",
+    hold_ms: holdMs,
+  });
+
+  await publishMqtt(mqttDebugTopic, command);
+  log(`debug voice turn published hold_ms=${holdMs}`);
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const states = recentMqttStates.filter(
+      (event) => Date.parse(event.ts ?? "") >= startedAt - 1000,
+    );
+    const observedListening = states.some(
+      (event) =>
+        (event.type === "xiaozhi.status" && event.text === "Listening...") ||
+        (event.type === "device.state" && event.text === "listening"),
+    );
+    const observedStartTimeout = states.some(
+      (event) =>
+        event.type === "mic.start.timeout" ||
+        (event.type === "mic.cancelled" && event.text === "start_timeout"),
+    );
+    const observedRetry = states.some((event) => event.type === "mic.start.retry");
+    const observedWaitingReady = states.some((event) => event.type === "mic.start.waiting_ready");
+    const observedRecoverableError = states.some(
+      (event) => event.type === "xiaozhi.error.recoverable",
+    );
+    const observedDebugDone = states.some((event) => event.type === "debug.voice_turn.done");
+    if (observedListening || observedStartTimeout) {
+      return Response.json({
+        holdMs,
+        timeoutMs,
+        observedListening,
+        observedStartTimeout,
+        observedRetry,
+        observedWaitingReady,
+        observedRecoverableError,
+        observedDebugDone,
+        states,
+      });
+    }
+    await Bun.sleep(200);
+  }
+
+  const states = recentMqttStates.filter((event) => Date.parse(event.ts ?? "") >= startedAt - 1000);
+  return Response.json({
+    holdMs,
+    timeoutMs,
+    observedListening: states.some(
+      (event) =>
+        (event.type === "xiaozhi.status" && event.text === "Listening...") ||
+        (event.type === "device.state" && event.text === "listening"),
+    ),
+    observedStartTimeout: states.some(
+      (event) =>
+        event.type === "mic.start.timeout" ||
+        (event.type === "mic.cancelled" && event.text === "start_timeout"),
+    ),
+    observedRetry: states.some((event) => event.type === "mic.start.retry"),
+    observedWaitingReady: states.some((event) => event.type === "mic.start.waiting_ready"),
+    observedRecoverableError: states.some((event) => event.type === "xiaozhi.error.recoverable"),
+    observedDebugDone: states.some((event) => event.type === "debug.voice_turn.done"),
+    states,
+  });
+}
+
+setTimeout(() => {
+  void warmFastProvisionalAudio();
+}, 0);
 
 if (httpServerEnabled) {
   Bun.serve<StackChanConnection>({
-  hostname: host,
-  port,
-  async fetch(req, server) {
-    const url = new URL(req.url)
-    if (url.pathname === '/health') {
-      refreshXiaozhiListeningState()
-      const xiaozhiListeningAgeMs = xiaozhiListeningStartedAt === 0 ? 0 : Date.now() - xiaozhiListeningStartedAt
-      return Response.json({
-        status: 'ok',
-        upstreamOtaUrl,
-        agentTransport: stackChanAgentTransport,
-        mqtt: {
-          enabled: mqttEnabled,
+    hostname: host,
+    port,
+    async fetch(req, server) {
+      const url = new URL(req.url);
+      if (url.pathname === "/health") {
+        refreshXiaozhiListeningState();
+        const xiaozhiListeningAgeMs =
+          xiaozhiListeningStartedAt === 0 ? 0 : Date.now() - xiaozhiListeningStartedAt;
+        return Response.json({
+          status: "ok",
+          upstreamOtaUrl,
+          agentTransport: stackChanAgentTransport,
+          mqtt: {
+            enabled: mqttEnabled,
           embedded: mqttEmbedded,
-          brokerHost: mqttBrokerHost,
-          url: mqttUrl,
-          inputTopic: mqttInputTopic,
-          outputTopic: mqttOutputTopic,
-          outputAudioTopic: mqttOutputAudioTopic,
-          stateTopic: mqttStateTopic,
-          audioQos: mqttAudioQos,
-          brokerClients: Array.from(mqttBrokerClients),
-          brokerSubscriptions: Object.fromEntries(mqttBrokerSubscriptions),
-          recentBrokerEvents: recentMqttBrokerEvents,
-        },
-        irodoriTts: {
-          provider: irodoriTtsProvider,
-          frameDelayMs: irodoriTtsFrameDelayMs,
-          mqttFrameDelayMs: irodoriTtsMqttFrameDelayMs,
-          audioTransport: irodoriTtsAudioTransport,
-          durationScale: irodoriTtsDurationScale,
-          hasHfToken: Boolean(irodoriTtsHfToken),
-          audioWsWaitMs: stackChanAudioWsWaitMs,
-          warmupOnListen: irodoriTtsWarmupOnListen,
-          rateLimitCooldownMs: irodoriTtsRateLimitCooldownMs,
-          rateLimitedUntil: irodoriTtsRateLimitedUntil > Date.now() ? new Date(irodoriTtsRateLimitedUntil).toISOString() : undefined,
-          lastRateLimit: lastIrodoriTtsRateLimit,
-          fastFirstAudio: {
-            enabled: fastFirstAudioEnabled,
-            maxChars: fastFirstAudioMaxChars,
+          inputHandler: mqttInputHandlerEnabled,
+            brokerHost: mqttBrokerHost,
+            url: mqttUrl,
+            inputTopic: mqttInputTopic,
+            outputTopic: mqttOutputTopic,
+            outputAudioTopic: mqttOutputAudioTopic,
+            debugTopic: mqttDebugTopic,
+            stateTopic: mqttStateTopic,
+            audioQos: mqttAudioQos,
+            brokerClients: Array.from(mqttBrokerClients),
+            brokerSubscriptions: Object.fromEntries(mqttBrokerSubscriptions),
+            recentBrokerEvents: recentMqttBrokerEvents,
           },
-          fastLocalTts: {
-            enabled: fastLocalTtsEnabled,
-            voice: fastLocalTtsVoice,
-            firstChunkOnly: fastLocalTtsFirstChunkOnly,
+          irodoriTts: {
+            provider: irodoriTtsProvider,
+            frameDelayMs: irodoriTtsFrameDelayMs,
+            mqttFrameDelayMs: irodoriTtsMqttFrameDelayMs,
+            audioTransport: irodoriTtsAudioTransport,
+            durationScale: irodoriTtsDurationScale,
+            hasHfToken: Boolean(irodoriTtsHfToken),
+            required: irodoriTtsRequired,
+            audioWsWaitMs: stackChanAudioWsWaitMs,
+            audioMqttFallback: stackChanAudioMqttFallback,
+            parallelChunks: irodoriTtsParallelChunks,
+            opusCacheEntries: irodoriOpusCache.size,
+            opusInFlight: irodoriOpusInFlight.size,
+            warmupOnListen: irodoriTtsWarmupOnListen,
+            rateLimitCooldownMs: irodoriTtsRateLimitCooldownMs,
+            rateLimitedUntil:
+              irodoriTtsRateLimitedUntil > Date.now()
+                ? new Date(irodoriTtsRateLimitedUntil).toISOString()
+                : undefined,
+            lastRateLimit: lastIrodoriTtsRateLimit,
+            fastFirstAudio: {
+              enabled: fastFirstAudioEnabled,
+              maxChars: fastFirstAudioMaxChars,
+            },
+            fastLocalTts: {
+              enabled: fastLocalTtsEnabled,
+              voice: fastLocalTtsVoice,
+              firstChunkOnly: fastLocalTtsFirstChunkOnly,
+            },
+            fastProvisionalReply: {
+              enabled: fastProvisionalReplyEnabled,
+              text: fastProvisionalReplyText,
+              audioWsWaitMs: fastProvisionalAudioWsWaitMs,
+              mqttFallback: fastProvisionalMqttFallback,
+              cachedPackets: fastProvisionalOpusPackets?.length ?? 0,
+              warming: Boolean(fastProvisionalOpusWarmup),
+            },
           },
-        },
-        stackChanClients: stackChanSockets.size,
-        stackChanAudioClients: stackChanAudioSockets.size,
-        pendingRequests: pending.size,
-        pendingAssistantSpeech: pendingAssistantSpeech.length,
-        pendingMqttAssistantAudio: pendingMqttAssistantAudio.length,
-        assistantSpeechQueueLimit,
-        mqttAssistantAudioSending,
-        irodoriWarmup: {
-          inFlight: Boolean(irodoriWarmupInFlight),
-          cooldownMs: irodoriTtsWarmupCooldownMs,
-          last: lastIrodoriWarmup,
-        },
-        mqttInputCount,
-        mqttOutputCount,
-        mqttOutputAudioCount,
-        mqttStateCount,
-        xiaozhiAudio: {
-          framesIn: xiaozhiAudioFramesIn,
-          bytesIn: xiaozhiAudioBytesIn,
-          framesOut: xiaozhiAudioFramesOut,
-          bytesOut: xiaozhiAudioBytesOut,
-          lastIn: lastXiaozhiAudioIn,
-          lastOut: lastXiaozhiAudioOut,
-          lastUpstreamTextMessage,
-          recentUpstreamTextMessages,
-          listening: xiaozhiListening,
-          listeningStartedAt: xiaozhiListeningStartedAt === 0 ? undefined : new Date(xiaozhiListeningStartedAt).toISOString(),
-          listeningAgeMs: xiaozhiListeningAgeMs,
-          listeningStaleMs: xiaozhiListeningStaleMs,
-          framesAfterLastStop: xiaozhiAudioFramesIn - xiaozhiFramesInAtLastStop,
-          bytesAfterLastStop: xiaozhiAudioBytesIn - xiaozhiBytesInAtLastStop,
-          recentEvents: recentXiaozhiEvents,
-        },
-        lastMqttInput,
-        lastMqttOutput,
-        lastMqttOutputAudio,
-        lastMqttState,
-        lastAssistantSpeech,
-        recentMqttStates,
-        recentMqttAudioPublishes,
-        lastChannelEmit,
-        latencySummary: latencySummary(),
-        turnTraces: recentTurnTraces.map(turnTraceView),
-      })
-    }
-    if (url.pathname.startsWith('/ota')) {
-      try {
-        const upstream = await fetchUpstreamOta(req)
-        const config = parseUpstreamConfig(upstream)
+          stackChanClients: stackChanSockets.size,
+          stackChanAudioClients: stackChanAudioSockets.size,
+          pendingRequests: pending.size,
+          pendingAssistantSpeech: pendingAssistantSpeech.length,
+          pendingMqttAssistantAudio: pendingMqttAssistantAudio.length,
+          assistantSpeechQueueLimit,
+          mqttAssistantAudioSending,
+          lastAssistantAudioCancel,
+          irodoriWarmup: {
+            inFlight: Boolean(irodoriWarmupInFlight),
+            cooldownMs: irodoriTtsWarmupCooldownMs,
+            last: lastIrodoriWarmup,
+          },
+          mqttInputCount,
+          mqttOutputCount,
+          mqttOutputAudioCount,
+          mqttStateCount,
+          xiaozhiAudio: {
+            framesIn: xiaozhiAudioFramesIn,
+            bytesIn: xiaozhiAudioBytesIn,
+            framesOut: xiaozhiAudioFramesOut,
+            bytesOut: xiaozhiAudioBytesOut,
+            lastIn: lastXiaozhiAudioIn,
+            lastOut: lastXiaozhiAudioOut,
+            lastUpstreamTextMessage,
+            recentUpstreamTextMessages,
+            listening: xiaozhiListening,
+            listeningStartedAt:
+              xiaozhiListeningStartedAt === 0
+                ? undefined
+                : new Date(xiaozhiListeningStartedAt).toISOString(),
+            listeningAgeMs: xiaozhiListeningAgeMs,
+            listeningStaleMs: xiaozhiListeningStaleMs,
+            framesAfterLastStop: xiaozhiAudioFramesIn - xiaozhiFramesInAtLastStop,
+            bytesAfterLastStop: xiaozhiAudioBytesIn - xiaozhiBytesInAtLastStop,
+            recentEvents: recentXiaozhiEvents,
+          },
+          lastMqttInput,
+          lastMqttOutput,
+          lastMqttOutputAudio,
+          lastMqttState,
+          lastAssistantSpeech,
+          recentMqttStates,
+          recentMqttAudioPublishes,
+          lastChannelEmit,
+          latencySummary: latencySummary(),
+          turnTraces: recentTurnTraces.map(turnTraceView),
+        });
+      }
+      if (url.pathname.startsWith("/ota")) {
+        try {
+          const upstream = await fetchUpstreamOta(req);
+          const config = parseUpstreamConfig(upstream);
+          if (!config) {
+            return Response.json(cachedLocalOtaResponse(req) ?? upstream);
+          }
+          const key = deviceKey(req);
+          upstreamConfigs.set(key, config);
+          upstreamConfigs.set("stackchan", config);
+          saveUpstreamConfigs();
+          log(`ota proxy: ${key} -> ${config.url}`);
+          return Response.json(localOtaResponse(upstream, config.version));
+        } catch (err) {
+          log(`ota proxy failed: ${err}`);
+          const cached = cachedLocalOtaResponse(req);
+          if (cached) {
+            return Response.json(cached);
+          }
+          return Response.json({ error: "upstream OTA failed" }, { status: 502 });
+        }
+      }
+      if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
+        return await handleChatCompletions(req);
+      }
+      if (url.pathname === "/debug/stackchan/button-turn" && req.method === "POST") {
+        return await handleDebugStackChanButtonTurn(req);
+      }
+      if (url.pathname === "/debug/stackchan/voice-turn" && req.method === "POST") {
+        return await handleDebugStackChanVoiceTurn(req);
+      }
+      if (
+        url.pathname === "/xiaozhi" &&
+        server.upgrade(req, {
+          data: {
+            kind: "xiaozhi",
+            sessionId: randomUUID(),
+            deviceId: req.headers.get("device-id") ?? req.headers.get("Device-Id") ?? "stackchan",
+            clientId: req.headers.get("client-id") ?? req.headers.get("Client-Id") ?? randomUUID(),
+            protocolVersion:
+              req.headers.get("protocol-version") ?? req.headers.get("Protocol-Version") ?? "1",
+          },
+        })
+      ) {
+        return undefined;
+      }
+      if (
+        url.pathname === "/audio" &&
+        server.upgrade(req, {
+          data: {
+            kind: "audio",
+            sessionId: randomUUID(),
+            deviceId: req.headers.get("device-id") ?? req.headers.get("Device-Id") ?? "stackchan",
+            clientId: req.headers.get("client-id") ?? req.headers.get("Client-Id") ?? randomUUID(),
+            protocolVersion:
+              req.headers.get("protocol-version") ?? req.headers.get("Protocol-Version") ?? "1",
+          },
+        })
+      ) {
+        return undefined;
+      }
+      return new Response("not found", { status: 404 });
+    },
+    websocket: {
+      open(ws) {
+        if (ws.data.kind === "audio") {
+          stackChanAudioSockets.add(ws);
+          log(`audio connected ${ws.data.deviceId} session=${ws.data.sessionId}`);
+          return;
+        }
+        stackChanSockets.add(ws);
+        log(`connected ${ws.data.deviceId} session=${ws.data.sessionId}`);
+        void publishStackChanState("connected", {
+          source: "stackchan",
+          session_id: ws.data.sessionId,
+          device_id: ws.data.deviceId,
+        });
+        setTimeout(() => {
+          void flushPendingAssistantSpeech();
+        }, 500);
+      },
+      async message(ws, message) {
+        if (ws.data.kind === "audio") {
+          return;
+        }
+        const config = upstreamConfigs.get(ws.data.deviceId) ?? upstreamConfigs.get("stackchan");
         if (!config) {
-          return Response.json(cachedLocalOtaResponse(req) ?? upstream)
+          sendStackChanText(
+            ws,
+            ws.data.sessionId,
+            "標準 AI Agent の接続情報がまだ取れてないの。もう一回起動してね。",
+            "assistant",
+          );
+          return;
         }
-        const key = deviceKey(req)
-        upstreamConfigs.set(key, config)
-        upstreamConfigs.set('stackchan', config)
-        saveUpstreamConfigs()
-        log(`ota proxy: ${key} -> ${config.url}`)
-        return Response.json(localOtaResponse(upstream, config.version))
-      } catch (err) {
-        log(`ota proxy failed: ${err}`)
-        const cached = cachedLocalOtaResponse(req)
-        if (cached) {
-          return Response.json(cached)
+        if (!ws.data.upstream) {
+          ws.data.upstream = new UpstreamConnection(ws, config);
         }
-        return Response.json({ error: 'upstream OTA failed' }, { status: 502 })
-      }
-    }
-    if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
-      return await handleChatCompletions(req)
-    }
-    if (url.pathname === '/xiaozhi' && server.upgrade(req, {
-      data: {
-        kind: 'xiaozhi',
-        sessionId: randomUUID(),
-        deviceId: req.headers.get('device-id') ?? req.headers.get('Device-Id') ?? 'stackchan',
-        clientId: req.headers.get('client-id') ?? req.headers.get('Client-Id') ?? randomUUID(),
-        protocolVersion: req.headers.get('protocol-version') ?? req.headers.get('Protocol-Version') ?? '1',
-      },
-    })) {
-      return undefined
-    }
-    if (url.pathname === '/audio' && server.upgrade(req, {
-      data: {
-        kind: 'audio',
-        sessionId: randomUUID(),
-        deviceId: req.headers.get('device-id') ?? req.headers.get('Device-Id') ?? 'stackchan',
-        clientId: req.headers.get('client-id') ?? req.headers.get('Client-Id') ?? randomUUID(),
-        protocolVersion: req.headers.get('protocol-version') ?? req.headers.get('Protocol-Version') ?? '1',
-      },
-    })) {
-      return undefined
-    }
-    return new Response('not found', { status: 404 })
-  },
-  websocket: {
-    open(ws) {
-      if (ws.data.kind === 'audio') {
-        stackChanAudioSockets.add(ws)
-        log(`audio connected ${ws.data.deviceId} session=${ws.data.sessionId}`)
-        return
-      }
-      stackChanSockets.add(ws)
-      log(`connected ${ws.data.deviceId} session=${ws.data.sessionId}`)
-      void publishStackChanState('connected', {
-        source: 'stackchan',
-        session_id: ws.data.sessionId,
-        device_id: ws.data.deviceId,
-      })
-      setTimeout(() => {
-        void flushPendingAssistantSpeech()
-      }, 500)
-    },
-    async message(ws, message) {
-      if (ws.data.kind === 'audio') {
-        return
-      }
-      const config = upstreamConfigs.get(ws.data.deviceId) ?? upstreamConfigs.get('stackchan')
-      if (!config) {
-        sendStackChanText(ws, ws.data.sessionId, '標準 AI Agent の接続情報がまだ取れてないの。もう一回起動してね。', 'assistant')
-        return
-      }
-      if (!ws.data.upstream) {
-        ws.data.upstream = new UpstreamConnection(ws, config)
-      }
-      try {
-        if (typeof message === 'string') {
-          let parsed: { type?: string; state?: string }
-          try {
-            parsed = JSON.parse(message)
-          } catch {
-            parsed = {}
-          }
-          if (parsed.type === 'listen' && parsed.state === 'start') {
-            ws.data.transcript = undefined
-            ws.data.claudeAsked = false
-            markXiaozhiListening(ws.data.sessionId, ws.data.deviceId)
-            if (irodoriTtsWarmupOnListen) {
-              void warmIrodoriTts().catch(err => {
-                log(`Irodori warmup skipped: ${err}`)
-              })
+        try {
+          if (typeof message === "string") {
+            let parsed: { type?: string; state?: string };
+            try {
+              parsed = JSON.parse(message);
+            } catch {
+              parsed = {};
             }
-            void publishStackChanState('listening', {
-              source: 'stackchan',
-              session_id: ws.data.sessionId,
-              device_id: ws.data.deviceId,
-            })
+            if (parsed.type === "hello") {
+              ws.data.helloMessage = message as string;
+            }
+            if (parsed.type === "listen" && parsed.state === "start") {
+              cancelAssistantAudio("xiaozhi.listen.start");
+              ws.data.transcript = undefined;
+              ws.data.claudeAsked = false;
+              markXiaozhiListening(ws.data.sessionId, ws.data.deviceId);
+              if (irodoriTtsWarmupOnListen) {
+                void warmIrodoriTts().catch((err) => {
+                  log(`Irodori warmup skipped: ${err}`);
+                });
+              }
+              void publishStackChanState("listening", {
+                source: "stackchan",
+                session_id: ws.data.sessionId,
+                device_id: ws.data.deviceId,
+              });
+            }
+            if (parsed.type === "listen" && parsed.state === "stop") {
+              clearXiaozhiListening("client-stop", ws.data.sessionId, ws.data.deviceId);
+              void publishStackChanState("idle", {
+                source: "stackchan",
+                session_id: ws.data.sessionId,
+                device_id: ws.data.deviceId,
+              });
+            }
+            log(`xiaozhi -> upstream: ${message}`);
+            await ws.data.upstream.send(message);
+            return;
           }
-          if (parsed.type === 'listen' && parsed.state === 'stop') {
-            clearXiaozhiListening('client-stop', ws.data.sessionId, ws.data.deviceId)
-            void publishStackChanState('idle', {
-              source: 'stackchan',
-              session_id: ws.data.sessionId,
-              device_id: ws.data.deviceId,
-            })
-          }
-          log(`xiaozhi -> upstream: ${message}`)
-          await ws.data.upstream.send(message)
-          return
+          const payload = message instanceof ArrayBuffer ? message : message.slice().buffer;
+          xiaozhiAudioFramesIn += 1;
+          xiaozhiAudioBytesIn += payload.byteLength;
+          lastXiaozhiAudioIn = {
+            bytes: payload.byteLength,
+            ts: nowIso(),
+            sessionId: ws.data.sessionId,
+            deviceId: ws.data.deviceId,
+          };
+          await ws.data.upstream.send(payload);
+        } catch (err) {
+          log(`upstream send failed: ${err}`);
+          sendStackChanText(
+            ws,
+            ws.data.sessionId,
+            "標準 AI Agent への接続で失敗しちゃったの。",
+            "assistant",
+          );
         }
-        const payload = message instanceof ArrayBuffer ? message : message.slice().buffer
-        xiaozhiAudioFramesIn += 1
-        xiaozhiAudioBytesIn += payload.byteLength
-        lastXiaozhiAudioIn = {
-          bytes: payload.byteLength,
-          ts: nowIso(),
-          sessionId: ws.data.sessionId,
-          deviceId: ws.data.deviceId,
+      },
+      close(ws, code, reason) {
+        if (ws.data.kind === "audio") {
+          stackChanAudioSockets.delete(ws);
+          log(`audio disconnected ${ws.data.deviceId} code=${code} reason=${reason}`);
+          return;
         }
-        await ws.data.upstream.send(payload)
-      } catch (err) {
-        log(`upstream send failed: ${err}`)
-        sendStackChanText(ws, ws.data.sessionId, '標準 AI Agent への接続で失敗しちゃったの。', 'assistant')
-      }
+        stackChanSockets.delete(ws);
+        ws.data.upstream?.close();
+        clearXiaozhiListening("socket-close", ws.data.sessionId, ws.data.deviceId);
+        log(`disconnected ${ws.data.deviceId} code=${code} reason=${reason}`);
+        void publishStackChanState("disconnected", {
+          source: "stackchan",
+          session_id: ws.data.sessionId,
+          device_id: ws.data.deviceId,
+        });
+      },
     },
-    close(ws, code, reason) {
-      if (ws.data.kind === 'audio') {
-        stackChanAudioSockets.delete(ws)
-        log(`audio disconnected ${ws.data.deviceId} code=${code} reason=${reason}`)
-        return
-      }
-      stackChanSockets.delete(ws)
-      ws.data.upstream?.close()
-      clearXiaozhiListening('socket-close', ws.data.sessionId, ws.data.deviceId)
-      log(`disconnected ${ws.data.deviceId} code=${code} reason=${reason}`)
-      void publishStackChanState('disconnected', {
-        source: 'stackchan',
-        session_id: ws.data.sessionId,
-        device_id: ws.data.deviceId,
-      })
-    },
-  },
-  })
+  });
 }
 
-const transport = new StdioServerTransport()
-loadUpstreamConfigs()
-startEmbeddedMqttBroker()
-void ensureMqtt()
+const transport = new StdioServerTransport();
+loadUpstreamConfigs();
+startEmbeddedMqttBroker();
+void ensureMqtt();
 if (directMcpChannel) {
-  await mcp.connect(transport)
+  await mcp.connect(transport);
 }
