@@ -53,7 +53,7 @@ jobs:
           find_dirs() { # $1..: file names; prints unique dirs (max 6), root first
             local args=() n
             for n in "$@"; do args+=(-o -name "$n"); done
-            find . -maxdepth 4 \( -path '*/node_modules' -o -path '*/.git' -o -path '*/.venv' -o -path '*/vendor' \) -prune \
+            find . -maxdepth 6 \( -path '*/node_modules' -o -path '*/.git' -o -path '*/.venv' -o -path '*/vendor' \) -prune \
               -o -type f \( "${args[@]:1}" \) -exec dirname {} \; 2>/dev/null \
               | sort -u | awk '{print length, $0}' | sort -n | cut -d' ' -f2- | head -6 | paste -sd' ' -
           }
@@ -73,9 +73,9 @@ jobs:
             echo "py_dirs=$py_dirs"
             echo "go_dirs=$go_dirs"
             echo "cargo_dirs=$cargo_dirs"
-            echo "pnpm=$(find . -maxdepth 4 -name pnpm-lock.yaml -not -path '*/node_modules/*' | grep -q . && echo true || echo false)"
-            echo "bun=$(find . -maxdepth 4 \( -name bun.lock -o -name bun.lockb \) -not -path '*/node_modules/*' | grep -q . && echo true || echo false)"
-            echo "uv=$(find . -maxdepth 4 -name uv.lock -not -path '*/.venv/*' | grep -q . && echo true || echo false)"
+            echo "pnpm=$(find . -maxdepth 6 -name pnpm-lock.yaml -not -path '*/node_modules/*' | grep -q . && echo true || echo false)"
+            echo "bun=$(find . -maxdepth 6 \( -name bun.lock -o -name bun.lockb \) -not -path '*/node_modules/*' | grep -q . && echo true || echo false)"
+            echo "uv=$(find . -maxdepth 6 -name uv.lock -not -path '*/.venv/*' | grep -q . && echo true || echo false)"
             pm=$(jq -r '.packageManager // ""' package.json 2>/dev/null || true)
             echo "pnpm_pinned=$(case "$pm" in pnpm@*) echo true ;; *) echo false ;; esac)"
             if [ -f .nvmrc ]; then echo "node_version_file=.nvmrc"
@@ -111,12 +111,13 @@ jobs:
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           no-cache: true
+      # no .python-version: use a mature release (the newest one often lacks wheels)
       - name: Setup Python
         if: steps.detect.outputs.py_dirs != ''
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ${{ steps.detect.outputs.python_version_file }}
-          python-version: ${{ steps.detect.outputs.python_version_file == '' && '3.x' || '' }}
+          python-version: ${{ steps.detect.outputs.python_version_file == '' && '3.13' || '' }}
       - name: Setup uv
         if: steps.detect.outputs.uv == 'true'
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
