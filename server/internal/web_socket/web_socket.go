@@ -493,7 +493,7 @@ func readAppClientMessage(ctx context.Context, client *model.AppClient, messageT
 			// Query device name
 			name, err := service.GetDeviceName(ctx, client.GetMac())
 			if err != nil {
-				logger.Errorf(ctx, err.Error())
+				logger.Error(ctx, err)
 				return
 			}
 			if name == "" {
@@ -501,7 +501,7 @@ func readAppClientMessage(ctx context.Context, client *model.AppClient, messageT
 				return
 			}
 			newMsg := createStringMessage(GetDeviceName, name)
-			logger.Infof(ctx, "Device name found, returning: "+name)
+			logger.Infof(ctx, "Device name found, returning: %s", name)
 			appSendMessage(ctx, client, messageType, newMsg)
 			break
 		case UpdateDeviceName:
